@@ -109,6 +109,26 @@ def patch_relate_paths(project_dir, monkeypatch):
     monkeypatch.setattr(mod, "INDEX_FILE", project_dir / "wiki" / "index.yaml")
     monkeypatch.setattr(mod, "KG_FILE",
                         project_dir / "meta" / "relations" / "knowledge_graph.yaml")
+    # Big-Loop #2: 实体关系抽取的路径常量(隔离)
+    monkeypatch.setattr(mod, "ONTOLOGY_DIR", project_dir / "meta" / "ontology")
+    monkeypatch.setattr(mod, "ENTITY_RELATIONS_FILE",
+                        project_dir / "meta" / "ontology" / "entity_relations.yaml")
+    return mod
+
+
+@pytest.fixture()
+def patch_consistency_paths(project_dir, monkeypatch):
+    """Big-Loop #3: 一致性模块的路径常量(隔离)。"""
+    _ensure_scripts_importable()
+    import scripts.consistency as mod
+    monkeypatch.setattr(mod, "BASE_DIR", project_dir)
+    monkeypatch.setattr(mod, "META_DIR", project_dir / "meta")
+    monkeypatch.setattr(mod, "WIKI_DIR", project_dir / "wiki")
+    monkeypatch.setattr(mod, "RAW_DIR", project_dir / "raw")
+    monkeypatch.setattr(mod, "INDEX_FILE", project_dir / "wiki" / "index.yaml")
+    monkeypatch.setattr(mod, "CONSISTENCY_DIR", project_dir / "meta" / "consistency")
+    monkeypatch.setattr(mod, "CONTRADICTIONS_FILE",
+                        project_dir / "meta" / "consistency" / "contradictions.yaml")
     return mod
 
 

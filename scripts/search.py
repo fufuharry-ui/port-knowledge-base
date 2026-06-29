@@ -194,8 +194,16 @@ def layer1_filter(query: str, index: dict, top_k: int = 20,
     expanded_query = query
     if ontology:
         try:
-            from scripts.ontology import expand_query_with_ontology
-            extra_terms = expand_query_with_ontology(query, ontology.get("ontology_tree", []))
+            from scripts.ontology import (
+                expand_query_with_ontology, expand_query_with_entities,
+            )
+            extra = expand_query_with_ontology(query, ontology.get("ontology_tree", []))
+            # Big-Loop #2: 合并实体邻居(术语→术语 语义关系)
+            entity_rels = ontology.get("entity_relations", []) if isinstance(ontology, dict) else []
+            extra += expand_query_with_entities(query, entity_rels)
+            # 去重保序
+            seen = set()
+            extra_terms = [t for t in extra if not (t in seen or seen.add(t))]
             if extra_terms:
                 expanded_query = query + " " + " ".join(extra_terms)
         except Exception:
@@ -286,12 +294,22 @@ def load_summary_full(doc_id: str) -> dict:
 
 
 def _load_ontology() -> dict:
-    """加载全局本体树供查询扩展用(缺失/为空 → 返回空 dict,降级纯 BM25)。"""
+    """加载全局本体树 + 实体关系供查询扩展用(缺失/为空 → 返回空 dict,降级纯 BM25)。"""
     if not GLOBAL_ONTOLOGY_FILE.exists():
         return {}
     try:
         with open(GLOBAL_ONTOLOGY_FILE, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
+            data = yaml.safe_load(f) or {}
+        # Big-Loop #2: 并入实体级关系(Layer1 扩展用)
+        ent_file = GLOBAL_ONTOLOGY_FILE.parent / "entity_relations.yaml"
+        if ent_file.exists():
+            try:
+                with open(ent_file, "r", encoding="utf-8") as f:
+                    ent = yaml.safe_load(f) or {}
+                data["entity_relations"] = ent.get("edges", [])
+            except Exception:
+                pass
+        return data
     except Exception:
         return {}
 
@@ -308,8 +326,14 @@ ANSWER_SYSTEM = """你是一个专业的技术文档助理，服务于港口智�
 
 
 def layer3_answer(query: str, top_docs: list[dict],
-                  client, model: str, index: dict) -> str:
-    """Layer 3：基于精选文档全文生成最终回答"""
+                  client, model: str, index: dict,
+                  contradictions: list[dict] | None = None) -> str:
+    """Layer 3：基于精选文档全文生成最终回答。
+
+    Big-Loop #3: contradictions 参数(可选)携带已知矛盾对。
+    若 Top 文档间存在已知矛盾,在答案后附加 ⚠️ 提示(ADR-10:附加非拦截,
+    Layer3 仍正常回答)。None → 从 contradictions.yaml 懒加载(缺失则无提示)。
+    """
     id2entry = {d["id"]: d for d in index.get("documents", [])}
 
     # 构建上下文：全文 + 摘要结构
@@ -348,9 +372,46 @@ def layer3_answer(query: str, top_docs: list[dict],
 
     answer = llm_call_text(client, model, ANSWER_SYSTEM, user_prompt)
 
+    # Big-Loop #3: 矛盾提示(附加,在来源前)。Top 文档内部矛盾才提示,避免噪声。
+    hint = _build_contradiction_hint(top_docs, contradictions)
+
     # 追加来源列表
     sources_section = "\n\n---\n📎 **引用来源:**\n" + "\n".join(sources)
-    return answer + sources_section
+    return answer + hint + sources_section
+
+
+def _build_contradiction_hint(top_docs: list[dict],
+                              contradictions: list[dict] | None) -> str:
+    """构建 ⚠️ 矛盾提示块。无矛盾/contradictions 为空 → 返回空串(无提示)。
+
+    懒导入 scripts.consistency 避免无矛盾场景的加载开销;
+    contradictions 非 None 时直接用(供测试注入,不读文件)。
+    """
+    if not top_docs:
+        return ""
+    top_ids = [d.get("id") for d in top_docs if d.get("id")]
+    if not top_ids:
+        return ""
+    try:
+        from scripts.consistency import contradictions_for_docs, load_contradictions
+        if contradictions is None:
+            contradictions = load_contradictions().get("contradictions", [])
+    except Exception:
+        return ""
+    hits = contradictions_for_docs(top_ids, contradictions)
+    if not hits:
+        return ""
+    lines = ["", "---", "⚠️ **知识库内存在不一致** — 以下文档对同一事实有冲突论断,请注意甄别:"]
+    for c in hits:
+        a = c.get("doc_a", "?")
+        b = c.get("doc_b", "?")
+        point = c.get("conflict_point", "未指明")
+        chain = c.get("reasoning_chain", "")
+        conf = c.get("confidence", 0.0)
+        lines.append(f"- `{a}` ↔ `{b}` · 冲突点: {point} (置信度 {conf:.2f})")
+        if chain:
+            lines.append(f"  推理链: {chain}")
+    return "\n".join(lines) + "\n"
 
 
 # ─── 主检索流程 ──────────────────────────────────────────────────────────────

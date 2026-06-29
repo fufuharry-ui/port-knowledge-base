@@ -128,3 +128,94 @@ def test_search_stream_passes_ontology_to_layer1(
     _args, kwargs = mock_l1.call_args
     assert "ontology" in kwargs
     assert kwargs["ontology"], "/search/stream 未向 layer1_filter 传入有效本体"
+
+
+@patch("api.main.load_contradictions")
+@patch("api.main.layer3_answer", return_value="mock answer")
+@patch("api.main.layer2_score", return_value=[{"id": "doc_A", "title": "A"}])
+@patch("api.main.layer1_filter")
+@patch("api.main.get_llm_client")
+def test_qa_passes_contradictions_to_layer3(
+    mock_client, mock_l1, mock_l2, mock_l3, mock_load_con
+):
+    """P0 回归守卫(Big-Loop #3):/qa 必须把 contradictions 传给 layer3_answer。
+    复刻 Loop #1 ontology 断线教训:用户主路径若忘传 contradictions,
+    Layer3 的矛盾提示在 /qa 上完全不生效。本测试防止该断线。
+    """
+    mock_l1.return_value = [{"id": "doc_A", "title": "A"}]
+    mock_load_con.return_value = {"contradictions": [
+        {"doc_a": "doc_A", "doc_b": "doc_B", "conflict_point": "x"},
+    ]}
+
+    response = client.post("/api/v1/qa", json={"query": "岸桥远控"})
+    assert response.status_code == 200
+
+    assert mock_l3.called
+    _args, kwargs = mock_l3.call_args
+    assert "contradictions" in kwargs, "/qa 未向 layer3_answer 传 contradictions 参数"
+    assert kwargs["contradictions"], "/qa 传入的 contradictions 为空(断线)"
+
+
+def test_entity_graph_endpoint():
+    """E-5:GET /api/v1/entity-graph 返回术语邻居结构。"""
+    response = client.get("/api/v1/entity-graph?term=5G专网&depth=2")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["term"] == "5G专网"
+    assert data["depth"] == 2
+    assert "neighbors" in data
+    assert isinstance(data["neighbors"], list)
+    assert "total_edges" in data
+
+
+def test_entity_graph_empty_term():
+    """term 为空时返回空邻居,不报错"""
+    response = client.get("/api/v1/entity-graph")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["neighbors"] == []
+
+
+# ─── Big-Loop #3: /consistency 端点 ─────────────────────────────────────────
+
+def test_consistency_get():
+    """C-5: GET /api/v1/consistency 返回报告结构(只读)。"""
+    response = client.get("/api/v1/consistency")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "success"
+    assert "total" in data
+    assert isinstance(data["contradictions"], list)
+    assert "last_updated" in data
+
+
+@patch("api.main.run_consistency_check")
+def test_consistency_post_triggers_check(mock_run):
+    """C-5: POST /api/v1/consistency 触发稽核并返回报告。"""
+    mock_run.return_value = {
+        "total": 1,
+        "candidates_checked": 5,
+        "last_updated": "2026-06-29T22:00:00+08:00",
+        "contradictions": [
+            {"doc_a": "doc_A", "doc_b": "doc_B",
+             "conflict_point": "延迟要求", "reasoning_chain": "A说10ms,B说20ms",
+             "confidence": 0.85},
+        ],
+    }
+    response = client.post("/api/v1/consistency")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "success"
+    assert data["total"] == 1
+    assert mock_run.called
+    assert data["contradictions"][0]["conflict_point"] == "延迟要求"
+
+
+@patch("api.main.run_consistency_check", side_effect=Exception("LLM down"))
+def test_consistency_post_degrades_on_error(mock_run):
+    """LLM 不可用 → POST 返回 error 状态(降级,不 500)。"""
+    response = client.post("/api/v1/consistency")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "error"
+    assert data["total"] == 0

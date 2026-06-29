@@ -15,8 +15,11 @@ from scripts.ingest import ingest_file, generate_doc_id
 from scripts.search import (
     search, get_llm_client, layer1_filter, layer2_score, layer3_answer, _load_ontology,
 )
-from scripts.ontology import expand_query_with_ontology
+from scripts.ontology import expand_query_with_ontology, get_entity_neighbors
 from scripts.lint import Linter
+from scripts.consistency import (
+    run_consistency_check, load_contradictions, find_contradiction_candidates,
+)
 
 app = FastAPI(title="Karpathy-Style LLM Wiki API", version="2.0.0")
 
@@ -140,6 +143,32 @@ async def ontology_data():
         "last_updated": data.get("last_updated"),
     }
 
+
+@app.get("/api/v1/entity-graph")
+async def entity_graph(term: str = "", depth: int = 1):
+    """返回某术语的实体级邻居(Big-Loop #2 新增,供前端实体图谱查询)。
+
+    ?term=5G专网&depth=2 → 返回该术语在 entity_relations.yaml 中的多跳邻居 + 相关边。
+    """
+    ent_file = META_DIR / "ontology" / "entity_relations.yaml"
+    edges = []
+    if ent_file.exists():
+        try:
+            with open(ent_file, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            edges = data.get("edges", [])
+        except Exception:
+            edges = []
+
+    from scripts.ontology import get_entity_neighbors
+    neighbors = get_entity_neighbors(term, edges, depth=depth) if term else []
+    # 只返回与该 term 相关的边(邻居 + 自身)
+    relevant = set(neighbors) | ({term} if term else set())
+    related_edges = [e for e in edges
+                     if e.get("source") in relevant or e.get("target") in relevant]
+    return {"term": term, "depth": depth, "neighbors": neighbors,
+            "edges": related_edges, "total_edges": len(edges)}
+
 # ─── GET /api/v1/docs ────────────────────────────────────────────────────────
 
 @app.get("/api/v1/docs")
@@ -246,7 +275,12 @@ async def search_stream(q: str):
 
             # Layer 3 - stream by sentence
             try:
-                answer = layer3_answer(q, top_docs, client, os.environ.get("SEARCH_MODEL", "gpt-4o"), index)
+                # Big-Loop #3: 加载已知矛盾,Top 文档间有矛盾 → 回答附 ⚠️ 提示
+                contradictions = load_contradictions().get("contradictions", [])
+                answer = layer3_answer(
+                    q, top_docs, client, os.environ.get("SEARCH_MODEL", "gpt-4o"), index,
+                    contradictions=contradictions,
+                )
                 chunk_size = 80
                 for i in range(0, len(answer), chunk_size):
                     yield {"data": json.dumps({"delta": answer[i:i + chunk_size]})}
@@ -322,7 +356,12 @@ async def qa_stream(request: QAQuery):
 
             # Step 6: Stream answer
             try:
-                answer = layer3_answer(request.query, top_docs, client, model, index)
+                # Big-Loop #3: 加载已知矛盾,Top 文档间有矛盾 → 回答附 ⚠️ 提示
+                contradictions = load_contradictions().get("contradictions", [])
+                answer = layer3_answer(
+                    request.query, top_docs, client, model, index,
+                    contradictions=contradictions,
+                )
                 chunk_size = 60
                 for i in range(0, len(answer), chunk_size):
                     yield {"data": json.dumps({"type": "delta", "text": answer[i:i + chunk_size]})}
@@ -361,4 +400,41 @@ async def lint_endpoint():
             "missing_concepts_count": len(missing_concepts),
             "contradictions_count": len(contradictions),
         },
+    }
+
+
+# ─── GET/POST /api/v1/consistency (Big-Loop #3: 跨文档一致性稽核) ─────────────
+
+@app.get("/api/v1/consistency")
+async def consistency_get():
+    """查看已知矛盾报告(不触发 LLM,只读 contradictions.yaml)。"""
+    report = load_contradictions()
+    return {
+        "status": "success",
+        "total": report.get("total", 0),
+        "candidates_checked": report.get("candidates_checked", 0),
+        "last_updated": report.get("last_updated"),
+        "contradictions": report.get("contradictions", []),
+    }
+
+
+@app.post("/api/v1/consistency")
+async def consistency_run():
+    """触发全库一致性稽核:生成候选对 → LLM 逐对判定 → 写 contradictions.yaml。
+
+    返回报告摘要。LLM 不可用/无候选 → 返回空报告(降级,不报错)。
+    """
+    try:
+        client = get_llm_client()
+        model = os.environ.get("RELATE_MODEL", os.environ.get("SEARCH_MODEL", "gpt-4o"))
+        report = run_consistency_check(client, model)
+    except Exception as e:
+        return {"status": "error", "message": f"稽核失败: {e}", "total": 0,
+                "contradictions": []}
+    return {
+        "status": "success",
+        "total": report.get("total", 0),
+        "candidates_checked": report.get("candidates_checked", 0),
+        "last_updated": report.get("last_updated"),
+        "contradictions": report.get("contradictions", []),
     }

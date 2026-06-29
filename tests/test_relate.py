@@ -258,3 +258,94 @@ class TestRecommend:
         patch_relate_paths.recommend("doc_nonexistent")
         captured = capsys.readouterr()
         assert "未找到" in captured.out
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5. Big-Loop #2: 实体级关系抽取(术语→术语)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestEntityRelations:
+    """实体级关系抽取与合并"""
+
+    def _seed_for_entity(self, project_dir, doc_id, terms):
+        """预填 index + summary 供实体抽取"""
+        index = {"documents": [
+            {"id": doc_id, "title": f"文档_{doc_id}", "abstract_short": "摘要",
+             "ontology_terms": terms}
+        ]}
+        with open(project_dir / "wiki" / "index.yaml", "w", encoding="utf-8") as f:
+            yaml.dump(index, f, allow_unicode=True)
+        summary = {"doc_id": doc_id, "title": f"文档_{doc_id}",
+                   "abstract": "测试摘要", "key_points": ["论点"]}
+        with open(project_dir / "wiki" / f"{doc_id}.summary.yaml", "w", encoding="utf-8") as f:
+            yaml.dump(summary, f, allow_unicode=True)
+
+    def test_extract_valid_entity_relations(self, patch_relate_paths, project_dir, mock_llm_client):
+        """E-1: 合法实体关系被抽取并写入"""
+        self._seed_for_entity(project_dir, "doc_e1", ["岸桥远控", "5G专网", "MEC"])
+        mock_resp = {"relations": [
+            {"source": "岸桥远控", "target": "5G专网", "type": "depends_on",
+             "confidence": 0.9, "evidence": "远控依赖5G低延迟"},
+            {"source": "5G专网", "target": "MEC", "type": "supports",
+             "confidence": 0.85, "evidence": "5G+MEC降时延"},
+        ]}
+        set_llm_response(mock_llm_client, mock_resp)
+
+        rels = patch_relate_paths.extract_entity_relations(
+            "doc_e1", mock_llm_client, "gpt-4o"
+        )
+        assert len(rels) == 2
+        assert rels[0]["type"] == "depends_on"
+        assert rels[0]["doc_id"] == "doc_e1"
+
+        # 写入 entity_relations.yaml
+        ent_path = project_dir / "meta" / "ontology" / "entity_relations.yaml"
+        assert ent_path.exists()
+        with open(ent_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        assert len(data["edges"]) == 2
+
+    def test_filter_invalid_entity_type(self, patch_relate_paths, project_dir, mock_llm_client):
+        """非法实体关系类型应过滤"""
+        self._seed_for_entity(project_dir, "doc_e2", ["A", "B"])
+        bad = {"relations": [
+            {"source": "A", "target": "B", "type": "unknown", "confidence": 0.9},
+        ]}
+        set_llm_response(mock_llm_client, bad)
+        rels = patch_relate_paths.extract_entity_relations("doc_e2", mock_llm_client, "gpt-4o")
+        assert rels == []
+
+    def test_filter_low_confidence_entity(self, patch_relate_paths, project_dir, mock_llm_client):
+        """confidence < 0.70 的实体关系过滤"""
+        self._seed_for_entity(project_dir, "doc_e3", ["A", "B"])
+        low = {"relations": [
+            {"source": "A", "target": "B", "type": "depends_on", "confidence": 0.5},
+        ]}
+        set_llm_response(mock_llm_client, low)
+        rels = patch_relate_paths.extract_entity_relations("doc_e3", mock_llm_client, "gpt-4o")
+        assert rels == []
+
+    def test_insufficient_terms_skips(self, patch_relate_paths, project_dir, mock_llm_client):
+        """术语 < 2 时跳过(无关系可抽)"""
+        self._seed_for_entity(project_dir, "doc_e4", ["唯一术语"])
+        rels = patch_relate_paths.extract_entity_relations("doc_e4", mock_llm_client, "gpt-4o")
+        assert rels == []
+
+    def test_merge_replaces_old_doc_edges(self, patch_relate_paths, project_dir, mock_llm_client):
+        """重新抽取应替换该 doc 的旧实体边"""
+        self._seed_for_entity(project_dir, "doc_e5", ["A", "B", "C"])
+        # 第一次
+        set_llm_response(mock_llm_client, {"relations": [
+            {"source": "A", "target": "B", "type": "depends_on", "confidence": 0.9}]})
+        patch_relate_paths.extract_entity_relations("doc_e5", mock_llm_client, "gpt-4o")
+        # 第二次(新边)
+        set_llm_response(mock_llm_client, {"relations": [
+            {"source": "A", "target": "C", "type": "depends_on", "confidence": 0.9}]})
+        patch_relate_paths.extract_entity_relations("doc_e5", mock_llm_client, "gpt-4o")
+
+        ent_path = project_dir / "meta" / "ontology" / "entity_relations.yaml"
+        with open(ent_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        doc_edges = [e for e in data["edges"] if e["doc_id"] == "doc_e5"]
+        assert len(doc_edges) == 1
+        assert doc_edges[0]["target"] == "C"

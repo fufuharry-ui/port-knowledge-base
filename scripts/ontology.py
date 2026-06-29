@@ -291,3 +291,85 @@ def rebuild_tree_from_nodes(seed_tree, per_doc_nodes):
 
     tree = [_build(r, {r}) for r in roots]
     return tree, len(reg)
+
+
+# ─── 实体级知识图谱(Big-Loop #2)──────────────────────────────────────────────
+
+def get_entity_neighbors(term, entity_relations, depth=1):
+    """返回 term 在实体关系图中的邻居(多跳,双向,去重,不含自身)。
+
+    entity_relations: list of {source, target, type, confidence, ...}
+    depth: 遍历跳数(1=直接邻居,2=二跳…)。无关系/term 不存在 → []。
+    """
+    if not entity_relations or not term or depth < 1:
+        return []
+
+    # 建无向邻接表(双向:source↔target)
+    adj = {}
+    for r in entity_relations:
+        if not isinstance(r, dict):
+            continue
+        s, t = r.get("source"), r.get("target")
+        if not s or not t:
+            continue
+        adj.setdefault(s, set()).add(t)
+        adj.setdefault(t, set()).add(s)
+
+    if term not in adj:
+        return []
+
+    # BFS 多跳
+    visited = set()
+    frontier = {term}
+    for _ in range(depth):
+        nxt = set()
+        for node in frontier:
+            for nb in adj.get(node, []):
+                if nb not in visited and nb != term:
+                    nxt.add(nb)
+        visited |= nxt
+        frontier = nxt
+        if not frontier:
+            break
+    visited.discard(term)
+    return list(visited)
+
+
+def expand_query_with_entities(query, entity_relations, matched_terms=None):
+    """识别 query 中命中的本体术语,返回其**实体邻居**(term→term 关系目标)。
+
+    与 expand_query_with_entities 互补:#1 注入上位/兄弟(分类),
+    本函数注入语义关系邻居(依赖/支撑/属于…)。
+
+    matched_terms: 若调用方已识别命中术语,直接传入;否则从 query 子串匹配。
+    无 entity_relations → [](降级)。
+    """
+    if not entity_relations or not query:
+        return []
+
+    # 收集所有出现的术语(作候选命中)
+    all_terms = sorted(
+        (t for t in _collect_relation_terms(entity_relations) if t and len(t) >= 2),
+        key=len, reverse=True,
+    )
+    hits = matched_terms if matched_terms else [t for t in all_terms if t in query]
+
+    expansions = []
+    for term in hits:
+        for nb in get_entity_neighbors(term, entity_relations, depth=1):
+            if nb not in hits and nb not in expansions:
+                expansions.append(nb)
+    return expansions
+
+
+def _collect_relation_terms(entity_relations):
+    """收集所有实体关系中的 source/target 术语。"""
+    terms = set()
+    for r in entity_relations or []:
+        if not isinstance(r, dict):
+            continue
+        if r.get("source"):
+            terms.add(r["source"])
+        if r.get("target"):
+            terms.add(r["target"])
+    return terms

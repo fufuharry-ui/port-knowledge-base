@@ -112,3 +112,48 @@ Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
 ## [2026-06-29 21:50:57] ingest | my_doc
 Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
 
+## [2026-06-29 22:02:19] ingest | 测试文档
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 22:02:19] ingest | test
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 22:02:19] ingest | doc
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 22:02:19] ingest | complete_test
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 22:02:19] ingest | my_doc
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 22:31:11] ingest | 测试文档
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 22:31:11] ingest | test
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 22:31:11] ingest | doc
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 22:31:11] ingest | complete_test
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 22:31:11] ingest | my_doc
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 22:41:17] ingest | 测试文档
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 22:41:17] ingest | test
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 22:41:17] ingest | doc
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 22:41:17] ingest | complete_test
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 22:41:17] ingest | my_doc
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+

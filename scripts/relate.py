@@ -19,8 +19,11 @@ import yaml
 BASE_DIR = Path(__file__).parent.parent
 WIKI_DIR = BASE_DIR / "wiki"
 RELATIONS_DIR = BASE_DIR / "meta" / "relations"
+ONTOLOGY_DIR = BASE_DIR / "meta" / "ontology"
 INDEX_FILE = WIKI_DIR / "index.yaml"
 KG_FILE = RELATIONS_DIR / "knowledge_graph.yaml"
+# Big-Loop #2: 实体级关系汇总文件
+ENTITY_RELATIONS_FILE = ONTOLOGY_DIR / "entity_relations.yaml"
 
 TZ_CST = timezone(timedelta(hours=8))
 CONFIDENCE_THRESHOLD = 0.70
@@ -29,6 +32,8 @@ RELATION_LABELS = {
     "cites": "引用", "supplements": "补充", "contradicts": "⚠️ 矛盾",
     "same_topic": "同主题", "version_iteration": "版本迭代",
 }
+# Big-Loop #2: 实体级关系类型(术语→术语)
+ENTITY_RELATION_TYPES = {"depends_on", "part_of", "supports", "alternative_of"}
 
 
 def _load_env():
@@ -157,6 +162,78 @@ def update_kg(doc_id, relations):
     print(f"  [OK] 知识图谱更新，共 {len(kg['edges'])} 条边")
 
 
+# ─── Big-Loop #2: 实体级关系抽取(术语→术语)──────────────────────────────────
+
+ENTITY_SYSTEM = """你是一个领域本体工程师，识别**同一文档内术语之间**的语义关系。
+关系类型:
+  depends_on(依赖) — A 的实现/运行依赖 B
+  part_of(属于/构成) — A 是 B 的组成部分
+  supports(支撑) — A 为 B 提供能力支撑(与 depends_on 互逆,选更贴切者)
+  alternative_of(替代) — A 与 B 互为替代方案
+仅输出 confidence >= 0.70 的关系。每对术语最多 1 条关系。
+严格 JSON: {"relations": [{"source": "术语A", "target": "术语B", "type": "depends_on", "confidence": 0.85, "evidence": "证据(30字内)"}]}"""
+
+
+def extract_entity_relations(doc_id, client, model):
+    """抽取某文档术语间的实体级关系,合并写入 entity_relations.yaml。"""
+    summary = load_summary(doc_id)
+    if not summary:
+        return []
+    index = load_index()
+    # 取该文档的本体术语(从 index 条目)
+    terms = []
+    for d in index.get("documents", []):
+        if d["id"] == doc_id:
+            terms = d.get("ontology_terms", [])
+            break
+    if len(terms) < 2:
+        return []  # 不足两个术语,无关系可抽
+
+    user = (
+        f"文档: {summary.get('title', doc_id)}\n"
+        f"摘要: {summary.get('abstract', '')[:300]}\n"
+        f"论点: {'; '.join(summary.get('key_points', [])[:3])}\n"
+        f"术语列表: {', '.join(terms)}"
+    )
+    result = llm_call(client, model, ENTITY_SYSTEM, user)
+
+    valid_terms = set(terms)
+    seen = set()
+    relations = []
+    for r in result.get("relations", []):
+        s, t = r.get("source"), r.get("target")
+        key = tuple(sorted([s, t]))
+        if (s in valid_terms and t in valid_terms
+                and r.get("type") in ENTITY_RELATION_TYPES
+                and float(r.get("confidence", 0)) >= 0.70
+                and s != t and key not in seen):
+            relations.append({
+                "source": s, "target": t, "type": r["type"],
+                "confidence": r["confidence"], "evidence": r.get("evidence", ""),
+                "doc_id": doc_id,
+            })
+            seen.add(key)
+
+    _merge_entity_relations(doc_id, relations)
+    if relations:
+        print(f"  [OK] 实体关系抽取 {len(relations)} 条")
+    return relations
+
+
+def _merge_entity_relations(doc_id, relations):
+    """合并到全局 entity_relations.yaml(先移除该 doc 的旧边)。"""
+    ONTOLOGY_DIR.mkdir(parents=True, exist_ok=True)
+    data = {"edges": []}
+    if ENTITY_RELATIONS_FILE.exists():
+        with open(ENTITY_RELATIONS_FILE, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {"edges": []}
+    data["edges"] = [e for e in data.get("edges", []) if e.get("doc_id") != doc_id]
+    data["edges"].extend(relations)
+    data["last_updated"] = datetime.now(TZ_CST).isoformat()
+    with open(ENTITY_RELATIONS_FILE, "w", encoding="utf-8") as f:
+        yaml.dump(data, f, allow_unicode=True, sort_keys=False)
+
+
 def recommend(doc_id):
     p = RELATIONS_DIR / f"{doc_id}.relations.yaml"
     if not p.exists():
@@ -201,6 +278,8 @@ def main():
         rels = detect_relations(doc_id, client, model)
         write_relations(doc_id, rels)
         update_kg(doc_id, rels)
+        # Big-Loop #2: 实体级关系抽取
+        extract_entity_relations(doc_id, client, model)
     print("\n✅ 关系检测完成")
 
 

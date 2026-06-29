@@ -105,7 +105,14 @@ class TestCompileOntology:
     def test_global_ontology_updated_with_new_nodes(
         self, patch_compile_paths, project_dir, mock_llm_client
     ):
-        """新节点（is_new_node=True）应追加到 global_ontology.yaml"""
+        """新节点应合并进 global_ontology.yaml 为真树(非顶层孤儿)。
+
+        Big-Loop #1 修正:旧断言 +2 实为对"扁平追加"bug 的编码。
+        SAMPLE 响应给 岸桥远控(parent=港口自动化,在树中)与 5G专网
+        (parent=通信技术[不在],grandparent=基础设施[在])。
+        真树合并:岸桥远控挂 港口自动化(+1);新建 通信技术 挂 基础设施、
+        5G专网挂 通信技术(+2)。共 +3,且无顶层孤儿。
+        """
         set_llm_response(mock_llm_client, SAMPLE_ONTOLOGY_RESPONSE)
 
         global_ont_path = project_dir / "meta" / "ontology" / "global_ontology.yaml"
@@ -121,8 +128,31 @@ class TestCompileOntology:
         with open(global_ont_path, "r", encoding="utf-8") as f:
             after = yaml.safe_load(f)
 
-        # 应新增 2 个节点 (岸桥远控, 5G专网)
-        assert after["total_nodes"] == nodes_before + 2
+        # 真实增量 3(见上),修正旧 +2 断言
+        assert after["total_nodes"] == nodes_before + 3
+
+        # 岸桥远控 必须嵌套在 港口自动化.children 下,而非顶层孤儿
+        def _find(tree, term):
+            for n in tree:
+                if n.get("term") == term:
+                    return n
+                found = _find(n.get("children", []), term)
+                if found:
+                    return found
+            return None
+
+        assert _find(after["ontology_tree"], "岸桥远控") is not None
+        auto = _find(after["ontology_tree"], "港口自动化")
+        assert auto is not None
+        assert any(c["term"] == "岸桥远控" for c in auto.get("children", []))
+        # 5G专网 挂在 通信技术 下。注:conftest 种子树无"基础设施",
+        # 故 grandparent 缺失 → 通信技术 被建为**新根**(parent=None,不悬空)。
+        # U-2(grandparent 存在则建中间父节点)由 test_ontology.py 覆盖。
+        fiveg = _find(after["ontology_tree"], "5G专网")
+        assert fiveg is not None and fiveg["parent"] == "通信技术"
+        comm = _find(after["ontology_tree"], "通信技术")
+        assert comm is not None and comm["parent"] is None  # 种子无 基础设施 → 新根
+        assert any(c["term"] == "5G专网" for c in comm.get("children", []))
 
     def test_existing_terms_not_duplicated(
         self, patch_compile_paths, project_dir, mock_llm_client

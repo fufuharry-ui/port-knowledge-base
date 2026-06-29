@@ -93,6 +93,9 @@ def patch_search_paths(project_dir, monkeypatch):
     monkeypatch.setattr(mod, "RAW_DIR", project_dir / "raw")
     monkeypatch.setattr(mod, "WIKI_DIR", project_dir / "wiki")
     monkeypatch.setattr(mod, "INDEX_FILE", project_dir / "wiki" / "index.yaml")
+    # Big-Loop #1: 检索层读取全局本体做查询扩展,必须同步 patch 隔离
+    monkeypatch.setattr(mod, "GLOBAL_ONTOLOGY_FILE",
+                        project_dir / "meta" / "ontology" / "global_ontology.yaml")
     return mod
 
 

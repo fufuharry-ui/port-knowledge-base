@@ -12,7 +12,10 @@ from sse_starlette.sse import EventSourceResponse
 import yaml
 
 from scripts.ingest import ingest_file, generate_doc_id
-from scripts.search import search, get_llm_client, layer1_filter, layer2_score, layer3_answer
+from scripts.search import (
+    search, get_llm_client, layer1_filter, layer2_score, layer3_answer, _load_ontology,
+)
+from scripts.ontology import expand_query_with_ontology
 from scripts.lint import Linter
 
 app = FastAPI(title="Karpathy-Style LLM Wiki API", version="2.0.0")
@@ -80,47 +83,33 @@ async def wiki_index():
 
 @app.get("/api/v1/graph")
 async def graph_data():
-    """Build nodes and edges from index and relations files."""
+    """Build nodes and edges from index and the knowledge graph.
+
+    Big-Loop #1 修正:旧实现读 per-doc 文件取 rel.get('source')/'target'),
+    但 per-doc 关系实际字段是 target_doc_id 且无 source;又读 KG 的 relations
+    键,但 KG 实际键是 edges → 实际返回 0 条边,前端图谱无连线。改为以
+    knowledge_graph.yaml(权威汇总)的 edges 为准。
+    """
     index = _load_index()
     docs = index.get("documents", [])
 
     nodes = [{"id": d["id"], "title": d.get("title", d["id"])} for d in docs]
     edges = []
 
-    relations_dir = META_DIR / "relations"
-    if relations_dir.exists():
-        for rel_file in relations_dir.glob("*.yaml"):
-            try:
-                with open(rel_file, "r", encoding="utf-8") as f:
-                    rel_data = yaml.safe_load(f) or {}
-                for rel in rel_data.get("relations", []):
-                    src = rel.get("source") or rel.get("src")
-                    tgt = rel.get("target") or rel.get("tgt")
-                    if src and tgt:
-                        edges.append({
-                            "source": src,
-                            "target": tgt,
-                            "type": rel.get("type", "relates_to"),
-                            "confidence": rel.get("confidence"),
-                        })
-            except Exception:
-                pass
-
-    # Also try a global knowledge_graph.yaml if it exists
     kg_file = META_DIR / "relations" / "knowledge_graph.yaml"
     if kg_file.exists():
         try:
             with open(kg_file, "r", encoding="utf-8") as f:
                 kg = yaml.safe_load(f) or {}
-            for rel in kg.get("relations", []):
-                src = rel.get("source") or rel.get("src")
-                tgt = rel.get("target") or rel.get("tgt")
+            for e in kg.get("edges", []):
+                src = e.get("source")
+                tgt = e.get("target")
                 if src and tgt:
                     edges.append({
                         "source": src,
                         "target": tgt,
-                        "type": rel.get("type", "relates_to"),
-                        "confidence": rel.get("confidence"),
+                        "type": e.get("type", "relates_to"),
+                        "confidence": e.get("confidence"),
                     })
         except Exception:
             pass
@@ -135,6 +124,21 @@ async def graph_data():
             unique_edges.append(e)
 
     return {"nodes": nodes, "edges": unique_edges}
+
+
+@app.get("/api/v1/ontology")
+async def ontology_data():
+    """Return the global ontology tree (供前端本体视图;Big-Loop #1 新增)。"""
+    ont_file = META_DIR / "ontology" / "global_ontology.yaml"
+    if not ont_file.exists():
+        return {"ontology_tree": [], "total_nodes": 0, "last_updated": None}
+    with open(ont_file, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    return {
+        "ontology_tree": data.get("ontology_tree", []),
+        "total_nodes": data.get("total_nodes", 0),
+        "last_updated": data.get("last_updated"),
+    }
 
 # ─── GET /api/v1/docs ────────────────────────────────────────────────────────
 
@@ -217,8 +221,10 @@ async def search_stream(q: str):
         try:
             client = get_llm_client()
             index = _load_index()
+            # Big-Loop #1: 本体查询扩展(缺失则降级纯 BM25)
+            ontology = _load_ontology()
             # Layer 1
-            candidates = layer1_filter(q, index, top_k=20)
+            candidates = layer1_filter(q, index, top_k=20, ontology=ontology)
             if not candidates:
                 yield {"data": json.dumps({"delta": "⚠️ 未找到相关文档，请调整检索词。"})}
                 yield {"data": "[DONE]"}
@@ -267,9 +273,25 @@ async def qa_stream(request: QAQuery):
             index = _load_index()
             model = os.environ.get("SEARCH_MODEL", "gpt-4o")
 
+            # Big-Loop #1: 本体查询扩展(缺失则降级纯 BM25)
+            ontology = _load_ontology()
+            expansion_terms = []
+            if ontology:
+                try:
+                    expansion_terms = expand_query_with_ontology(
+                        request.query, ontology.get("ontology_tree", [])
+                    )
+                except Exception:
+                    expansion_terms = []
+
             # Step 1: Thought - BM25 filter
             yield {"data": json.dumps({"type": "thought", "step": 1, "message": "🔍 BM25 关键词初筛中..."})}
-            candidates = layer1_filter(request.query, index, top_k=20)
+            candidates = layer1_filter(request.query, index, top_k=20, ontology=ontology)
+
+            # Step 1.5: 本体扩展的可 thought(若有扩展词,显式告知用户)
+            if expansion_terms:
+                shown = ", ".join(expansion_terms[:8])
+                yield {"data": json.dumps({"type": "thought", "step": 1, "message": f"🧭 本体扩展词: {shown}"})}
 
             if not candidates:
                 yield {"data": json.dumps({"type": "delta", "text": "⚠️ 未找到相关文档，请调整提问关键词。"})}

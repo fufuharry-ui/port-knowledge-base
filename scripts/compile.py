@@ -211,34 +211,28 @@ def _get_existing_terms() -> list[str]:
 
 
 def _update_global_ontology(new_nodes: list):
-    """将新节点合并到全局本体（简单追加，不做树结构整合）"""
+    """将新节点合并到全局本体为**真树**(消除顶层孤儿)。
+
+    Big-Loop #1 修正:旧实现把每个新节点都 extend 到 ontology_tree 顶层,
+    只留 parent 标签但不真正挂到父节点下 → 产生大量顶层孤儿与悬空 parent 引用。
+    现改用 scripts.ontology.merge_ontology_nodes 做真树插入(parent 在树中
+    则挂其 children;parent 缺失但 grandparent 在则建中间父节点)。
+    """
     if not GLOBAL_ONTOLOGY_FILE.exists():
         return
     with open(GLOBAL_ONTOLOGY_FILE, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
 
-    existing_terms = set(_get_existing_terms())
-    added = 0
-    # 仅追加真正新节点（is_new_node=True 且不存在于本体中）
-    new_top_level = []
-    for node in new_nodes:
-        if node.get("is_new_node") and node.get("term") not in existing_terms:
-            new_top_level.append({
-                "term": node["term"],
-                "parent": node.get("parent"),
-                "definition": node.get("definition", ""),
-                "children": [],
-            })
-            existing_terms.add(node["term"])
-            added += 1
+    from scripts.ontology import merge_ontology_nodes
+    tree = data.setdefault("ontology_tree", [])
+    added = merge_ontology_nodes(tree, new_nodes)
 
-    if new_top_level:
-        data.setdefault("ontology_tree", []).extend(new_top_level)
+    if added:
         data["last_updated"] = datetime.now(TZ_CST).isoformat()
         data["total_nodes"] = data.get("total_nodes", 0) + added
         with open(GLOBAL_ONTOLOGY_FILE, "w", encoding="utf-8") as f:
             yaml.dump(data, f, allow_unicode=True, sort_keys=False)
-        print(f"  [OK] 全局本体新增 {added} 个节点")
+        print(f"  [OK] 全局本体新增 {added} 个节点(真树合并)")
 
 
 # ─── Step C：更新全局索引 ────────────────────────────────────────────────────

@@ -24,6 +24,9 @@ BASE_DIR = Path(__file__).parent.parent
 RAW_DIR = BASE_DIR / "raw"
 WIKI_DIR = BASE_DIR / "wiki"
 INDEX_FILE = WIKI_DIR / "index.yaml"
+# Big-Loop #1: 全局本体树路径(查询扩展读取)。模块常量,便于测试隔离
+# (见 tests/conftest.py patch_search_paths)。
+GLOBAL_ONTOLOGY_FILE = BASE_DIR / "meta" / "ontology" / "global_ontology.yaml"
 TZ_CST = timezone(timedelta(hours=8))
 
 
@@ -174,18 +177,36 @@ def reciprocal_rank_fusion(scores1: dict[str, float], scores2: dict[str, float],
     return fused
 
 
-def layer1_filter(query: str, index: dict, top_k: int = 20) -> list[dict]:
+def layer1_filter(query: str, index: dict, top_k: int = 20,
+                  ontology: dict | None = None) -> list[dict]:
     """Layer 1：从全局索引中通过混合检索粗筛候选文档。
     Only includes documents with either a BM25 hit or a meaningful vector score.
+
+    Big-Loop #1 新增(本体查询扩展):若传入 ontology(含 ontology_tree),
+    则把查询命中的本体术语的上位/兄弟词注入 BM25 加权,捞回"字面词 miss、
+    本体相关"的文档。ontology=None 时行为与旧版完全一致(向后兼容)。
     """
     docs = index.get("documents", [])
     if not docs:
         return []
 
+    # 本体查询扩展(本体缺失/为空 → 空列表,降级纯 BM25)
+    expanded_query = query
+    if ontology:
+        try:
+            from scripts.ontology import expand_query_with_ontology
+            extra_terms = expand_query_with_ontology(query, ontology.get("ontology_tree", []))
+            if extra_terms:
+                expanded_query = query + " " + " ".join(extra_terms)
+        except Exception:
+            # 扩展失败不应阻断检索
+            pass
+
     bm25 = BM25Engine(docs)
     vector = VectorEngine(docs)
-    
-    bm25_scores = bm25.search(query)
+
+    # BM25 用扩展后的查询;向量仍用原始查询(语义不稀释)
+    bm25_scores = bm25.search(expanded_query)
     vector_scores = vector.search(query)
     
     # Only include docs that have at least a BM25 hit, or are in vector results
@@ -264,6 +285,17 @@ def load_summary_full(doc_id: str) -> dict:
     return {}
 
 
+def _load_ontology() -> dict:
+    """加载全局本体树供查询扩展用(缺失/为空 → 返回空 dict,降级纯 BM25)。"""
+    if not GLOBAL_ONTOLOGY_FILE.exists():
+        return {}
+    try:
+        with open(GLOBAL_ONTOLOGY_FILE, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+
 ANSWER_SYSTEM = """你是一个专业的技术文档助理，服务于港口智慧化与数字化转型领域。
 
 你的回答要求：
@@ -339,8 +371,11 @@ def search(query: str, client, verbose: bool = True) -> str:
         print(f"\n🔍 查询: {query}")
         print(f"📚 知识库文档总数: {len(index['documents'])}")
 
+    # Big-Loop #1: 加载全局本体做查询扩展(缺失则降级纯 BM25)
+    ontology = _load_ontology()
+
     # Layer 1
-    candidates = layer1_filter(query, index, top_k=20)
+    candidates = layer1_filter(query, index, top_k=20, ontology=ontology)
     if verbose:
         print(f"[Layer 1] BM25 筛选: {len(candidates)} 篇候选文档")
 

@@ -37,3 +37,78 @@ Used docs: doc_20260405_001
 ## [2026-04-12 21:06:08] ingest | 关于调整优化集团公司智慧港口建设管理体制机制的研究报告(1)
 Files created: raw/doc_20260412_003.txt, raw/doc_20260412_003.meta.yaml
 
+## [2026-06-29 16:34:40] ingest | 测试文档
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 16:34:40] ingest | test
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 16:34:40] ingest | doc
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 16:34:40] ingest | complete_test
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 16:34:40] ingest | my_doc
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 17:10:58] ingest | 测试文档
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 17:10:58] ingest | test
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 17:10:58] ingest | doc
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 17:10:58] ingest | complete_test
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 17:10:58] ingest | my_doc
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 17:17:08] ingest | 测试文档
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 17:17:08] ingest | test
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 17:17:08] ingest | doc
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 17:17:08] ingest | complete_test
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 17:17:08] ingest | my_doc
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 21:40:58] ingest | 测试文档
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 21:40:58] ingest | test
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 21:40:58] ingest | doc
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 21:40:58] ingest | complete_test
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 21:40:58] ingest | my_doc
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 21:50:57] ingest | 测试文档
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 21:50:57] ingest | test
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 21:50:57] ingest | doc
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 21:50:57] ingest | complete_test
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+
+## [2026-06-29 21:50:57] ingest | my_doc
+Files created: raw/doc_20260629_001.txt, raw/doc_20260629_001.meta.yaml
+

@@ -1,0 +1,33 @@
+doc_id: doc_20260405_003
+extracted_at: '2026-04-05T19:03:09.311825+08:00'
+ontology_nodes:
+- term: 5G技术
+  parent: 通信技术
+  grandparent: null
+  definition: 第五代移动通信技术，凭借大带宽、低时延与高可靠特性支撑港口自动化作业。
+  is_new_node: true
+- term: eMBB
+  parent: 5G技术
+  grandparent: 通信技术
+  definition: 增强型移动宽带，用于实现岸桥远控等场景的高清视频大带宽回传。
+  is_new_node: true
+- term: uRLLC
+  parent: 5G技术
+  grandparent: 通信技术
+  definition: 超可靠低延迟通信，保障无人集卡等设备的厘米级精准控制与实时响应。
+  is_new_node: true
+- term: 无人集卡
+  parent: 自动导引车
+  grandparent: 港口自动化
+  definition: 应用于港口水平运输的无人驾驶集装箱卡车，依赖5G实现精准调度与控制。
+  is_new_node: true
+- term: 智能理货
+  parent: 港口自动化
+  grandparent: 智慧港口
+  definition: 结合AI视觉技术实现集装箱自动识别与计数，准确率超99%的港口作业环节。
+  is_new_node: true
+- term: 5G+光纤冗余链路
+  parent: 通信技术
+  grandparent: 基础设施
+  definition: 融合5G无线与光纤有线的双链路架构，用于极端气象下保障港口业务高可用性。
+  is_new_node: true

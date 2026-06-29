@@ -1,0 +1,11 @@
+doc_id: doc_20260406_008
+detected_at: '2026-04-06T23:13:53.295639+08:00'
+relations:
+- target_doc_id: doc_20260406_007
+  type: same_topic
+  confidence: 0.9
+  evidence: 两者均聚焦天津港集团智慧港口顶层规划与数字化转型路径，核心议题高度重合。
+- target_doc_id: doc_20260405_004
+  type: same_topic
+  confidence: 0.85
+  evidence: 两者均围绕天津港2026年智慧港口升级与数字化建设展开，目标与战略方向一致。

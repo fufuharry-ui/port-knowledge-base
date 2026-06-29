@@ -1,0 +1,7 @@
+doc_id: doc_20260405_003
+detected_at: '2026-04-05T19:08:29.817407+08:00'
+relations:
+- target_doc_id: doc_20260405_002
+  type: same_topic
+  confidence: 0.92
+  evidence: 两篇文档均聚焦于5G通信技术在自动化/智慧港口场景中的应用，核心探讨5G如何赋能港口物流与作业设备的无人化与智能化转型。

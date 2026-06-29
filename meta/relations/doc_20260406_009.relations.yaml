@@ -1,0 +1,15 @@
+doc_id: doc_20260406_009
+detected_at: '2026-04-06T23:27:10.542147+08:00'
+relations:
+- target_doc_id: doc_20260405_004
+  type: same_topic
+  confidence: 0.85
+  evidence: 两者均聚焦港口集团数字化转型与智慧化建设，新文档的数字员工平台方案是现有文档2026年智慧港口升级版工作方案在AI与智能体技术层面的具体落地。
+- target_doc_id: doc_20260406_007
+  type: same_topic
+  confidence: 0.8
+  evidence: 均围绕天津港集团中长期智慧港口规划与数字化转型展开，新文档的平台建设方案契合‘十五五’规划中关于智能化升级的战略方向。
+- target_doc_id: doc_20260406_008
+  type: supplements
+  confidence: 0.88
+  evidence: 现有文档总结了AI在港口各领域的初步应用成果，新文档提出构建统一的数字员工平台与多模态大模型纳管体系，旨在将分散的AI应用平台化、规模化，是对现有AI应用成果的体系化补充。

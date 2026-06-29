@@ -1,0 +1,23 @@
+# 知识库系统 Python 依赖
+# 安装: pip install -r requirements.txt
+
+# ─── 核心依赖 ───────────────────────────────────────────
+openai>=1.30.0          # LLM API 调用（兼容 OpenAI / Azure / 本地兼容服务）
+pyyaml>=6.0             # YAML 读写
+
+# ─── 文档解析 ───────────────────────────────────────────
+pdfplumber>=0.10.0      # PDF 文本提取（含表格识别）
+python-docx>=1.1.0      # Word 文档解析
+readability-lxml>=0.8.1 # 网页正文提取
+
+# ─── 可选：性能增强 ─────────────────────────────────────────────────────────────
+# rank-bm25>=0.2.2      # 标准 BM25 实现（当前使用内置简化版），取消注释以启用
+# python-dotenv>=1.0.0  # .env 文件加载（当前内置实现），取消注释以使用标准库
+
+# ─── Phase 2a: 后端服务化 ────────────────────────────────────────────────────
+fastapi>=0.111.0          # Web 框架
+uvicorn[standard]>=0.29.0 # ASGI 服务器
+python-multipart>=0.0.9   # 文件上传（multipart/form-data）
+jieba>=0.42.1             # 中文分词（替换 Layer 1 空格切词）
+httpx>=0.27.0             # 异步 HTTP 客户端（TestClient 依赖）
+pytest-asyncio>=0.23.0    # 异步测试支持

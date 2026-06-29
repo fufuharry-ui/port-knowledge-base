@@ -1,0 +1,15 @@
+doc_id: doc_20260405_004
+detected_at: '2026-04-05T21:44:29.810227+08:00'
+relations:
+- target_doc_id: doc_20260405_002
+  type: same_topic
+  confidence: 0.85
+  evidence: 新文档提出推进自动化码头2.0/3.0建设与全流程智慧赋能，现有文档聚焦AGV无人化导航与调度技术，两者均围绕港口自动化装备与智慧物流体系展开，核心主题高度一致。
+- target_doc_id: doc_20260405_003
+  type: supplements
+  confidence: 0.82
+  evidence: 新文档规划夯实ICT数字底座与网络通信升级，现有文档详细论证5G技术解决传统网络瓶颈、支撑港口全自动化转型的优势，为新文档的ICT底座建设提供关键底层技术补充。
+- target_doc_id: doc_20260405_001
+  type: same_topic
+  confidence: 0.8
+  evidence: 新文档为集团级智慧港口升级总体方案，涵盖自动化码头建设；现有文档针对具体码头三期自动化装卸系统提出技改方案，两者均聚焦港口生产作业自动化升级，属于同主题下的宏观规划与微观实施关系。

@@ -1,0 +1,23 @@
+doc_id: doc_20260405_001
+extracted_at: '2026-04-05T19:15:38.054498+08:00'
+ontology_nodes:
+- term: SA架构
+  parent: 5G技术
+  definition: 5G独立组网架构，提供完整核心网，支撑港口专网低延迟高可靠通信。
+  is_new_node: true
+- term: 自动化装卸系统
+  parent: 港口自动化
+  definition: 集成远控技术与自动化设备的码头作业系统，旨在提升吞吐量与保障安全。
+  is_new_node: true
+- term: 场桥远控
+  parent: 港口自动化
+  definition: 对码头堆场起重机实施远程操控的技术，有效降低人员高空作业风险。
+  is_new_node: true
+- term: 数据流量本地化卸载
+  parent: MEC边缘计算
+  definition: 通过边缘节点就近处理业务流量，避免回传核心网，显著降低网络延迟。
+  is_new_node: true
+- term: 控制信令延迟
+  parent: 通信技术
+  definition: 设备控制指令在网络传输的耗时，港口远控场景要求严格控制在20ms内。
+  is_new_node: true

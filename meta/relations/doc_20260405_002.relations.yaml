@@ -1,0 +1,7 @@
+doc_id: doc_20260405_002
+detected_at: '2026-04-05T19:07:49.937102+08:00'
+relations:
+- target_doc_id: doc_20260405_003
+  type: same_topic
+  confidence: 0.92
+  evidence: 两篇文档均聚焦于5G通信技术在智慧港口/自动化码头建设中的核心应用与赋能作用。

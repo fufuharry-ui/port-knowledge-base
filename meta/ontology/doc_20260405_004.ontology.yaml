@@ -1,0 +1,39 @@
+doc_id: doc_20260405_004
+extracted_at: '2026-04-05T21:43:28.299758+08:00'
+ontology_nodes:
+- term: 数字孪生
+  parent: 港口数字化
+  definition: 构建港口物理实体与虚拟模型实时映射的技术体系，用于仿真推演与优化决策。
+  is_new_node: true
+- term: 自动化码头2.0/3.0
+  parent: 港口自动化
+  definition: 港口自动化建设的演进阶段，强调全流程无人化、智能化协同与系统自主可控。
+  is_new_node: true
+- term: JTOS
+  parent: 港口操作系统
+  definition: 天津港自主研发的码头生产作业核心调度与管理系统，实现全流程智慧赋能。
+  is_new_node: true
+- term: 智能体
+  parent: 人工智能
+  definition: 具备自主感知、决策与执行能力的AI应用形态，用于重塑港口管理与决策流程。
+  is_new_node: true
+- term: ICT数字底座
+  parent: 基础设施
+  definition: 支撑港口数字化运行的底层信息通信技术设施、算力网络与云平台集合。
+  is_new_node: true
+- term: 信创适配
+  parent: 港口安全
+  definition: 核心软硬件系统向国产化技术栈迁移与兼容性验证的过程，保障供应链安全。
+  is_new_node: true
+- term: PortGPT
+  parent: 大语言模型
+  definition: 面向港航物流场景定制训练的垂直领域大语言模型，赋能业务智能化。
+  is_new_node: true
+- term: 立体安全防护体系
+  parent: 港口安全
+  definition: 涵盖网络通信、数据资产与底层信创环境的多层级综合安全保障架构。
+  is_new_node: true
+- term: 港口新质生产力
+  parent: 智慧港口
+  definition: 以数字技术与人工智能深度融合驱动的港口高效能、高质量发展核心动能。
+  is_new_node: true

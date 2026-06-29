@@ -1,0 +1,15 @@
+doc_id: doc_20260412_003
+detected_at: '2026-04-12T21:12:19.143265+08:00'
+relations:
+- target_doc_id: doc_20260412_002
+  type: same_topic
+  confidence: 0.92
+  evidence: 两文档均聚焦集团2026年智慧港口升级版建设，新文档从体制机制与考核导向层面进行深度剖析，与简化版工作方案的战略部署同属一个核心主题。
+- target_doc_id: doc_20260405_004
+  type: same_topic
+  confidence: 0.85
+  evidence: 两者均围绕天津港集团智慧港口建设与数字化转型战略展开，新文档的管理体制分析是对该工作方案顶层设计的同主题延伸。
+- target_doc_id: doc_20260406_007
+  type: same_topic
+  confidence: 0.82
+  evidence: 新文档关于数据治理、业技融合及信创算力统筹的论述，与“十五五”规划报告中数字化转型与智慧港口建设路径高度一致。

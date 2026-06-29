@@ -1,0 +1,33 @@
+doc_id: doc_20260405_002
+extracted_at: '2026-04-05T19:00:25.266478+08:00'
+ontology_nodes:
+- term: 北斗RTK
+  parent: 定位导航技术
+  grandparent: 基础设施
+  definition: 基于北斗卫星的实时动态差分技术，为AGV提供厘米级高精度位置基准。
+  is_new_node: true
+- term: 激光雷达SLAM
+  parent: 环境感知算法
+  grandparent: 人工智能
+  definition: 利用激光雷达扫描环境特征实现同步定位与建图的自主导航技术。
+  is_new_node: true
+- term: 融合导航架构
+  parent: 导航控制系统
+  grandparent: 港口自动化
+  definition: 结合卫星定位与传感器SLAM的多源数据融合方案，提升复杂工况定位鲁棒性。
+  is_new_node: true
+- term: 车队管理系统
+  parent: 调度管理平台
+  grandparent: 港口操作系统
+  definition: 用于AGV车队集中监控、任务分配与实时路径下发的核心控制软件。
+  is_new_node: true
+- term: 动态避障策略
+  parent: 主动安全技术
+  grandparent: 港口安全
+  definition: 针对静动态障碍物采取差异化绕行或停车等待的实时路径重规划机制。
+  is_new_node: true
+- term: 高频心跳检测
+  parent: 链路状态监测
+  grandparent: 5G专网
+  definition: 通过5G网络高频发送状态信号以实时监控AGV在线状态与通信质量。
+  is_new_node: true

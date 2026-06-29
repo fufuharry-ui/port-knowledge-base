@@ -1,0 +1,35 @@
+doc_id: doc_20260406_007
+extracted_at: '2026-04-06T22:47:49.377111+08:00'
+ontology_nodes:
+- term: 数字孪生天津港
+  parent: 数字孪生
+  definition: 以天津港实体为映射的虚拟仿真系统，用于港口规划、运营监控与智能决策优化。
+  is_new_node: true
+- term: 全栈信创替代
+  parent: 信创适配
+  definition: 港口IT基础设施及应用系统从芯片到软件全面采用国产化自主可控技术的升级过程。
+  is_new_node: true
+- term: 数据要素市场化
+  parent: 数据治理
+  definition: 将港口数据资产化，建立确权、定价、交易与流通机制以释放数据经济价值。
+  is_new_node: true
+- term: 供应链物流智慧化
+  parent: 港口数字化
+  definition: 依托数字技术打通港航物流全链条，实现端到端智能协同与高效服务体系构建。
+  is_new_node: true
+- term: 六个数字化
+  parent: 港口数字化
+  definition: 涵盖交易、生产、管理、经营、产业及底座的港口全面数字化转型总体蓝图。
+  is_new_node: true
+- term: 津港智造
+  parent: 智慧港口
+  definition: 天津港自主研发、具备自主知识产权的智慧港口整体解决方案与技术输出品牌。
+  is_new_node: true
+- term: 数据可信流通
+  parent: 数据治理
+  definition: 基于隐私计算等技术保障跨主体港口数据交互的安全、合规与可追溯。
+  is_new_node: true
+- term: 智慧绿色枢纽港口
+  parent: 智慧港口
+  definition: 融合自动化作业、低碳能源与智能调度，具备全球资源配置能力的现代化港口形态。
+  is_new_node: true

@@ -1,0 +1,11 @@
+doc_id: doc_20260405_001
+detected_at: '2026-04-05T19:16:58.245191+08:00'
+relations:
+- target_doc_id: doc_20260405_002
+  type: same_topic
+  confidence: 0.85
+  evidence: 两者均聚焦港口自动化码头建设，新文档侧重岸桥/场桥垂直装卸自动化，现有文档侧重AGV水平运输自动化，共同属于港口全自动化作业系统范畴。
+- target_doc_id: doc_20260405_003
+  type: same_topic
+  confidence: 0.9
+  evidence: 两者核心均围绕5G技术在智慧港口中的应用，新文档具体落地于码头远控场景的网络指标与部署，现有文档为5G港口应用的宏观技术白皮书。

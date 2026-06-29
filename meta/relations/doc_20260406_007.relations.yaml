@@ -1,0 +1,15 @@
+doc_id: doc_20260406_007
+detected_at: '2026-04-06T22:50:56.356493+08:00'
+relations:
+- target_doc_id: doc_20260405_004
+  type: same_topic
+  confidence: 0.95
+  evidence: 两者均聚焦天津港集团智慧港口升级版建设，且明确共享“打造数字孪生天津港”的核心愿景与数字化转型战略方向。
+- target_doc_id: doc_20260405_001
+  type: supplements
+  confidence: 0.78
+  evidence: 新文档宏观提出“自动化码头”与“生产数字化”目标，现有文档提供三期码头自动化装卸系统的具体技改方案与网络实时性指标，为规划落地提供底层技术补充。
+- target_doc_id: doc_20260405_003
+  type: supplements
+  confidence: 0.72
+  evidence: 新文档强调夯实“数字底座”与通信网络升级，现有文档详细论证5G技术在港口高可靠、低延迟通信中的核心作用，是对规划中基础设施层的技术细节补充。

@@ -1,0 +1,342 @@
+import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
+from typing import AsyncIterable
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from sse_starlette.sse import EventSourceResponse
+import yaml
+
+from scripts.ingest import ingest_file, generate_doc_id
+from scripts.search import search, get_llm_client, layer1_filter, layer2_score, layer3_answer
+from scripts.lint import Linter
+
+app = FastAPI(title="Karpathy-Style LLM Wiki API", version="2.0.0")
+
+# ─── CORS ─────────────────────────────────────────────────────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ─── Paths ────────────────────────────────────────────────────────────────────
+BASE_DIR = Path(__file__).parent.parent
+WIKI_DIR = BASE_DIR / "wiki"
+INDEX_FILE = WIKI_DIR / "index.yaml"
+META_DIR = BASE_DIR / "meta"
+ORIGINALS_DIR = BASE_DIR / "originals"
+ORIGINALS_DIR.mkdir(exist_ok=True)
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _load_index() -> dict:
+    if INDEX_FILE.exists():
+        with open(INDEX_FILE, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {"documents": []}
+    return {"documents": []}
+
+
+def ingest_and_compile_task(file_path: Path):
+    try:
+        result = ingest_file(file_path)
+        if result:
+            compile_script = BASE_DIR / "scripts" / "compile.py"
+            if compile_script.exists():
+                subprocess.run(["python", str(compile_script)], cwd=str(BASE_DIR))
+            try:
+                from scripts.logger import global_logger
+                global_logger.log("api_ingest", file_path.stem, "Background task finished successfully.")
+            except ImportError:
+                pass
+    except Exception as e:
+        print(f"Background task failed: {e}")
+
+# ─── Pydantic Models ──────────────────────────────────────────────────────────
+
+class SearchQuery(BaseModel):
+    query: str
+    stream: bool = False
+
+class QAQuery(BaseModel):
+    query: str
+
+# ─── GET /api/v1/wiki/index ───────────────────────────────────────────────────
+
+@app.get("/api/v1/wiki/index")
+async def wiki_index():
+    """Return the full wiki index as JSON."""
+    index = _load_index()
+    docs = index.get("documents", [])
+    return {"total_docs": len(docs), "documents": docs}
+
+# ─── GET /api/v1/graph ───────────────────────────────────────────────────────
+
+@app.get("/api/v1/graph")
+async def graph_data():
+    """Build nodes and edges from index and relations files."""
+    index = _load_index()
+    docs = index.get("documents", [])
+
+    nodes = [{"id": d["id"], "title": d.get("title", d["id"])} for d in docs]
+    edges = []
+
+    relations_dir = META_DIR / "relations"
+    if relations_dir.exists():
+        for rel_file in relations_dir.glob("*.yaml"):
+            try:
+                with open(rel_file, "r", encoding="utf-8") as f:
+                    rel_data = yaml.safe_load(f) or {}
+                for rel in rel_data.get("relations", []):
+                    src = rel.get("source") or rel.get("src")
+                    tgt = rel.get("target") or rel.get("tgt")
+                    if src and tgt:
+                        edges.append({
+                            "source": src,
+                            "target": tgt,
+                            "type": rel.get("type", "relates_to"),
+                            "confidence": rel.get("confidence"),
+                        })
+            except Exception:
+                pass
+
+    # Also try a global knowledge_graph.yaml if it exists
+    kg_file = META_DIR / "relations" / "knowledge_graph.yaml"
+    if kg_file.exists():
+        try:
+            with open(kg_file, "r", encoding="utf-8") as f:
+                kg = yaml.safe_load(f) or {}
+            for rel in kg.get("relations", []):
+                src = rel.get("source") or rel.get("src")
+                tgt = rel.get("target") or rel.get("tgt")
+                if src and tgt:
+                    edges.append({
+                        "source": src,
+                        "target": tgt,
+                        "type": rel.get("type", "relates_to"),
+                        "confidence": rel.get("confidence"),
+                    })
+        except Exception:
+            pass
+
+    # Deduplicate edges
+    seen = set()
+    unique_edges = []
+    for e in edges:
+        key = (e["source"], e["target"], e["type"])
+        if key not in seen:
+            seen.add(key)
+            unique_edges.append(e)
+
+    return {"nodes": nodes, "edges": unique_edges}
+
+# ─── GET /api/v1/docs ────────────────────────────────────────────────────────
+
+@app.get("/api/v1/docs")
+async def list_docs():
+    index = _load_index()
+    docs = index.get("documents", [])
+    return {"documents": docs, "total": len(docs)}
+
+# ─── GET /api/v1/docs/{doc_id} ───────────────────────────────────────────────
+
+@app.get("/api/v1/docs/{doc_id}")
+async def get_doc(doc_id: str):
+    index = _load_index()
+    for doc in index.get("documents", []):
+        if doc["id"] == doc_id:
+            return doc
+    raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found")
+
+# ─── POST /api/v1/upload (alias for ingest) ──────────────────────────────────
+
+@app.post("/api/v1/upload")
+async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    """Frontend-compatible upload endpoint (alias for ingest with BackgroundTask)."""
+    file_path = ORIGINALS_DIR / file.filename
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    doc_id = generate_doc_id()
+    background_tasks.add_task(ingest_and_compile_task, file_path)
+
+    return {
+        "status": "processing",
+        "doc_id": doc_id,
+        "filename": file.filename,
+        "message": "摄入成功，后台自动编译中...",
+    }
+
+# ─── POST /api/v1/ingest ─────────────────────────────────────────────────────
+
+@app.post("/api/v1/ingest")
+async def ingest_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    file_path = ORIGINALS_DIR / file.filename
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    doc_id = generate_doc_id()
+    background_tasks.add_task(ingest_and_compile_task, file_path)
+
+    return {
+        "status": "processing",
+        "doc_id": doc_id,
+        "filename": file.filename,
+        "message": "File uploaded and background processing started.",
+    }
+
+# ─── POST /api/v1/search (sync JSON) ─────────────────────────────────────────
+
+@app.post("/api/v1/search")
+async def search_endpoint(request: SearchQuery):
+    try:
+        client = get_llm_client()
+        answer = search(request.query, client, verbose=False)
+        # Extract source doc_ids from answer text
+        import re
+        source_ids = list({m for m in re.findall(r'\[?(doc_\w+)\]?', answer)})
+        index = _load_index()
+        id_to_title = {d["id"]: d.get("title", d["id"]) for d in index.get("documents", [])}
+        sources = [{"doc_id": sid, "title": id_to_title.get(sid)} for sid in source_ids]
+        return {"answer": answer, "sources": sources}
+    except Exception as e:
+        return {"answer": f"⚠️ 搜索服务暂时不可用: {e}", "sources": []}
+
+# ─── GET /api/v1/search/stream (SSE) ─────────────────────────────────────────
+
+@app.get("/api/v1/search/stream")
+async def search_stream(q: str):
+    """SSE streaming search endpoint used by the Search page."""
+    async def generate():
+        try:
+            client = get_llm_client()
+            index = _load_index()
+            # Layer 1
+            candidates = layer1_filter(q, index, top_k=20)
+            if not candidates:
+                yield {"data": json.dumps({"delta": "⚠️ 未找到相关文档，请调整检索词。"})}
+                yield {"data": "[DONE]"}
+                return
+
+            # Layer 2
+            try:
+                top_docs = layer2_score(q, candidates, client, os.environ.get("SEARCH_MODEL", "gpt-4o"), top_k=5)
+            except Exception:
+                top_docs = candidates[:3]
+
+            # Emit sources as delta header
+            id_to_title = {d["id"]: d.get("title", d["id"]) for d in candidates}
+            source_ids = [d["id"] for d in top_docs]
+            sources_line = "📎 **来源：** " + " | ".join(
+                f"`{sid}` {id_to_title.get(sid, '')}" for sid in source_ids
+            )
+            yield {"data": json.dumps({"delta": sources_line + "\n\n"})}
+
+            # Layer 3 - stream by sentence
+            try:
+                answer = layer3_answer(q, top_docs, client, os.environ.get("SEARCH_MODEL", "gpt-4o"), index)
+                chunk_size = 80
+                for i in range(0, len(answer), chunk_size):
+                    yield {"data": json.dumps({"delta": answer[i:i + chunk_size]})}
+            except Exception as e:
+                yield {"data": json.dumps({"delta": f"\n\n⚠️ 生成回答时出错: {e}"})}
+
+            yield {"data": "[DONE]"}
+        except Exception as e:
+            yield {"data": json.dumps({"delta": f"⚠️ 检索失败: {e}"})}
+            yield {"data": "[DONE]"}
+
+    return EventSourceResponse(generate())
+
+# ─── POST /api/v1/qa (SSE Q&A with thought trace) ────────────────────────────
+
+@app.post("/api/v1/qa")
+async def qa_stream(request: QAQuery):
+    """SSE streaming Q&A used by the ChatPanel on /qa page.
+    Emits: thought, source, entity, delta, done events.
+    """
+    async def generate():
+        try:
+            client = get_llm_client()
+            index = _load_index()
+            model = os.environ.get("SEARCH_MODEL", "gpt-4o")
+
+            # Step 1: Thought - BM25 filter
+            yield {"data": json.dumps({"type": "thought", "step": 1, "message": "🔍 BM25 关键词初筛中..."})}
+            candidates = layer1_filter(request.query, index, top_k=20)
+
+            if not candidates:
+                yield {"data": json.dumps({"type": "delta", "text": "⚠️ 未找到相关文档，请调整提问关键词。"})}
+                yield {"data": json.dumps({"type": "done"})}
+                return
+
+            # Step 2: Thought - LLM scoring
+            yield {"data": json.dumps({"type": "thought", "step": 2, "message": f"🧠 LLM 精选候选文档 ({len(candidates)} → Top-5)..."})}
+            try:
+                top_docs = layer2_score(request.query, candidates, client, model, top_k=5)
+            except Exception:
+                top_docs = candidates[:3]
+
+            # Step 3: Emit sources
+            source_ids = [d["id"] for d in top_docs]
+            id_to_title = {d["id"]: d.get("title", d["id"]) for d in top_docs}
+            citations = [
+                {"ref": f"[{i+1}]", "doc_id": sid, "title": id_to_title.get(sid)}
+                for i, sid in enumerate(source_ids)
+            ]
+            yield {"data": json.dumps({"type": "source", "citations": citations})}
+
+            # Step 4: Emit entity highlights
+            yield {"data": json.dumps({"type": "entity", "ids": source_ids})}
+
+            # Step 5: Thought - generating answer
+            yield {"data": json.dumps({"type": "thought", "step": 3, "message": "✍️ 生成精确回答并注入原文引用..."})}
+
+            # Step 6: Stream answer
+            try:
+                answer = layer3_answer(request.query, top_docs, client, model, index)
+                chunk_size = 60
+                for i in range(0, len(answer), chunk_size):
+                    yield {"data": json.dumps({"type": "delta", "text": answer[i:i + chunk_size]})}
+            except Exception as e:
+                yield {"data": json.dumps({"type": "delta", "text": f"\n\n⚠️ 生成回答失败: {e}"})}
+
+            yield {"data": json.dumps({"type": "done"})}
+
+        except Exception as e:
+            yield {"data": json.dumps({"type": "delta", "text": f"⚠️ 服务异常: {e}"})}
+            yield {"data": json.dumps({"type": "done"})}
+
+    return EventSourceResponse(generate())
+
+# ─── POST /api/v1/lint ────────────────────────────────────────────────────────
+
+@app.post("/api/v1/lint")
+async def lint_endpoint():
+    linter = Linter()
+    orphans = linter.detect_orphan_pages()
+    missing_concepts = linter.detect_missing_concepts()
+
+    try:
+        client = get_llm_client()
+        search_model = os.environ.get("SEARCH_MODEL", "gpt-4o")
+        contradictions = linter.detect_contradictions(client, search_model)
+    except Exception:
+        contradictions = []
+
+    linter.run_lint()
+
+    return {
+        "status": "success",
+        "report": {
+            "orphans_count": len(orphans),
+            "missing_concepts_count": len(missing_concepts),
+            "contradictions_count": len(contradictions),
+        },
+    }

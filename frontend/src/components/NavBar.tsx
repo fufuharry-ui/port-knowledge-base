@@ -7,6 +7,9 @@ const NAV_ITEMS = [
     { href: '/wiki', label: '知识库', icon: '📚' },
     { href: '/search', label: '检索', icon: '🔍' },
     { href: '/graph', label: '知识图谱', icon: '🕸️' },
+    { href: '/ontology', label: '本体', icon: '🌳' },
+    { href: '/entity-graph', label: '实体', icon: '🔗' },
+    { href: '/consistency', label: '稽核', icon: '🛡️' },
     { href: '/qa', label: '问答', icon: '🧠' },
     { href: '/upload', label: '上传', icon: '⬆️' },
 ] as const;

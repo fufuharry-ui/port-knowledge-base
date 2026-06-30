@@ -61,6 +61,55 @@ export interface UploadResult {
     message?: string;
 }
 
+// ─── Big-Loop #4: 推理能力类型(本体/实体图谱/一致性) ──────────────────────
+
+export interface OntologyNode {
+    term: string;
+    parent: string | null;
+    definition?: string;
+    children?: OntologyNode[];
+}
+
+export interface OntologyData {
+    ontology_tree: OntologyNode[];
+    total_nodes: number;
+    last_updated?: string;
+}
+
+export interface EntityGraphData {
+    term: string;
+    depth: number;
+    neighbors: string[];
+    edges: Array<{
+        source: string;
+        target: string;
+        type?: string;
+        confidence?: number;
+        evidence?: string;
+        doc_id?: string;
+    }>;
+    total_edges: number;
+}
+
+export interface Contradiction {
+    doc_a: string;
+    doc_b: string;
+    conflict_point?: string;
+    reasoning_chain?: string;
+    confidence?: number;
+    detected_at?: string;
+}
+
+export interface ConsistencyReport {
+    status: string;
+    total: number;
+    candidates_checked?: number;
+    last_updated?: string;
+    contradictions: Contradiction[];
+    /** POST 失败时后端返回的错误说明(status === 'error') */
+    message?: string;
+}
+
 // ─── 内部工具 ─────────────────────────────────────────────────────────────────
 
 async function handleResponse<T>(res: Response): Promise<T> {
@@ -129,4 +178,31 @@ export async function fetchDocList(): Promise<{ documents: DocMeta[]; total: num
 export async function triggerRelate(docId: string): Promise<{ message: string }> {
     const res = await fetch(`${API_BASE}/api/v1/relate/${docId}`, { method: 'POST' });
     return handleResponse(res);
+}
+
+// ─── Big-Loop #4: 推理能力 API(本体/实体图谱/一致性) ──────────────────────────
+
+/** 获取全局本体树 (Loop #1) */
+export async function fetchOntology(): Promise<OntologyData> {
+    const res = await fetch(`${API_BASE}/api/v1/ontology`);
+    return handleResponse<OntologyData>(res);
+}
+
+/** 获取术语的实体邻居图谱 (Loop #2)。depth 默认 1。 */
+export async function fetchEntityGraph(term: string, depth: number = 1): Promise<EntityGraphData> {
+    const url = `${API_BASE}/api/v1/entity-graph?term=${encodeURIComponent(term)}&depth=${depth}`;
+    const res = await fetch(url);
+    return handleResponse<EntityGraphData>(res);
+}
+
+/** 读取已知矛盾报告(只读 GET,Loop #3) */
+export async function fetchConsistency(): Promise<ConsistencyReport> {
+    const res = await fetch(`${API_BASE}/api/v1/consistency`);
+    return handleResponse<ConsistencyReport>(res);
+}
+
+/** 触发全库一致性稽核(POST,Loop #3)。返回刷新后的报告。 */
+export async function triggerConsistencyCheck(): Promise<ConsistencyReport> {
+    const res = await fetch(`${API_BASE}/api/v1/consistency`, { method: 'POST' });
+    return handleResponse<ConsistencyReport>(res);
 }

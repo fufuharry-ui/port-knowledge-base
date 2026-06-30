@@ -35,6 +35,7 @@ app.add_middleware(
 # ─── Paths ────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent.parent
 WIKI_DIR = BASE_DIR / "wiki"
+RAW_DIR = BASE_DIR / "raw"
 INDEX_FILE = WIKI_DIR / "index.yaml"
 META_DIR = BASE_DIR / "meta"
 ORIGINALS_DIR = BASE_DIR / "originals"
@@ -47,6 +48,30 @@ def _load_index() -> dict:
         with open(INDEX_FILE, "r", encoding="utf-8") as f:
             return yaml.safe_load(f) or {"documents": []}
     return {"documents": []}
+
+
+def _enrich_doc_status(docs: list[dict]) -> list[dict]:
+    """用每篇 .meta.yaml 的权威 status 填充 index 条目(UX 修复)。
+
+    背景:compile.py 只更新 raw/{doc_id}.meta.yaml 的 status(raw→compiled),
+    但 wiki/index.yaml 条目的 status 字段不同步(常滞留 None)。仪表盘据此
+    统计"已编译"数,会误显示 0。这里在 /wiki/index 返回时即时用 .meta.yaml
+    的权威值覆盖,不改 compile.py 核心,也不写回 index.yaml(只读合并)。
+    """
+    for doc in docs:
+        doc_id = doc.get("id")
+        if not doc_id:
+            continue
+        meta_path = RAW_DIR / f"{doc_id}.meta.yaml"
+        try:
+            if meta_path.exists():
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = yaml.safe_load(f) or {}
+                if meta.get("status"):
+                    doc["status"] = meta["status"]
+        except Exception:
+            pass  # 单篇 meta 读取失败不影响整体
+    return docs
 
 
 def ingest_and_compile_task(file_path: Path):
@@ -77,9 +102,13 @@ class QAQuery(BaseModel):
 
 @app.get("/api/v1/wiki/index")
 async def wiki_index():
-    """Return the full wiki index as JSON."""
+    """Return the full wiki index as JSON.
+
+    UX 修复:用 .meta.yaml 的权威 status 即时填充(见 _enrich_doc_status),
+    否则仪表盘"已编译"统计恒为 0。
+    """
     index = _load_index()
-    docs = index.get("documents", [])
+    docs = _enrich_doc_status(index.get("documents", []))
     return {"total_docs": len(docs), "documents": docs}
 
 # ─── GET /api/v1/graph ───────────────────────────────────────────────────────

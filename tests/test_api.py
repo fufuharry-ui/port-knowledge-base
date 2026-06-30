@@ -176,6 +176,37 @@ def test_entity_graph_empty_term():
     assert data["neighbors"] == []
 
 
+# ─── UX 修复:仪表盘编译状态同步 ──────────────────────────────────────────────
+
+def test_wiki_index_enriches_status_from_meta(tmp_path, monkeypatch):
+    """UX 回归守卫:/wiki/index 必须用 .meta.yaml 的权威 status 填充。
+
+    走查发现:index.yaml 条目 status 滞留 None(compile.py 只更新 .meta.yaml),
+    导致仪表盘"已编译"恒为 0。_enrich_doc_status 在端点返回时即时合并。
+    """
+    import api.main as api_mod
+
+    # 构造:index 条目 status=None,但 .meta.yaml status=compiled(模拟真实不一致)
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    for doc_id, meta_status in [("doc_A", "compiled"), ("doc_B", "raw")]:
+        with open(raw_dir / f"{doc_id}.meta.yaml", "w", encoding="utf-8") as f:
+            yaml.dump({"id": doc_id, "status": meta_status}, f, allow_unicode=True)
+
+    monkeypatch.setattr(api_mod, "RAW_DIR", raw_dir)
+    fake_index = {"documents": [
+        {"id": "doc_A", "title": "A", "status": None},
+        {"id": "doc_B", "title": "B", "status": None},
+    ]}
+    with patch("api.main._load_index", return_value=fake_index):
+        response = client.get("/api/v1/wiki/index")
+
+    assert response.status_code == 200
+    docs = {d["id"]: d for d in response.json()["documents"]}
+    assert docs["doc_A"]["status"] == "compiled", "已编译文档状态未从 .meta.yaml 同步"
+    assert docs["doc_B"]["status"] == "raw"
+
+
 # ─── Big-Loop #3: /consistency 端点 ─────────────────────────────────────────
 
 def test_consistency_get():

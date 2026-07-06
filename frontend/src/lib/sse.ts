@@ -6,6 +6,7 @@ import { buildStreamUrl } from './api';
 
 export interface SSECallbacks {
     onDelta: (text: string) => void;
+    onThought?: (step: number, message: string) => void;
     onDone: () => void;
     onError: (err: Error) => void;
 }
@@ -47,7 +48,9 @@ export function startStreamSearch(query: string, callbacks: SSECallbacks): Abort
                     }
                     try {
                         const parsed = JSON.parse(payload);
-                        if (parsed.delta) {
+                        if (parsed.type === 'thought' && callbacks.onThought) {
+                            callbacks.onThought(parsed.step, parsed.message);
+                        } else if (parsed.delta) {
                             callbacks.onDelta(parsed.delta);
                         }
                     } catch {

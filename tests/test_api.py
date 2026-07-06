@@ -250,3 +250,53 @@ def test_consistency_post_degrades_on_error(mock_run):
     data = response.json()
     assert data["status"] == "error"
     assert data["total"] == 0
+
+
+# ─── 落地增强: /api/v1/health 健康检查 ───────────────────────────────────────
+
+def test_health_endpoint():
+    """GET /api/v1/health 返回运维所需的健康字段(部署监控用)。"""
+    response = client.get("/api/v1/health")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    # 关键运维字段
+    assert "doc_count" in data and isinstance(data["doc_count"], int)
+    assert "llm_configured" in data   # OPENAI_API_KEY 是否配置
+    assert "jieba_loaded" in data     # 分词引擎是否就绪
+    assert "ontology_loaded" in data  # 本体是否加载
+    assert "version" in data          # 版本可追溯
+
+
+# ─── 落地增强: /search/stream 进度反馈 ───────────────────────────────────────
+
+@patch("api.main.layer3_answer_stream", return_value=iter(["答案。"]))
+@patch("api.main.layer2_score", return_value=[{"id": "doc_001", "title": "T"}])
+@patch("api.main.layer1_filter")
+@patch("api.main.get_llm_client")
+def test_search_stream_emits_thought_progress(mock_client, mock_l1, mock_l2, mock_l3):
+    """落地增强:/search/stream 应在检索各阶段发 thought 事件,让用户看到进度。
+
+    痛点:Layer1(3s)+Layer2(~10s)期间用户只见"正在检索..."干等 14-21s,
+    易以为系统卡死。发 thought 事件(初筛/精选/生成)让前端能渲染分步进度。
+    """
+    mock_l1.return_value = [{"id": "doc_001", "title": "岸桥方案"}]
+
+    response = client.get("/api/v1/search/stream?q=岸桥", headers={"Accept": "text/event-stream"})
+    assert response.status_code == 200
+
+    # 解析 SSE 流,收集 thought 事件
+    thought_steps = []
+    for line in response.iter_lines():
+        if line and line.startswith("data:"):
+            import json as _json
+            try:
+                ev = _json.loads(line[5:].strip())
+                if ev.get("type") == "thought":
+                    thought_steps.append(ev.get("step"))
+            except _json.JSONDecodeError:
+                pass
+
+    # 至少 3 个步骤(初筛/精选/生成)
+    assert len(thought_steps) >= 3, f"/search/stream 应发≥3 个 thought 事件,实际 {thought_steps}"
+    assert 1 in thought_steps and 2 in thought_steps and 3 in thought_steps

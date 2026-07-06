@@ -25,11 +25,27 @@ from scripts.consistency import (
 app = FastAPI(title="Karpathy-Style LLM Wiki API", version="2.0.0")
 
 
+# ─── .env 加载(启动即读,避免 /health 在首次检索前读到空 env) ────────────────
+# 复用 scripts 的 os.environ.setdefault 语义:真实 env 优先,.env 不覆盖已设值。
+# 用直接路径,不依赖下方 BASE_DIR(其定义在本块之后,此时尚未赋值)。
+_JIEBA_READY = False
+try:
+    _env_file = Path(__file__).resolve().parent.parent / ".env"
+    if _env_file.exists():
+        for _line in _env_file.read_text(encoding="utf-8").splitlines():
+            if "=" in _line and not _line.startswith("#"):
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+except Exception:
+    pass
+
+
 # ─── jieba 预热 (Big-Loop #5, P-4) ───────────────────────────────────────────
 # 进程启动即加载分词词典,消除首次检索的冷启动延迟(~1s)。
 try:
     import jieba  # noqa: F401
     list(jieba.cut("智慧港口岸桥远控预热"))  # 触发词典加载
+    _JIEBA_READY = True
 except Exception:
     pass  # jieba 不可用时 BM25 回退到空白分词,不影响启动
 
@@ -107,6 +123,45 @@ class SearchQuery(BaseModel):
 
 class QAQuery(BaseModel):
     query: str
+
+# ─── GET /api/v1/health (落地增强:部署健康检查) ─────────────────────────────
+
+@app.get("/api/v1/health")
+async def health():
+    """运维健康检查。返回服务状态 + 关键依赖可用性(部署监控用)。
+
+    设计:只读、快速、不调 LLM、不抛异常(即使部分依赖缺失也返回 200 + 如实字段)。
+    """
+    # 文档数
+    try:
+        index = _load_index()
+        doc_count = len(index.get("documents", []))
+    except Exception:
+        doc_count = 0
+
+    # LLM 是否配置(不检查有效性,只看 Key 是否存在)
+    llm_configured = bool(os.environ.get("OPENAI_API_KEY", "").strip())
+
+    # jieba 是否就绪(用预热时设的标志,比探测内部属性可靠)
+    jieba_loaded = _JIEBA_READY
+
+    # 本体是否加载
+    ontology_loaded = False
+    try:
+        from scripts.search import GLOBAL_ONTOLOGY_FILE
+        ontology_loaded = GLOBAL_ONTOLOGY_FILE.exists()
+    except Exception:
+        ontology_loaded = False
+
+    return {
+        "status": "ok",
+        "doc_count": doc_count,
+        "llm_configured": llm_configured,
+        "jieba_loaded": jieba_loaded,
+        "ontology_loaded": ontology_loaded,
+        "version": app.version,
+    }
+
 
 # ─── GET /api/v1/wiki/index ───────────────────────────────────────────────────
 
@@ -291,6 +346,9 @@ async def search_stream(q: str):
             index = _load_index()
             # Big-Loop #1: 本体查询扩展(缺失则降级纯 BM25)
             ontology = _load_ontology()
+
+            # 落地增强:分步 thought 事件,让用户看到检索进度(消除 14-21s 干等焦虑)
+            yield {"data": json.dumps({"type": "thought", "step": 1, "message": f"🔍 初筛候选文档(BM25+本体扩展)..."})}
             # Layer 1
             candidates = layer1_filter(q, index, top_k=20, ontology=ontology)
             if not candidates:
@@ -298,6 +356,7 @@ async def search_stream(q: str):
                 yield {"data": "[DONE]"}
                 return
 
+            yield {"data": json.dumps({"type": "thought", "step": 2, "message": f"🧠 LLM 精选 Top-5(共{len(candidates)}篇候选)..."})}
             # Layer 2
             try:
                 top_docs = layer2_score(q, candidates, client, os.environ.get("SEARCH_MODEL", "gpt-4o"), top_k=5)
@@ -312,17 +371,16 @@ async def search_stream(q: str):
             )
             yield {"data": json.dumps({"delta": sources_line + "\n\n"})}
 
-            # Layer 3 - stream by sentence
+            # Layer 3 - 真流式(Big-Loop #5:layer3_answer_stream 逐 token)
+            yield {"data": json.dumps({"type": "thought", "step": 3, "message": "✍️ 生成精确回答并注入原文引用..."})}
             try:
                 # Big-Loop #3: 加载已知矛盾,Top 文档间有矛盾 → 回答附 ⚠️ 提示
                 contradictions = load_contradictions().get("contradictions", [])
-                answer = layer3_answer(
-                    q, top_docs, client, os.environ.get("SEARCH_MODEL", "gpt-4o"), index,
-                    contradictions=contradictions,
-                )
-                chunk_size = 80
-                for i in range(0, len(answer), chunk_size):
-                    yield {"data": json.dumps({"delta": answer[i:i + chunk_size]})}
+                model = os.environ.get("SEARCH_MODEL", "gpt-4o")
+                for token in layer3_answer_stream(
+                    q, top_docs, client, model, index, contradictions=contradictions,
+                ):
+                    yield {"data": json.dumps({"delta": token})}
             except Exception as e:
                 yield {"data": json.dumps({"delta": f"\n\n⚠️ 生成回答时出错: {e}"})}
 

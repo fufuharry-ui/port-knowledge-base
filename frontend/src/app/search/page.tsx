@@ -9,6 +9,7 @@ export default function SearchPage() {
     const [answer, setAnswer] = useState('');
     const [sources, setSources] = useState<SearchSource[]>([]);
     const [isLoading, setIsLoading] = useState(false);
+    const [thought, setThought] = useState('');
     const abortRef = useRef<AbortController | null>(null);
     const fullAnswerRef = useRef('');
 
@@ -16,16 +17,22 @@ export default function SearchPage() {
         abortRef.current?.abort();
         setAnswer('');
         setSources([]);
+        setThought('');
         setIsLoading(true);
         fullAnswerRef.current = '';
 
         const controller = startStreamSearch(query, {
+            onThought: (_step, message) => {
+                setThought(message);
+            },
             onDelta: (delta) => {
                 fullAnswerRef.current += delta;
                 setAnswer(fullAnswerRef.current);
+                setThought(''); // 首字到达后清空进度提示
             },
             onDone: () => {
                 setIsLoading(false);
+                setThought('');
                 const sourceMatches = [...fullAnswerRef.current.matchAll(/\[(doc_\w+)\]/g)];
                 if (sourceMatches.length > 0) {
                     setSources(sourceMatches.map(m => ({ doc_id: m[1] })));
@@ -34,6 +41,7 @@ export default function SearchPage() {
             onError: (err) => {
                 setAnswer(`⚠️ 检索错误: ${err.message}`);
                 setIsLoading(false);
+                setThought('');
             },
         });
         abortRef.current = controller;
@@ -55,6 +63,24 @@ export default function SearchPage() {
             </div>
 
             <SearchBox onSubmit={handleSubmit} isLoading={isLoading} />
+
+            {/* 进度反馈:检索各阶段提示(消除 14-21s 干等焦虑) */}
+            {isLoading && thought && (
+                <div style={{
+                    display: 'flex', alignItems: 'center', gap: '10px',
+                    padding: '12px 16px', borderRadius: '12px',
+                    background: 'rgba(96,165,250,0.08)', border: '1px solid rgba(96,165,250,0.18)',
+                    fontSize: '13px', color: 'var(--text-secondary)',
+                }}>
+                    <span className="spin" style={{
+                        display: 'inline-block', width: '14px', height: '14px',
+                        border: '2px solid var(--accent-blue)', borderTopColor: 'transparent',
+                        borderRadius: '50%',
+                    }} />
+                    {thought}
+                </div>
+            )}
+
             <SearchResult answer={answer} sources={sources} isLoading={isLoading} />
         </div>
     );

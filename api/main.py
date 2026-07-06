@@ -13,7 +13,8 @@ import yaml
 
 from scripts.ingest import ingest_file, generate_doc_id
 from scripts.search import (
-    search, get_llm_client, layer1_filter, layer2_score, layer3_answer, _load_ontology,
+    search, get_llm_client, layer1_filter, layer2_score, layer3_answer,
+    layer3_answer_stream, _load_ontology,
 )
 from scripts.ontology import expand_query_with_ontology, get_entity_neighbors
 from scripts.lint import Linter
@@ -22,6 +23,15 @@ from scripts.consistency import (
 )
 
 app = FastAPI(title="Karpathy-Style LLM Wiki API", version="2.0.0")
+
+
+# ─── jieba 预热 (Big-Loop #5, P-4) ───────────────────────────────────────────
+# 进程启动即加载分词词典,消除首次检索的冷启动延迟(~1s)。
+try:
+    import jieba  # noqa: F401
+    list(jieba.cut("智慧港口岸桥远控预热"))  # 触发词典加载
+except Exception:
+    pass  # jieba 不可用时 BM25 回退到空白分词,不影响启动
 
 # ─── CORS ─────────────────────────────────────────────────────────────────────
 app.add_middleware(
@@ -383,17 +393,16 @@ async def qa_stream(request: QAQuery):
             # Step 5: Thought - generating answer
             yield {"data": json.dumps({"type": "thought", "step": 3, "message": "✍️ 生成精确回答并注入原文引用..."})}
 
-            # Step 6: Stream answer
+            # Step 6: Stream answer (Big-Loop #5: 真流式透传 token,首 token 立即可见)
             try:
                 # Big-Loop #3: 加载已知矛盾,Top 文档间有矛盾 → 回答附 ⚠️ 提示
                 contradictions = load_contradictions().get("contradictions", [])
-                answer = layer3_answer(
+                for token in layer3_answer_stream(
                     request.query, top_docs, client, model, index,
                     contradictions=contradictions,
-                )
-                chunk_size = 60
-                for i in range(0, len(answer), chunk_size):
-                    yield {"data": json.dumps({"type": "delta", "text": answer[i:i + chunk_size]})}
+                ):
+                    if token:
+                        yield {"data": json.dumps({"type": "delta", "text": token})}
             except Exception as e:
                 yield {"data": json.dumps({"type": "delta", "text": f"\n\n⚠️ 生成回答失败: {e}"})}
 

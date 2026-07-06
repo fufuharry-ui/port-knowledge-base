@@ -64,7 +64,42 @@ def llm_call_text(client, model, system, user, retries=3):
             time.sleep(5 * (attempt + 1))
 
 
-def llm_call_json(client, model, system, user, retries=3):
+def llm_call_text_stream(client, model, system, user, retries=3, enable_thinking=True):
+    """流式返回文本 token 的 generator(Big-Loop #5)。
+
+    真流式:逐 token yield,首 token 不等全生成。
+    enable_thinking: qwen3 思考模型默认开思考(首 token 慢 ~30s);Layer3 传 False
+    可关思考(首 token ~0.4s,实测提速 11x,核心答案质量保留——Context Stuffing
+    已喂全文,思考非必需)。非 qwen3 模型该参数被忽略(extra_body 透传)。
+    """
+    last_err = None
+    extra_body = {"enable_thinking": enable_thinking}
+    for attempt in range(retries):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "system", "content": system},
+                           {"role": "user", "content": user}],
+                temperature=0.3,
+                stream=True,
+                extra_body=extra_body,
+            )
+            for chunk in resp:
+                if not getattr(chunk, "choices", None):
+                    continue
+                delta = chunk.choices[0].delta
+                content = getattr(delta, "content", None)
+                if content:
+                    yield content
+            return  # 流式成功完成
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(5 * (attempt + 1))
+    raise last_err if last_err else RuntimeError("stream failed")
+
+
+def llm_call_json(client, model, system, user, retries=3, enable_thinking=True):
     for attempt in range(retries):
         try:
             resp = client.chat.completions.create(
@@ -73,6 +108,7 @@ def llm_call_json(client, model, system, user, retries=3):
                 messages=[{"role": "system", "content": system},
                            {"role": "user", "content": user}],
                 temperature=0.1,
+                extra_body={"enable_thinking": enable_thinking},
             )
             return json.loads(resp.choices[0].message.content)
         except Exception as e:
@@ -252,25 +288,71 @@ SCORE_SYSTEM = """你是一个文档相关性评估专家。
 严格 JSON 输出: {"scores": [{"doc_id": "...", "score": 0.85, "reason": "简要说明"}]}"""
 
 
+# ─── Layer 2 结果缓存 (Big-Loop #5, ADR-17) ──────────────────────────────────
+# 进程级 LRU,key=(query, 候选 id 元组),TTL 60s。同查询短期复用,避免重复 LLM 评分。
+_LAYER2_CACHE: dict[tuple, tuple[float, list[dict]]] = {}
+_LAYER2_CACHE_TTL = 60.0  # 秒
+_LAYER2_CACHE_MAX = 64  # 最多缓存条目(防无界增长)
+
+
+def _layer2_cache_reset():
+    """清空缓存(测试用)。"""
+    _LAYER2_CACHE.clear()
+
+
+def _layer2_cache_get(key):
+    """命中返回 (scores),否则 None。过期自动失效。"""
+    entry = _LAYER2_CACHE.get(key)
+    if not entry:
+        return None
+    ts, scores = entry
+    if time.time() - ts > _LAYER2_CACHE_TTL:
+        _LAYER2_CACHE.pop(key, None)
+        return None
+    return scores
+
+
+def _layer2_cache_put(key, scores):
+    """写入缓存;超限时丢弃最旧条目。"""
+    if len(_LAYER2_CACHE) >= _LAYER2_CACHE_MAX:
+        # 丢最旧(按时间戳)
+        oldest = min(_LAYER2_CACHE, key=lambda k: _LAYER2_CACHE[k][0])
+        _LAYER2_CACHE.pop(oldest, None)
+    _LAYER2_CACHE[key] = (time.time(), scores)
+
+
 def layer2_score(query: str, candidates: list[dict], client,
                  model: str, top_k: int = 5) -> list[dict]:
-    """Layer 2：LLM 对候选摘要进行相关性评分"""
+    """Layer 2：LLM 对候选摘要进行相关性评分。
+
+    Big-Loop #5: 结果按 (query, 候选 id 元组) 缓存 60s,同查询复用(ADR-17)。
+    """
     if not candidates:
         return []
 
-    # 构建候选摘要上下文
-    docs_text = "\n---\n".join(
-        f"doc_id: {d['id']}\n标题: {d.get('title','')}\n摘要: {d.get('abstract_short','')}"
-        for d in candidates
-    )
-    user_prompt = f"查询: {query}\n\n候选文档:\n{docs_text}"
+    # 缓存 key:query + 候选 id 有序集合(top_k 变化不影响评分本身,故不进 key)
+    cand_key = tuple(sorted(d["id"] for d in candidates))
+    cache_key = (query, cand_key)
 
-    result = llm_call_json(client, model, SCORE_SYSTEM, user_prompt)
-    scores = result.get("scores", [])
+    scores = _layer2_cache_get(cache_key)
+    if scores is None:
+        # 构建候选摘要上下文
+        docs_text = "\n---\n".join(
+            f"doc_id: {d['id']}\n标题: {d.get('title','')}\n摘要: {d.get('abstract_short','')}"
+            for d in candidates
+        )
+        user_prompt = f"查询: {query}\n\n候选文档:\n{docs_text}"
+        # Big-Loop #5: Layer2 默认关思考(实测 4-5x 提速,Top 召回 3/3 一致,ADR-16 满足)。
+        # 操作侧可设 SCORE_ENABLE_THINKING=true 开回深度判断模式。
+        score_thinking = os.environ.get("SCORE_ENABLE_THINKING", "false").lower() == "true"
+        result = llm_call_json(client, model, SCORE_SYSTEM, user_prompt,
+                               enable_thinking=score_thinking)
+        scores = result.get("scores", [])
+        _layer2_cache_put(cache_key, scores)
 
-    # 排序并筛选 Top-K
-    scores.sort(key=lambda x: x.get("score", 0), reverse=True)
-    top_ids = {s["doc_id"] for s in scores[:top_k] if s.get("score", 0) >= 0.5}
+    # 排序并筛选 Top-K(缓存的是原始 scores,top_k 在此应用)
+    scores_sorted = sorted(scores, key=lambda x: x.get("score", 0), reverse=True)
+    top_ids = {s["doc_id"] for s in scores_sorted[:top_k] if s.get("score", 0) >= 0.5}
 
     return [d for d in candidates if d["id"] in top_ids]
 
@@ -328,15 +410,22 @@ ANSWER_SYSTEM = """你是一个专业的技术文档助理，服务于港口智�
 def layer3_answer(query: str, top_docs: list[dict],
                   client, model: str, index: dict,
                   contradictions: list[dict] | None = None) -> str:
-    """Layer 3：基于精选文档全文生成最终回答。
+    """Layer 3：基于精选文档全文生成最终回答(非流式,返回完整字符串)。
 
-    Big-Loop #3: contradictions 参数(可选)携带已知矛盾对。
-    若 Top 文档间存在已知矛盾,在答案后附加 ⚠️ 提示(ADR-10:附加非拦截,
-    Layer3 仍正常回答)。None → 从 contradictions.yaml 懒加载(缺失则无提示)。
+    Big-Loop #5: 委派给 layer3_answer_stream 并收集,保持单一真源。
+    Big-Loop #3: contradictions 携带已知矛盾对,Top 文档间有矛盾则附 ⚠️ 提示。
     """
-    id2entry = {d["id"]: d for d in index.get("documents", [])}
+    return "".join(layer3_answer_stream(
+        query, top_docs, client, model, index, contradictions=contradictions,
+    ))
 
-    # 构建上下文：全文 + 摘要结构
+
+def _build_layer3_context(query: str, top_docs: list[dict], index: dict):
+    """构建 Layer3 的 user_prompt + sources_section。
+
+    返回 (user_prompt, sources_section) 或 None(无候选文档)。
+    Big-Loop #5 抽出,供流式/非流式共用,避免逻辑重复。
+    """
     context_parts = []
     sources = []
     total_chars = 0
@@ -350,7 +439,6 @@ def layer3_answer(query: str, top_docs: list[dict],
         full_text = load_full_text(doc_id)
         summary = load_summary_full(doc_id)
 
-        # 章节信息辅助定位
         sections_info = ""
         if summary.get("sections"):
             sections_info = "章节目录: " + " | ".join(
@@ -365,19 +453,46 @@ def layer3_answer(query: str, top_docs: list[dict],
         sources.append(f"- [{doc_id}] 《{title}》")
 
     if not context_parts:
-        return "⚠️ 未找到相关文档，请调整查询关键词或扩充知识库。"
+        return None
 
-    context = "\n\n" + "="*40 + "\n\n".join(context_parts)
+    context = "\n\n" + "=" * 40 + "\n\n".join(context_parts)
     user_prompt = f"查询问题: {query}\n\n参考文档:{context}"
-
-    answer = llm_call_text(client, model, ANSWER_SYSTEM, user_prompt)
-
-    # Big-Loop #3: 矛盾提示(附加,在来源前)。Top 文档内部矛盾才提示,避免噪声。
-    hint = _build_contradiction_hint(top_docs, contradictions)
-
-    # 追加来源列表
     sources_section = "\n\n---\n📎 **引用来源:**\n" + "\n".join(sources)
-    return answer + hint + sources_section
+    return user_prompt, sources_section
+
+
+def layer3_answer_stream(query: str, top_docs: list[dict],
+                         client, model: str, index: dict,
+                         contradictions: list[dict] | None = None):
+    """Layer 3 流式版(Big-Loop #5):逐 token yield 答案,末尾 yield 提示+来源。
+
+    真流式:首 token 不等全生成(感知延迟从"总时长"降到"首 token")。
+    无候选文档 → yield 提示并返回。
+    """
+    built = _build_layer3_context(query, top_docs, index)
+    if built is None:
+        yield "⚠️ 未找到相关文档，请调整查询关键词或扩充知识库。"
+        return
+
+    user_prompt, sources_section = built
+
+    # Big-Loop #5: Layer3 默认关思考(首 token ~0.4s,11x 提速)。
+    # 全文已 Stuffing,思考非必需;操作侧可设 ANSWER_ENABLE_THINKING=true 开回质量模式。
+    enable_thinking = os.environ.get("ANSWER_ENABLE_THINKING", "false").lower() == "true"
+
+    # 流式产出答案 token
+    for token in llm_call_text_stream(
+        client, model, ANSWER_SYSTEM, user_prompt, enable_thinking=enable_thinking,
+    ):
+        yield token
+
+    # 矛盾提示(附加,在来源前)
+    hint = _build_contradiction_hint(top_docs, contradictions)
+    if hint:
+        yield hint
+
+    # 来源
+    yield sources_section
 
 
 def _build_contradiction_hint(top_docs: list[dict],

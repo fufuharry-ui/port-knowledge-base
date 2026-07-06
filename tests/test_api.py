@@ -131,16 +131,16 @@ def test_search_stream_passes_ontology_to_layer1(
 
 
 @patch("api.main.load_contradictions")
-@patch("api.main.layer3_answer", return_value="mock answer")
+@patch("api.main.layer3_answer_stream", return_value=iter(["mock answer"]))
 @patch("api.main.layer2_score", return_value=[{"id": "doc_A", "title": "A"}])
 @patch("api.main.layer1_filter")
 @patch("api.main.get_llm_client")
 def test_qa_passes_contradictions_to_layer3(
-    mock_client, mock_l1, mock_l2, mock_l3, mock_load_con
+    mock_client, mock_l1, mock_l2, mock_l3_stream, mock_load_con
 ):
-    """P0 回归守卫(Big-Loop #3):/qa 必须把 contradictions 传给 layer3_answer。
-    复刻 Loop #1 ontology 断线教训:用户主路径若忘传 contradictions,
-    Layer3 的矛盾提示在 /qa 上完全不生效。本测试防止该断线。
+    """P0 回归守卫(Big-Loop #3/#5):/qa 必须把 contradictions 传给 layer3_answer_stream。
+    Loop #5 起 /qa 主路径改用真流式 layer3_answer_stream;矛盾提示参数必须照传,
+    否则 Layer3 的矛盾提示在 /qa 上完全不生效。本测试防止断线。
     """
     mock_l1.return_value = [{"id": "doc_A", "title": "A"}]
     mock_load_con.return_value = {"contradictions": [
@@ -150,9 +150,9 @@ def test_qa_passes_contradictions_to_layer3(
     response = client.post("/api/v1/qa", json={"query": "岸桥远控"})
     assert response.status_code == 200
 
-    assert mock_l3.called
-    _args, kwargs = mock_l3.call_args
-    assert "contradictions" in kwargs, "/qa 未向 layer3_answer 传 contradictions 参数"
+    assert mock_l3_stream.called
+    _args, kwargs = mock_l3_stream.call_args
+    assert "contradictions" in kwargs, "/qa 未向 layer3_answer_stream 传 contradictions"
     assert kwargs["contradictions"], "/qa 传入的 contradictions 为空(断线)"
 
 

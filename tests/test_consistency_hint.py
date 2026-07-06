@@ -43,7 +43,7 @@ _CONTRADICTION = [{
 
 @patch("scripts.search.load_full_text", return_value="文档全文...")
 @patch("scripts.search.load_summary_full", return_value={})
-@patch("scripts.search.llm_call_text", return_value="这是正常生成的答案。")
+@patch("scripts.search.llm_call_text_stream", return_value=iter(["这是正常生成的答案。"]))
 def test_layer3_appends_contradiction_hint(mock_llm, mock_sum, mock_full):
     """C-3: Top 文档间有已知矛盾 → 回答附 ⚠️ 不一致提示 + 推理链。"""
     answer = layer3_answer(
@@ -61,7 +61,7 @@ def test_layer3_appends_contradiction_hint(mock_llm, mock_sum, mock_full):
 
 @patch("scripts.search.load_full_text", return_value="文档全文...")
 @patch("scripts.search.load_summary_full", return_value={})
-@patch("scripts.search.llm_call_text", return_value="这是正常生成的答案。")
+@patch("scripts.search.llm_call_text_stream", return_value=iter(["这是正常生成的答案。"]))
 def test_layer3_no_hint_without_contradiction(mock_llm, mock_sum, mock_full):
     """C-4: 无矛盾 → 回答无 ⚠️ 提示(不误报)。"""
     answer = layer3_answer(
@@ -76,7 +76,7 @@ def test_layer3_no_hint_without_contradiction(mock_llm, mock_sum, mock_full):
 
 @patch("scripts.search.load_full_text", return_value="文档全文...")
 @patch("scripts.search.load_summary_full", return_value={})
-@patch("scripts.search.llm_call_text", return_value="答案。")
+@patch("scripts.search.llm_call_text_stream", return_value=iter(["答案。"]))
 def test_layer3_contradiction_outside_top_set_no_hint(mock_llm, mock_sum, mock_full):
     """矛盾对只有一个文档在 Top 集 → 不提示(Top 内部才提示,避免噪声)。"""
     contradiction = [{

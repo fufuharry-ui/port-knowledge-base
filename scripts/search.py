@@ -388,7 +388,18 @@ def _load_ontology() -> dict:
             try:
                 with open(ent_file, "r", encoding="utf-8") as f:
                     ent = yaml.safe_load(f) or {}
-                data["entity_relations"] = ent.get("edges", [])
+                edges = list(ent.get("edges", []))
+                # Loop #6: 追加跨文档推断边(经共享枢纽 + 本体父类,纯推理,不改原文件)。
+                # 让现有 expand_query_with_entities 自动获得更深的邻居扩展。
+                # 传 ontology_tree 启用本体父类路径(弥补实体表面术语无跨文档重合)。
+                try:
+                    from scripts.ontology import infer_cross_doc_relations
+                    edges = edges + infer_cross_doc_relations(
+                        edges, ontology_tree=data.get("ontology_tree", []),
+                    )
+                except Exception:
+                    pass
+                data["entity_relations"] = edges
             except Exception:
                 pass
         return data

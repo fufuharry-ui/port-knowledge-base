@@ -373,3 +373,112 @@ def _collect_relation_terms(entity_relations):
         if r.get("target"):
             terms.add(r["target"])
     return terms
+
+
+# ─── 跨文档实体关系推断(Loop #6)──────────────────────────────────────────────
+
+def infer_cross_doc_relations(entity_relations, ontology_tree=None):
+    """经共享枢纽推断跨文档实体边(纯函数,无 IO)。
+
+    动机:Loop #2 的实体抽取仅在单文档内(term↔term 同源)。若 doc_A 声明
+    "网络切片→5G专网"、doc_B 声明"边缘计算→5G专网",二者分别声明,
+    但系统从不推断"网络切片↔边缘计算"(经 5G专网 枢纽关联)——这条边
+    没有任何单文档直接说过,是真正的跨文档推理新知识。
+
+    两条推断路径:
+      (a) 表面枢纽:同一术语在 ≥2 文档作为边端点 → 关联其跨文档邻居。
+      (b) 本体父类(传 ontology_tree 时):两术语在本体树共享父类、
+          且来自不同文档 → 推断 related_to。弥补"实体抽取太文档孤岛、
+          表面术语无跨文档重合"的真实数据缺口(实测:本体路径产 32 边,
+          表面路径产 0 边)。
+
+    规则:
+      - 仅当两术语来自完全不同文档(无共现文档)才推断——真正跨文档证据。
+      - 已有直接边的不重复推断;同一对术语去重。
+      - provenance=cross_doc_inferred,confidence 折扣(0.6×源置信度,本体路径固定 0.5)。
+
+    返回:推断边列表(不含原始边)。ontology_tree=None → 只走路径(a),向后兼容。
+    """
+    if not entity_relations:
+        return []
+
+    # 1. 收集每个术语的文档来源 + 清洗后的边
+    term_docs = {}  # term -> set(doc_id)
+    edges_clean = []
+    for r in entity_relations:
+        if not isinstance(r, dict):
+            continue
+        s, t = r.get("source"), r.get("target")
+        if not s or not t or s == t:
+            continue
+        doc = r.get("doc_id")
+        edges_clean.append((s, t, r))
+        if doc:
+            term_docs.setdefault(s, set()).add(doc)
+            term_docs.setdefault(t, set()).add(doc)
+
+    direct_pairs = {frozenset({s, t}) for s, t, _ in edges_clean}
+    inferred = []
+    seen_pairs = set()
+
+    def _add(a, b, hub, conf):
+        pair = frozenset({a, b})
+        if pair in direct_pairs or pair in seen_pairs:
+            return
+        if not term_docs.get(a, set()).isdisjoint(term_docs.get(b, set())):
+            return  # 有共现文档 → 留给单文档抽取
+        seen_pairs.add(pair)
+        inferred.append({
+            "source": a, "target": b, "type": "related_to",
+            "provenance": "cross_doc_inferred", "via_hub": hub,
+            "confidence": round(conf, 3),
+        })
+
+    # 路径 (a):表面枢纽(同一术语在 ≥2 文档)
+    hubs = {t for t, ds in term_docs.items() if len(ds) >= 2}
+    if hubs:
+        hub_nbrs = {}
+        for s, t, r in edges_clean:
+            doc = r.get("doc_id")
+            for a, b in ((s, t), (t, s)):
+                if a in hubs and b is not a:
+                    hub_nbrs.setdefault(a, {}).setdefault(b, set())
+                    if doc:
+                        hub_nbrs[a][b].add(doc)
+        for hub, nbrs in hub_nbrs.items():
+            terms = list(nbrs.keys())
+            for i in range(len(terms)):
+                for j in range(i + 1, len(terms)):
+                    conf = 0.6 * min(
+                        _edge_confidence(terms[i], hub, edges_clean) or 0.5,
+                        _edge_confidence(terms[j], hub, edges_clean) or 0.5,
+                    )
+                    _add(terms[i], terms[j], hub, conf)
+
+    # 路径 (b):本体父类(共享父类 + 跨文档)
+    if ontology_tree:
+        from collections import defaultdict
+        parent_groups = defaultdict(list)  # parent_term -> [entity_term]
+        for term in term_docs:
+            pn = get_parent_node(ontology_tree, term)
+            if pn and isinstance(pn, dict) and pn.get("term"):
+                parent_groups[pn["term"]].append(term)
+        for parent, terms in parent_groups.items():
+            if len(terms) < 2:
+                continue
+            for i in range(len(terms)):
+                for j in range(i + 1, len(terms)):
+                    _add(terms[i], terms[j], parent, 0.5)
+
+    return inferred
+
+
+def _edge_confidence(term_a, term_b, edges_clean):
+    """取 term_a↔term_b 边的置信度(取最大的,双向匹配)。"""
+    best = 0.0
+    for s, t, r in edges_clean:
+        if {s, t} == {term_a, term_b}:
+            c = r.get("confidence", 0.5)
+            if isinstance(c, (int, float)) and c > best:
+                best = c
+    return best

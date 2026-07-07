@@ -1,5 +1,6 @@
 'use client';
 import React from 'react';
+import Link from 'next/link';
 import * as Tooltip from '@radix-ui/react-tooltip';
 import type { CitationMeta } from '@/lib/qa-stream';
 
@@ -143,6 +144,21 @@ export default function ChatBubble({ role, content, citations }: ChatBubbleProps
                                         }}>
                                             {seg.meta.doc_id}
                                         </div>
+                                        <Link
+                                            href={`/wiki/${seg.meta.doc_id}`}
+                                            data-testid={`citation-link-${seg.meta.doc_id}`}
+                                            style={{
+                                                display: 'block',
+                                                marginTop: '8px',
+                                                fontSize: '11px',
+                                                color: '#93c5fd',
+                                                textDecoration: 'none',
+                                                borderTop: '1px solid rgba(255,255,255,0.08)',
+                                                paddingTop: '6px',
+                                            }}
+                                        >
+                                            查看文档详情 →
+                                        </Link>
                                         <Tooltip.Arrow style={{ fill: 'rgba(255,255,255,0.12)' }} />
                                     </Tooltip.Content>
                                 </Tooltip.Portal>

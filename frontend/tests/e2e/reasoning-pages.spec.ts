@@ -117,3 +117,71 @@ test.describe('Big-Loop #4 推理页面可见性', () => {
         await expect(page.locator('header nav a[href="/consistency"]')).toBeVisible();
     });
 });
+
+test.describe('Big-Loop #7 文档枢纽 + 连贯穿梭', () => {
+    // 串行:动态路由 /wiki/[id] 在 dev server 首次编译较慢,
+    // 并行三实例会压垮冷编译;串行让首测预热,后续复用编译缓存。
+    test.describe.configure({ mode: 'serial' });
+
+    const mockDoc = {
+        id: 'doc_20260405_001', title: '岸桥远控方案', status: 'compiled',
+        abstract_short: '岸桥远控的网络延迟要求与架构。',
+        ontology_terms: ['岸桥远控', '5G专网'], char_count: 12000,
+    };
+    const mockGraph = {
+        nodes: [{ id: 'doc_20260405_001', title: '岸桥远控方案' },
+                { id: 'doc_20260405_003', title: '5G白皮书' }],
+        edges: [{ source: 'doc_20260405_001', target: 'doc_20260405_003', type: 'same_topic', confidence: 0.9 }],
+    };
+
+    test('G-1: /wiki/[id] 文档枢纽展示摘要+实体+关联(修复旧404)', async ({ page }) => {
+        await page.route(`${API}/api/v1/docs/doc_20260405_001`, route =>
+            route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(mockDoc) }));
+        await page.route(`${API}/api/v1/graph`, route =>
+            route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(mockGraph) }));
+        await page.route(`${API}/api/v1/consistency`, route =>
+            route.fulfill({ status: 200, contentType: 'application/json',
+                body: JSON.stringify({ contradictions: [], total: 0 }) }));
+
+        await page.goto('/wiki/doc_20260405_001');
+        // 标题 + 摘要
+        await expect(page.getByRole('heading', { name: '岸桥远控方案' })).toBeVisible();
+        await expect(page.getByText(/网络延迟要求与架构/)).toBeVisible();
+        // 实体 chip 可点 → 实体图谱页预填
+        await expect(page.locator(`a[href*="/entity-graph?term="]`)).toHaveCount(2);
+        // 关联文档可点 → 另一文档枢纽
+        await expect(page.locator('a[href="/wiki/doc_20260405_003"]')).toBeVisible();
+        // 不应有 404
+        await expect(page.getByText('404')).toHaveCount(0);
+    });
+
+    test('G-2: 实体 chip 链接含预填 term(depth=2)', async ({ page }) => {
+        await page.route(`${API}/api/v1/docs/doc_20260405_001`, route =>
+            route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(mockDoc) }));
+        await page.route(`${API}/api/v1/graph`, route =>
+            route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(mockGraph) }));
+        await page.route(`${API}/api/v1/consistency`, route =>
+            route.fulfill({ status: 200, contentType: 'application/json',
+                body: JSON.stringify({ contradictions: [], total: 0 }) }));
+        await page.goto('/wiki/doc_20260405_001');
+        const chip = page.locator(`a[href*="/entity-graph?term="]`).first();
+        const href = await chip.getAttribute('href');
+        expect(href).toContain('term=');
+        expect(href).toContain('depth=2');
+    });
+
+    test('G-3: 不存在的文档 ID → 优雅 notFound 态(非裸 404)', async ({ page }) => {
+        await page.route(`${API}/api/v1/docs/doc_missing`, route =>
+            route.fulfill({ status: 404 }));
+        await page.route(`${API}/api/v1/graph`, route =>
+            route.fulfill({ status: 200, contentType: 'application/json',
+                body: JSON.stringify({ nodes: [], edges: [] }) }));
+        await page.route(`${API}/api/v1/consistency`, route =>
+            route.fulfill({ status: 200, contentType: 'application/json',
+                body: JSON.stringify({ contradictions: [], total: 0 }) }));
+        await page.goto('/wiki/doc_missing');
+        await expect(page.getByText(/文档不存在/)).toBeVisible();
+        // 返回链接(notFound 分支文案"返回知识库")
+        await expect(page.getByRole('link', { name: /返回知识库/ })).toBeVisible();
+    });
+});

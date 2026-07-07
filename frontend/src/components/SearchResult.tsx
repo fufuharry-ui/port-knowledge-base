@@ -1,5 +1,6 @@
 'use client';
 import React from 'react';
+import Link from 'next/link';
 import type { SearchSource } from '@/lib/api';
 
 interface SearchResultProps {
@@ -75,10 +76,13 @@ export default function SearchResult({ answer, sources, isLoading }: SearchResul
                     </div>
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
                         {sources.map(src => (
-                            <span
+                            <Link
                                 key={src.doc_id}
+                                href={`/wiki/${src.doc_id}`}
                                 data-testid={`source-badge-${src.doc_id}`}
                                 className="source-badge"
+                                style={{ textDecoration: 'none', cursor: 'pointer' }}
+                                title={`查看《${src.title ?? src.doc_id}》文档详情`}
                             >
                                 <span style={{ fontFamily: 'monospace', fontSize: '10px', color: '#60a5fa' }}>{src.doc_id}</span>
                                 {src.title && (
@@ -89,7 +93,7 @@ export default function SearchResult({ answer, sources, isLoading }: SearchResul
                                         </span>
                                     </>
                                 )}
-                            </span>
+                            </Link>
                         ))}
                     </div>
                 </div>

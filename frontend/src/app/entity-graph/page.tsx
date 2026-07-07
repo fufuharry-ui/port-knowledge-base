@@ -3,7 +3,8 @@
  * 输入术语 + 深度 → 展示多跳邻居术语 + 关系边表格(谁依赖/属于/支撑谁)
  */
 'use client';
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
+import { useSearchParams } from 'next/navigation';
 import { fetchEntityGraph, type EntityGraphData } from '@/lib/api';
 
 const TYPE_LABELS: Record<string, string> = {
@@ -14,11 +15,31 @@ const TYPE_LABELS: Record<string, string> = {
 };
 
 export default function EntityGraphPage() {
+    // Next.js 16: useSearchParams 需 Suspense 边界(静态预渲染要求)
+    return (
+        <React.Suspense fallback={<div style={{ padding: '80px', textAlign: 'center', color: 'var(--text-muted)' }}>加载中…</div>}>
+            <EntityGraphContent />
+        </React.Suspense>
+    );
+}
+
+function EntityGraphContent() {
     const [term, setTerm] = useState('5G技术');
     const [depth, setDepth] = useState(2);
     const [data, setData] = useState<EntityGraphData | null>(null);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
+
+    // Big-Loop #7: 接受 ?term= 预填(从文档枢纽的实体 chip 穿梭过来)
+    const searchParams = useSearchParams();
+    useEffect(() => {
+        const t = searchParams.get('term');
+        const d = searchParams.get('depth');
+        if (t) {
+            setTerm(t);
+            if (d) setDepth(Number(d));
+        }
+    }, [searchParams]);
 
     const lookup = async (e?: React.FormEvent) => {
         e?.preventDefault();

@@ -284,6 +284,43 @@ async def get_doc(doc_id: str):
             return doc
     raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found")
 
+
+# ─── 文档管理:删除 + 重编译(Loop #10)─────────────────────────────────────────
+
+@app.delete("/api/v1/docs/{doc_id}")
+async def delete_doc(doc_id: str):
+    """删除文档 + 全部产物 + 清理 index/KG/entity_relations 引用。
+
+    此前知识库只能追加无法维护——上传错文档/编译失败时无法清理。
+    """
+    from scripts.doc_admin import remove_doc
+    summary = remove_doc(doc_id)
+    if not summary.get("removed"):
+        raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found")
+    return {"status": "deleted", **summary}
+
+
+@app.post("/api/v1/docs/{doc_id}/recompile")
+async def recompile_doc_endpoint(doc_id: str, background_tasks: BackgroundTasks):
+    """重置文档状态为 raw 并触发重编译(error 文档重试用)。"""
+    from scripts.doc_admin import recompile_doc
+    result = recompile_doc(doc_id)
+    if not result.get("reset"):
+        raise HTTPException(status_code=404, detail=f"Document '{doc_id}' meta not found")
+    # 后台触发编译(复用 compile.compile_doc)
+    def _compile_task():
+        try:
+            import scripts.compile as cmod
+            cmod._load_env()
+            client = cmod.get_llm_client()
+            cmod.compile_doc(doc_id, client,
+                             os.environ.get("COMPILE_MODEL", "gpt-4o"),
+                             os.environ.get("ONTOLOGY_MODEL", "gpt-4o-mini"))
+        except Exception:
+            pass
+    background_tasks.add_task(_compile_task)
+    return {"status": "recompiling", "doc_id": doc_id}
+
 # ─── POST /api/v1/upload (alias for ingest) ──────────────────────────────────
 
 @app.post("/api/v1/upload")

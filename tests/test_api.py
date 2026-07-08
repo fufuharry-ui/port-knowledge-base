@@ -244,6 +244,39 @@ def test_consistency_get():
     assert "last_updated" in data
 
 
+# ─── 文档管理:删除 + 重编译(Loop #10)────────────────────────────────────────
+
+@patch("scripts.doc_admin.remove_doc")
+def test_delete_doc_endpoint(mock_remove):
+    """DELETE /api/v1/docs/{id} 调用 remove_doc 并返回删除摘要。"""
+    mock_remove.return_value = {"doc_id": "doc_X", "removed": True,
+                                "cleaned_refs": {"index_removed": 1}}
+    response = client.delete("/api/v1/docs/doc_X")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "deleted"
+    assert data["removed"] is True
+    assert mock_remove.called
+
+
+@patch("scripts.doc_admin.remove_doc", return_value={"doc_id": "doc_X", "removed": False})
+def test_delete_nonexistent_doc_returns_404(mock_remove):
+    """删不存在的文档 → 404。"""
+    response = client.delete("/api/v1/docs/doc_missing")
+    assert response.status_code == 404
+
+
+@patch("scripts.compile.compile_doc")
+@patch("scripts.doc_admin.recompile_doc")
+def test_recompile_doc_endpoint(mock_recompile, _mock_compile):
+    """POST /api/v1/docs/{id}/recompile 重置状态 + 后台触发编译。"""
+    mock_recompile.return_value = {"doc_id": "doc_X", "reset": True}
+    response = client.post("/api/v1/docs/doc_X/recompile")
+    assert response.status_code == 200
+    assert response.json()["status"] == "recompiling"
+    assert mock_recompile.called
+
+
 @patch("api.main.run_consistency_check")
 def test_consistency_post_triggers_check(mock_run):
     """C-5: POST /api/v1/consistency 触发稽核并返回报告。"""

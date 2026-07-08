@@ -180,6 +180,18 @@ export async function triggerRelate(docId: string): Promise<{ message: string }>
     return handleResponse(res);
 }
 
+/** 删除文档 + 全部产物 + 清理引用(Loop #10) */
+export async function deleteDoc(docId: string): Promise<{ status: string; removed: boolean }> {
+    const res = await fetch(`${API_BASE}/api/v1/docs/${docId}`, { method: 'DELETE' });
+    return handleResponse(res);
+}
+
+/** 重置文档状态并触发重编译(error 文档重试,Loop #10) */
+export async function recompileDoc(docId: string): Promise<{ status: string }> {
+    const res = await fetch(`${API_BASE}/api/v1/docs/${docId}/recompile`, { method: 'POST' });
+    return handleResponse(res);
+}
+
 // ─── Big-Loop #4: 推理能力 API(本体/实体图谱/一致性) ──────────────────────────
 
 /** 获取全局本体树 (Loop #1) */

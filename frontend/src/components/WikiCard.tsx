@@ -5,6 +5,8 @@ import type { DocMeta } from '@/lib/api';
 interface WikiCardProps {
     doc: DocMeta;
     onExpand?: (docId: string) => void;
+    onDelete?: (docId: string) => void;
+    onRecompile?: (docId: string) => void;
 }
 
 const STATUS_BADGE: Record<string, { label: string; cls: string }> = {
@@ -14,10 +16,13 @@ const STATUS_BADGE: Record<string, { label: string; cls: string }> = {
     error: { label: '✗ error', cls: 'badge-error' },
 };
 
-export default function WikiCard({ doc, onExpand }: WikiCardProps) {
+export default function WikiCard({ doc, onExpand, onDelete, onRecompile }: WikiCardProps) {
     const status = doc.status ?? 'raw';
     const badge = STATUS_BADGE[status] ?? STATUS_BADGE.raw;
     const isCompiling = status === 'compiling';
+    const isError = status === 'error';
+
+    const stop = (e: React.MouseEvent) => e.stopPropagation();
 
     return (
         <div
@@ -95,17 +100,55 @@ export default function WikiCard({ doc, onExpand }: WikiCardProps) {
                 marginTop: 'auto', paddingTop: '10px',
                 borderTop: '1px solid var(--border-subtle)',
             }}>
-                {doc.char_count && (
-                    <span data-testid="char-count" style={{ fontSize: '10px', color: 'var(--text-muted)', fontFamily: 'monospace' }}>
-                        {doc.char_count.toLocaleString('zh-CN')} 字
-                    </span>
-                )}
-                {doc.ingested_at && (
-                    <span style={{ fontSize: '10px', color: 'var(--text-muted)' }}>
-                        {new Date(doc.ingested_at).toLocaleDateString('zh-CN')}
-                    </span>
+                <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+                    {doc.char_count && (
+                        <span data-testid="char-count" style={{ fontSize: '10px', color: 'var(--text-muted)', fontFamily: 'monospace' }}>
+                            {doc.char_count.toLocaleString('zh-CN')} 字
+                        </span>
+                    )}
+                    {doc.ingested_at && (
+                        <span style={{ fontSize: '10px', color: 'var(--text-muted)' }}>
+                            {new Date(doc.ingested_at).toLocaleDateString('zh-CN')}
+                        </span>
+                    )}
+                </div>
+                {/* 管理操作(Loop #10):hover 显出,stopPropagation 防误触展开 */}
+                {(onDelete || onRecompile) && (
+                    <div data-testid="card-actions" className="card-actions" style={{
+                        display: 'flex', gap: '6px', opacity: 0.6,
+                    }}>
+                        {isError && onRecompile && (
+                            <button
+                                data-testid="recompile-btn"
+                                onClick={e => { stop(e); onRecompile(doc.id); }}
+                                title="重编译(error 重试)"
+                                style={actionBtnStyle}
+                            >↻</button>
+                        )}
+                        {onDelete && (
+                            <button
+                                data-testid="delete-btn"
+                                onClick={e => {
+                                    stop(e);
+                                    if (window.confirm(`确认删除《${doc.title ?? doc.id}》?此操作不可撤销,将移除其全部产物与引用。`)) {
+                                        onDelete(doc.id);
+                                    }
+                                }}
+                                title="删除文档"
+                                style={{ ...actionBtnStyle, color: 'var(--accent-red)' }}
+                            >🗑</button>
+                        )}
+                    </div>
                 )}
             </div>
         </div>
     );
 }
+
+const actionBtnStyle: React.CSSProperties = {
+    padding: '2px 8px', fontSize: '12px', lineHeight: 1,
+    borderRadius: '6px', cursor: 'pointer',
+    border: '1px solid rgba(255,255,255,0.10)',
+    background: 'rgba(255,255,255,0.04)',
+    color: 'var(--text-muted)',
+};

@@ -1,7 +1,7 @@
 'use client';
 import React, { useEffect, useState } from 'react';
 import WikiCard from '@/components/WikiCard';
-import { fetchWikiIndex, type DocMeta } from '@/lib/api';
+import { fetchWikiIndex, deleteDoc, recompileDoc, type DocMeta } from '@/lib/api';
 
 export default function WikiPage() {
     const [docs, setDocs] = useState<DocMeta[]>([]);
@@ -86,6 +86,24 @@ export default function WikiPage() {
                             key={doc.id}
                             doc={doc}
                             onExpand={id => window.location.assign(`/wiki/${id}`)}
+                            onDelete={async id => {
+                                try {
+                                    await deleteDoc(id);
+                                    setDocs(ds => ds.filter(d => d.id !== id));
+                                    setTotal(t => Math.max(0, t - 1));
+                                } catch (e) {
+                                    alert(`删除失败: ${e instanceof Error ? e.message : e}`);
+                                }
+                            }}
+                            onRecompile={async id => {
+                                try {
+                                    await recompileDoc(id);
+                                    // 状态先标 compiling(后台编译中),稍后刷新
+                                    setDocs(ds => ds.map(d => d.id === id ? { ...d, status: 'compiling' } : d));
+                                } catch (e) {
+                                    alert(`重编译失败: ${e instanceof Error ? e.message : e}`);
+                                }
+                            }}
                         />
                     ))}
                 </div>

@@ -16,6 +16,19 @@ export default function WikiPage() {
             .finally(() => setLoading(false));
     }, []);
 
+    // Loop #11: 任一文档编译中时,每 10s 轮询刷新;全部编译完自动停止。
+    // 解决:上传后用户需手动反复刷新才知道编译完成。
+    const hasPending = docs.some(d => d.status === 'raw' || d.status === 'compiling');
+    useEffect(() => {
+        if (!hasPending) return;
+        const timer = setInterval(() => {
+            fetchWikiIndex()
+                .then(data => { setDocs(data.documents); setTotal(data.total_docs); })
+                .catch(() => {});
+        }, 10000);
+        return () => clearInterval(timer);
+    }, [hasPending]);
+
     const compiled = docs.filter(d => d.status === 'compiled').length;
 
     return (
@@ -29,6 +42,19 @@ export default function WikiPage() {
                     <p style={{ fontSize: '13px', color: 'var(--text-muted)', margin: 0 }}>
                         零向量数据库 · Context Stuffing 检索引擎
                     </p>
+                    {hasPending && (
+                        <p data-testid="compiling-hint" style={{
+                            fontSize: '12px', color: 'var(--accent-amber)', margin: '6px 0 0',
+                            display: 'flex', alignItems: 'center', gap: '6px',
+                        }}>
+                            <span className="spin" style={{
+                                display: 'inline-block', width: '10px', height: '10px',
+                                border: '1.5px solid var(--accent-amber)', borderTopColor: 'transparent',
+                                borderRadius: '50%',
+                            }} />
+                            有文档编译中,每 10 秒自动刷新…
+                        </p>
+                    )}
                 </div>
                 <div style={{ display: 'flex', gap: '32px', textAlign: 'right' }}>
                     <div>

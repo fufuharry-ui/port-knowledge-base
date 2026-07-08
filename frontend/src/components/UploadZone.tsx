@@ -138,7 +138,12 @@ export default function UploadZone({ onUpload }: UploadZoneProps) {
                                     </p>
                                 )}
                                 {item.state === 'done' && !item.result?.skipped && (
-                                    <p style={{ margin: 0, fontSize: '11px', color: 'var(--accent-green)' }}>摄入成功，后台编译中...</p>
+                                    <p style={{ margin: 0, fontSize: '11px', color: 'var(--accent-green)' }}>
+                                        摄入成功，后台编译中…
+                                        <a href="/wiki" style={{ marginLeft: '8px', color: 'var(--accent-blue)', textDecoration: 'none' }}>
+                                            去仪表盘看编译进度 →
+                                        </a>
+                                    </p>
                                 )}
                                 {item.result?.skipped && (
                                     <p style={{ margin: 0, fontSize: '11px', color: 'var(--accent-amber)' }}>文件已存在，已跳过</p>

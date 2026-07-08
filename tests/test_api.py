@@ -156,6 +156,30 @@ def test_qa_passes_contradictions_to_layer3(
     assert kwargs["contradictions"], "/qa 传入的 contradictions 为空(断线)"
 
 
+@patch("api.main.layer3_answer_stream", return_value=iter(["mock answer"]))
+@patch("api.main.layer2_score", return_value=[{"id": "doc_A", "title": "A"}])
+@patch("api.main.layer1_filter")
+@patch("api.main.get_llm_client")
+def test_qa_passes_history_to_layer3(
+    mock_client, mock_l1, mock_l2, mock_l3_stream
+):
+    """P0 回归守卫(Big-Loop #8):/qa 必须把 history 传给 layer3_answer_stream。
+    多轮对话上下文若断线,追问代词无法解析,Q&A 退化为单轮。
+    """
+    mock_l1.return_value = [{"id": "doc_A", "title": "A"}]
+    history = [
+        {"role": "user", "content": "岸桥远控用什么网络"},
+        {"role": "assistant", "content": "采用5G专网"},
+    ]
+    response = client.post("/api/v1/qa", json={"query": "那它的延迟要求", "history": history})
+    assert response.status_code == 200
+
+    assert mock_l3_stream.called
+    _args, kwargs = mock_l3_stream.call_args
+    assert "history" in kwargs, "/qa 未向 layer3_answer_stream 传 history"
+    assert kwargs["history"], "/qa 传入的 history 为空(断线)"
+
+
 def test_entity_graph_endpoint():
     """E-5:GET /api/v1/entity-graph 返回术语邻居结构。"""
     response = client.get("/api/v1/entity-graph?term=5G专网&depth=2")

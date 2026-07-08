@@ -44,6 +44,12 @@ export default function ChatPanel({ onHighlight }: ChatPanelProps) {
             role: 'user',
             content: query,
         };
+        // Big-Loop #8: 收集当前轮之前的对话历史(不含刚加的本轮 userMsg),
+        // 传给后端解析追问代词。截断到最近 10 条(与后端一致)。
+        const history = messages
+            .slice(-10)
+            .map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }))
+            .filter(m => m.content.trim());
         setMessages(prev => [...prev, userMsg]);
         setInputValue('');
         setThoughts([]);
@@ -61,7 +67,7 @@ export default function ChatPanel({ onHighlight }: ChatPanelProps) {
         scrollToBottom();
 
         try {
-            for await (const event of streamQA(query)) {
+            for await (const event of streamQA(query, history)) {
                 switch (event.type) {
                     case 'thought':
                         setThoughts(prev => [...prev, {

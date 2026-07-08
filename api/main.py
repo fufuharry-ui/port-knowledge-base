@@ -123,6 +123,9 @@ class SearchQuery(BaseModel):
 
 class QAQuery(BaseModel):
     query: str
+    # Big-Loop #8: 多轮对话历史。每条 {role:'user'|'assistant', content:str}。
+    # 后端注入 Layer3 prompt,让 LLM 解析追问代词。默认空 → 单轮(向后兼容)。
+    history: list[dict] = []
 
 # ─── GET /api/v1/health (落地增强:部署健康检查) ─────────────────────────────
 
@@ -457,7 +460,7 @@ async def qa_stream(request: QAQuery):
                 contradictions = load_contradictions().get("contradictions", [])
                 for token in layer3_answer_stream(
                     request.query, top_docs, client, model, index,
-                    contradictions=contradictions,
+                    contradictions=contradictions, history=request.history,
                 ):
                     if token:
                         yield {"data": json.dumps({"type": "delta", "text": token})}

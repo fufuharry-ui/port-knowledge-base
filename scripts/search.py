@@ -420,22 +420,28 @@ ANSWER_SYSTEM = """你是一个专业的技术文档助理，服务于港口智�
 
 def layer3_answer(query: str, top_docs: list[dict],
                   client, model: str, index: dict,
-                  contradictions: list[dict] | None = None) -> str:
+                  contradictions: list[dict] | None = None,
+                  history: list[dict] | None = None) -> str:
     """Layer 3：基于精选文档全文生成最终回答(非流式,返回完整字符串)。
 
     Big-Loop #5: 委派给 layer3_answer_stream 并收集,保持单一真源。
     Big-Loop #3: contradictions 携带已知矛盾对,Top 文档间有矛盾则附 ⚠️ 提示。
+    Big-Loop #8: history 携带多轮对话。
     """
     return "".join(layer3_answer_stream(
-        query, top_docs, client, model, index, contradictions=contradictions,
+        query, top_docs, client, model, index,
+        contradictions=contradictions, history=history,
     ))
 
 
-def _build_layer3_context(query: str, top_docs: list[dict], index: dict):
+def _build_layer3_context(query: str, top_docs: list[dict], index: dict,
+                          history: list[dict] | None = None):
     """构建 Layer3 的 user_prompt + sources_section。
 
     返回 (user_prompt, sources_section) 或 None(无候选文档)。
     Big-Loop #5 抽出,供流式/非流式共用,避免逻辑重复。
+    Big-Loop #8: history 携带多轮对话(最近若干轮),注入 prompt 让 LLM
+    解析追问代词(如"它的延迟要求"中的"它")。None/空 → 不注入(向后兼容)。
     """
     context_parts = []
     sources = []
@@ -467,20 +473,38 @@ def _build_layer3_context(query: str, top_docs: list[dict], index: dict):
         return None
 
     context = "\n\n" + "=" * 40 + "\n\n".join(context_parts)
-    user_prompt = f"查询问题: {query}\n\n参考文档:{context}"
+
+    # Big-Loop #8: 注入最近若干轮对话历史(截断到最近 10 条,避免吃文档预算)
+    history_block = ""
+    if history:
+        recent = history[-10:]
+        lines = []
+        for turn in recent:
+            role = turn.get("role", "user")
+            content = (turn.get("content") or "").strip()
+            if not content:
+                continue
+            label = "用户" if role == "user" else "助手"
+            lines.append(f"{label}: {content}")
+        if lines:
+            history_block = "\n\n【对话历史】(用于理解追问,勿重复其中信息)\n" + "\n".join(lines)
+
+    user_prompt = f"查询问题: {query}{history_block}\n\n参考文档:{context}"
     sources_section = "\n\n---\n📎 **引用来源:**\n" + "\n".join(sources)
     return user_prompt, sources_section
 
 
 def layer3_answer_stream(query: str, top_docs: list[dict],
                          client, model: str, index: dict,
-                         contradictions: list[dict] | None = None):
+                         contradictions: list[dict] | None = None,
+                         history: list[dict] | None = None):
     """Layer 3 流式版(Big-Loop #5):逐 token yield 答案,末尾 yield 提示+来源。
 
     真流式:首 token 不等全生成(感知延迟从"总时长"降到"首 token")。
     无候选文档 → yield 提示并返回。
+    Big-Loop #8: history 携带多轮对话,透传给 _build_layer3_context。
     """
-    built = _build_layer3_context(query, top_docs, index)
+    built = _build_layer3_context(query, top_docs, index, history=history)
     if built is None:
         yield "⚠️ 未找到相关文档，请调整查询关键词或扩充知识库。"
         return

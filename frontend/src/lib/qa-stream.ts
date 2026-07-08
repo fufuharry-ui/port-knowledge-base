@@ -54,17 +54,24 @@ export function parseSSELine(line: string): QAEvent | null {
 
 import { API_BASE } from './api';
 
+export interface ChatTurn {
+    role: 'user' | 'assistant';
+    content: string;
+}
+
 /**
  * streamQA — 向后端发起 POST /api/v1/qa，返回 QAEvent 异步可迭代对象
+ * Big-Loop #8: history 携带多轮对话,让后端解析追问代词。默认空(单轮,向后兼容)。
  */
 export async function* streamQA(
     query: string,
+    history: ChatTurn[] = [],
     apiBase = `${API_BASE}/api/v1`,
 ): AsyncIterable<QAEvent> {
     const response = await fetch(`${apiBase}/qa`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query }),
+        body: JSON.stringify({ query, history }),
     });
 
     if (!response.ok || !response.body) {

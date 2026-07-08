@@ -18,6 +18,7 @@ import pytest
 from scripts.consistency import (
     find_contradiction_candidates,
     detect_contradiction,
+    detect_contradictions_batch,
     contradictions_for_docs,
 )
 
@@ -182,3 +183,93 @@ class TestContradictionsForDocs:
 
     def test_empty_top_set(self):
         assert contradictions_for_docs([], [{"doc_a": "A", "doc_b": "B"}]) == []
+
+
+# ─── 批量化稽核(Loop #9,解决规模化瓶颈)─────────────────────────────────────
+
+class TestBatchContradictionDetection:
+    """detect_contradictions_batch: 多对一次 LLM,把 N 次调用降到 N/batch_size 次。"""
+
+    def _client_returning_batch(self, results: list[dict]):
+        """mock client,chat.completions.create 返回含 results 数组的 JSON。"""
+        client = MagicMock()
+        msg = MagicMock()
+        msg.content = json.dumps({"results": results}, ensure_ascii=False)
+        choice = MagicMock()
+        choice.message = msg
+        resp = MagicMock()
+        resp.choices = [choice]
+        client.chat.completions.create.return_value = resp
+        return client
+
+    def test_batch_reduces_llm_call_count(self, patch_consistency_paths):
+        """5 对 + batch_size=5 → 仅 1 次 LLM 调用(而非 5 次)。"""
+        mod = patch_consistency_paths
+        index = {"documents": [
+            {"id": f"doc_{i}", "title": f"T{i}", "abstract_short": f"摘要{i}"}
+            for i in range(2)  # 2 docs → 1 pair, 放大用 below
+        ]}
+        # 构造 5 对(用 10 个文档)
+        docs = [{"id": f"d{i}", "title": f"T{i}", "abstract_short": f"摘要{i}"} for i in range(10)]
+        index = {"documents": docs}
+        pairs = [(f"d{i}", f"d{i+1}") for i in range(0, 10, 2)]  # 5 对
+        results = [{"doc_a": a, "doc_b": b, "has_conflict": False, "confidence": 0.9}
+                   for a, b in pairs]
+        client = self._client_returning_batch(results)
+
+        out = detect_contradictions_batch(pairs, client, "m", index=index, batch_size=5)
+        assert client.chat.completions.create.call_count == 1  # 5对1批=1次
+        assert len(out) == 5
+
+    def test_batch_splits_when_exceeding_batch_size(self, patch_consistency_paths):
+        """12 对 + batch_size=5 → 3 次调用(5+5+2)。"""
+        docs = [{"id": f"d{i}", "title": f"T{i}", "abstract_short": f"摘要{i}"} for i in range(24)]
+        index = {"documents": docs}
+        pairs = [(f"d{i}", f"d{i+1}") for i in range(0, 24, 2)]  # 12 对
+        client = self._client_returning_batch(
+            [{"doc_a": a, "doc_b": b, "has_conflict": False, "confidence": 0.9} for a, b in pairs]
+        )
+        detect_contradictions_batch(pairs, client, "m", index=index, batch_size=5)
+        assert client.chat.completions.create.call_count == 3  # ceil(12/5)=3
+
+    def test_batch_preserves_verdicts(self, patch_consistency_paths):
+        """批量返回的冲突判定正确映射到对应文档对。"""
+        docs = [{"id": "d0", "title": "A", "abstract_short": "延迟10ms"},
+                {"id": "d1", "title": "B", "abstract_short": "延迟20ms"},
+                {"id": "d2", "title": "C", "abstract_short": "讲机械"}]
+        index = {"documents": docs}
+        pairs = [("d0", "d1"), ("d0", "d2")]
+        results = [
+            {"doc_a": "d0", "doc_b": "d1", "has_conflict": True,
+             "conflict_point": "延迟", "reasoning_chain": "10ms vs 20ms", "confidence": 0.85},
+            {"doc_a": "d0", "doc_b": "d2", "has_conflict": False, "confidence": 0.9},
+        ]
+        client = self._client_returning_batch(results)
+        out = detect_contradictions_batch(pairs, client, "m", index=index, batch_size=5)
+        conflict = [r for r in out if r and r.get("has_conflict")]
+        assert len(conflict) == 1
+        assert conflict[0]["conflict_point"] == "延迟"
+
+    def test_batch_empty_pairs(self, patch_consistency_paths):
+        client = MagicMock()
+        out = detect_contradictions_batch([], client, "m", index={"documents": []})
+        assert out == []
+        client.chat.completions.create.assert_not_called()
+
+    def test_batch_degrades_on_bad_json(self, patch_consistency_paths):
+        """某批 LLM 返回非 JSON → 该批返回 None(不崩,降级)。"""
+        docs = [{"id": "d0", "title": "A", "abstract_short": "x"},
+                {"id": "d1", "title": "B", "abstract_short": "y"}]
+        index = {"documents": docs}
+        client = MagicMock()
+        msg = MagicMock()
+        msg.content = "这不是JSON"
+        choice = MagicMock()
+        choice.message = msg
+        resp = MagicMock()
+        resp.choices = [choice]
+        client.chat.completions.create.return_value = resp
+        out = detect_contradictions_batch([("d0", "d1")], client, "m", index=index, batch_size=5)
+        # 坏 JSON → 该对结果为 None
+        assert len(out) == 1
+        assert out[0] is None

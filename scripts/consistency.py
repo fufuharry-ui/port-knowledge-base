@@ -184,6 +184,135 @@ def detect_contradiction(
     return _parse_contradiction_json(content)
 
 
+# ─── 批量化稽核(Loop #9,解决规模化瓶颈)──────────────────────────────────────
+
+BATCH_CONTRADICTION_SYSTEM = """你是知识库一致性稽核员。给定若干文档对的摘要与原文片段,
+逐对判断每对是否对【同一事实/指标/论断】给出冲突结论。
+
+冲突判定标准(严格,同单对版):
+- 两文档论及同一事实,且对该事实给出不一致的数值/结论/规范。
+- 单纯详略互补、视角不同,不算冲突。
+
+输出严格 JSON,results 数组,顺序与输入对一致:
+{
+  "results": [
+    {"doc_a": "...", "doc_b": "...", "has_conflict": true|false,
+     "conflict_point": "冲突点(无则空串)", "reasoning_chain": "推理链(无则空串)",
+     "confidence": 0.0-1.0}
+  ]
+}
+只输出 JSON。"""
+
+
+def detect_contradictions_batch(
+    pairs: list[tuple[str, str]],
+    client,
+    model: str,
+    *,
+    index: dict | None = None,
+    raw_dir: Path | None = None,
+    batch_size: int = 5,
+) -> list[dict | None]:
+    """批量矛盾判定:多对一次 LLM 调用,把 N 次降到 ceil(N/batch_size) 次。
+
+    解决规模化瓶颈:100 文档 ~222 对,单对串行 ~14 分钟;batch=10 → ~22 调用 ~2 分钟。
+    返回:与 pairs 等长的列表,每项为判定 dict 或 None(证据缺失/批次失败时降级)。
+    """
+    if not pairs:
+        return []
+    if client is None:
+        return [None] * len(pairs)
+
+    idx = index if index is not None else _load_index()
+    rdir = raw_dir if raw_dir is not None else RAW_DIR
+    docs_by_id = {d.get("id"): d for d in idx.get("documents", [])}
+
+    results_out: list[dict | None] = [None] * len(pairs)
+
+    for start in range(0, len(pairs), batch_size):
+        batch = pairs[start:start + batch_size]
+        prompt_parts = []  # (batch内序号, doc_a, doc_b)
+        for i, (a, b) in enumerate(batch):
+            da = docs_by_id.get(a)
+            db = docs_by_id.get(b)
+            if not da or not db:
+                results_out[start + i] = None  # 证据缺失
+                continue
+            prompt_parts.append((
+                i, a, b,
+                f"[对{i+1}] doc_a={a} doc_b={b}\n"
+                f"文档A《{da.get('title', a)}》:\n{_doc_evidence(da, rdir)}\n\n"
+                f"文档B《{db.get('title', b)}》:\n{_doc_evidence(db, rdir)}",
+            ))
+        if not prompt_parts:
+            continue
+
+        prompt = "请逐对判定以下文档对是否存在事实性冲突:\n\n" + \
+                 "\n\n".join(p[3] for p in prompt_parts)
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": BATCH_CONTRADICTION_SYSTEM},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+                response_format={"type": "json_object"},
+                extra_body={"enable_thinking": False},  # 批量判定,关思考加速(Loop #5 同理)
+            )
+            content = resp.choices[0].message.content
+        except Exception:
+            content = None
+
+        batch_results = _parse_batch_json(content) if content else None
+        # 按 (doc_a, doc_b) 建索引,映射回各对
+        verdict_map = {}
+        if batch_results:
+            for r in batch_results:
+                if isinstance(r, dict):
+                    a, b = r.get("doc_a"), r.get("doc_b")
+                    if a and b:
+                        verdict_map[(a, b)] = verdict_map[(b, a)] = r
+        for i, a, b, _ in prompt_parts:
+            r = verdict_map.get((a, b))
+            if r:
+                results_out[start + i] = {
+                    "has_conflict": bool(r.get("has_conflict", False)),
+                    "conflict_point": str(r.get("conflict_point", "")).strip(),
+                    "reasoning_chain": str(r.get("reasoning_chain", "")).strip(),
+                    "confidence": float(r.get("confidence", 0.0) or 0.0),
+                }
+            # 批次坏 JSON 或缺映射 → None(降级)
+
+    return results_out
+
+
+def _parse_batch_json(content: str) -> list[dict] | None:
+    """解析批量 LLM 返回({"results": [...]})。"""
+    if not content:
+        return None
+    import re
+    import json as _json
+    txt = content.strip()
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", txt, re.DOTALL)
+    if fence:
+        txt = fence.group(1)
+    else:
+        brace = re.search(r"\{.*\}", txt, re.DOTALL)
+        if brace:
+            txt = brace.group(0)
+    try:
+        data = _json.loads(txt)
+    except Exception:
+        return None
+    if isinstance(data, dict):
+        return data.get("results", [])
+    if isinstance(data, list):
+        return data
+    return None
+
+
+
 def _doc_evidence(doc: dict, raw_dir: Path) -> str:
     """取一条文档的稽核证据:摘要 + 原文头部(截断到 2000 字符)。"""
     parts = []
@@ -248,9 +377,12 @@ def run_consistency_check(
     out_file: Path | None = None,
     index: dict | None = None,
     raw_dir: Path | None = None,
+    batch_size: int = 5,
 ) -> dict:
-    """全库一致性稽核:生成候选对 → LLM 逐对判定 → 写 contradictions.yaml。
+    """全库一致性稽核:生成候选对 → LLM 批量判定 → 写 contradictions.yaml。
 
+    Loop #9: 用 detect_contradictions_batch(多对一次调用)替代逐对串行,
+    把 N 次 LLM 降到 ceil(N/batch_size) 次。batch_size 默认 5(质量/速度平衡)。
     返回写入的报告 dict(pairs/last_updated/total)。
     """
     kg_path = kg_file if kg_file is not None else (
@@ -267,11 +399,12 @@ def run_consistency_check(
     candidates = find_contradiction_candidates(kg_edges, ent_edges)
 
     contradictions = []
-    for doc_a, doc_b in candidates:
-        result = detect_contradiction(
-            doc_a, doc_b, client, model,
-            index=index, raw_dir=raw_dir,
-        )
+    # Loop #9: 批量判定(降 N 次→N/batch_size 次)
+    verdicts = detect_contradictions_batch(
+        candidates, client, model,
+        index=index, raw_dir=raw_dir, batch_size=batch_size,
+    )
+    for (doc_a, doc_b), result in zip(candidates, verdicts):
         if result and result.get("has_conflict"):
             contradictions.append({
                 "doc_a": doc_a,

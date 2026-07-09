@@ -1,0 +1,372 @@
+ontology_tree:
+- term: 智慧港口
+  parent: null
+  definition: 利用数字化、智能化技术提升港口运营效率与安全水平的综合体系
+  children:
+  - term: 港口自动化
+    parent: 智慧港口
+    definition: 港口装卸、运输、调度等作业环节的自动化改造
+    children:
+    - term: 岸桥远控
+      parent: 港口自动化
+      definition: 通过远程操控系统实现岸桥装卸作业的自动化技术
+      children: []
+    - term: 自动导引车
+      parent: 港口自动化
+      definition: 无人驾驶的港区集装箱水平运输设备（AGV/ARMG）
+      children:
+      - term: 无人集卡
+        parent: 自动导引车
+        definition: 应用于港口水平运输的无人驾驶集装箱卡车，依赖5G实现精准调度与控制。
+        children: []
+    - term: 自动化轨道吊
+      parent: 港口自动化
+      definition: 自动化堆场中用于集装箱堆存的轨道式起重机（ARMG）
+      children: []
+    - term: 智能理货
+      parent: 港口自动化
+      definition: 结合AI视觉技术实现集装箱自动识别与计数，准确率超99%的港口作业环节。
+      children:
+      - term: 智能理货闸口
+        parent: 智能理货
+        definition: 集成AI识别技术的港口闸口系统，实现货物自动核验与高效放行。
+        children: []
+    - term: 自动化装卸系统
+      parent: 港口自动化
+      definition: 集成远控技术与自动化设备的码头作业系统，旨在提升吞吐量与保障安全。
+      children:
+      - term: ART机器人
+        parent: 自动化装卸系统
+        definition: 应用于港口生产作业的自动化机器人设备，实现装卸流程自动化。
+        children: []
+    - term: 场桥远控
+      parent: 港口自动化
+      definition: 对码头堆场起重机实施远程操控的技术，有效降低人员高空作业风险。
+      children: []
+    - term: 自动化码头2.0/3.0
+      parent: 港口自动化
+      definition: 港口自动化建设的演进阶段，强调全流程无人化、智能化协同与系统自主可控。
+      children: []
+  - term: 港口数字化
+    parent: 智慧港口
+    definition: 港口业务流程、数据资产的数字化转型
+    children:
+    - term: 港口操作系统
+      parent: 港口数字化
+      definition: 港口生产作业管理核心系统（TOS/CTMS）
+      children:
+      - term: JTOS
+        parent: 港口操作系统
+        definition: 天津港自主研发的码头生产作业核心调度与管理系统，实现全流程智慧赋能。
+        children:
+        - term: JTOS智能算法
+          parent: JTOS
+          definition: 嵌入港口操作系统的核心调度算法，实现作业计划秒级生成与优化。
+          children: []
+    - term: 数据治理
+      parent: 港口数字化
+      definition: 港口数据标准化、质量管理与共享机制
+      children:
+      - term: 数据要素市场化
+        parent: 数据治理
+        definition: 将港口数据资产化，建立确权、定价、交易与流通机制以释放数据经济价值。
+        children: []
+      - term: 数据可信流通
+        parent: 数据治理
+        definition: 基于隐私计算等技术保障跨主体港口数据交互的安全、合规与可追溯。
+        children: []
+      - term: 三级知识体系
+        parent: 数据治理
+        definition: 面向港口业务构建的层级化知识分类与组织框架，用于支撑精准检索与推理。
+        children: []
+      - term: 数据运营体系
+        parent: 数据治理
+        definition: 涵盖数据采集、资产化管理、价值挖掘与对外服务的全生命周期管理机制。
+        children: []
+      - term: 大数据管理中心
+        parent: 数据治理
+        definition: 负责集团级数据资产统筹、标准制定与非经营性服务保障的核心机构。
+        children: []
+    - term: 数字孪生
+      parent: 港口数字化
+      definition: 构建港口物理实体与虚拟模型实时映射的技术体系，用于仿真推演与优化决策。
+      children:
+      - term: 数字孪生天津港
+        parent: 数字孪生
+        definition: 以天津港实体为映射的虚拟仿真系统，用于港口规划、运营监控与智能决策优化。
+        children: []
+    - term: 供应链物流智慧化
+      parent: 港口数字化
+      definition: 依托数字技术打通港航物流全链条，实现端到端智能协同与高效服务体系构建。
+      children:
+      - term: 航运服务智慧化
+        parent: 供应链物流智慧化
+        definition: 利用数字技术打通航运生产与交易环节，实现港航服务全链条协同与效率提升。
+        children: []
+    - term: 六个数字化
+      parent: 港口数字化
+      definition: 涵盖交易、生产、管理、经营、产业及底座的港口全面数字化转型总体蓝图。
+      children: []
+    - term: 数字员工平台
+      parent: 港口数字化
+      definition: 集成算力、模型与智能体，覆盖全生命周期的港口统一技术支撑与运营平台。
+      children: []
+    - term: 数据智能驱动
+      parent: 港口数字化
+      definition: 以数据为核心要素替代传统经验，通过算法模型赋能管理决策与生产运营。
+      children: []
+    - term: 业技融合
+      parent: 港口数字化
+      definition: 港口业务场景与信息技术深度结合，实现流程重构与效能提升的过程。
+      children: []
+  - term: 港口安全
+    parent: 智慧港口
+    definition: 港口生产安全与应急响应体系
+    children:
+    - term: 信创适配
+      parent: 港口安全
+      definition: 核心软硬件系统向国产化技术栈迁移与兼容性验证的过程，保障供应链安全。
+      children:
+      - term: 全栈信创替代
+        parent: 信创适配
+        definition: 港口IT基础设施及应用系统从芯片到软件全面采用国产化自主可控技术的升级过程。
+        children: []
+    - term: 立体安全防护体系
+      parent: 港口安全
+      definition: 涵盖网络通信、数据资产与底层信创环境的多层级综合安全保障架构。
+      children:
+      - term: 内容安全护栏
+        parent: 立体安全防护体系
+        definition: 针对大模型输入输出进行双向过滤、合规审查与风险拦截的安全管控机制。
+        children: []
+      - term: 网络安全防御体系
+        parent: 立体安全防护体系
+        definition: 覆盖网络边界、终端与数据的多层纵深防护架构，保障港口核心业务连续可控。
+        children: []
+    - term: 安全合规
+      parent: 港口安全
+      definition: 满足国家数据安全法规与行业标准，保障港口信息系统合法稳健运行的要求。
+      children: []
+  - term: 港口新质生产力
+    parent: 智慧港口
+    definition: 以数字技术与人工智能深度融合驱动的港口高效能、高质量发展核心动能。
+    children:
+    - term: 人机协同生态
+      parent: 港口新质生产力
+      definition: 以"一岗一助手"为核心，实现港口员工与数字智能体高效协作的业务新模式。
+      children: []
+  - term: 津港智造
+    parent: 智慧港口
+    definition: 天津港自主研发、具备自主知识产权的智慧港口整体解决方案与技术输出品牌。
+    children: []
+  - term: 智慧绿色枢纽港口
+    parent: 智慧港口
+    definition: 融合自动化作业、低碳能源与智能调度，具备全球资源配置能力的现代化港口形态。
+    children: []
+  - term: 智慧港口管理体制
+    parent: 智慧港口
+    definition: 统筹智慧港口规划、建设、运营与考核的组织架构与制度体系。
+    children:
+    - term: 非经营性统筹实体
+      parent: 智慧港口管理体制
+      definition: 以公共服务与战略保障为导向，弱化市场化盈利指标的资源调配与管理实体。
+      children: []
+- term: 基础设施
+  parent: null
+  definition: 支撑智慧港口系统运行的底层技术组件
+  children:
+  - term: 通信技术
+    parent: 基础设施
+    definition: 港区网络通信与数据传输技术
+    children:
+    - term: 5G专网
+      parent: 通信技术
+      definition: 面向港口场景的5G SA独立组网方案
+      children: []
+    - term: 工业以太网
+      parent: 通信技术
+      definition: 用于港口设备内部通信的有线网络
+      children: []
+    - term: 5G技术
+      parent: 通信技术
+      definition: 第五代移动通信技术，凭借大带宽、低时延与高可靠特性支撑港口自动化作业。
+      children:
+      - term: eMBB
+        parent: 5G技术
+        definition: 增强型移动宽带，用于实现岸桥远控等场景的高清视频大带宽回传。
+        children: []
+      - term: uRLLC
+        parent: 5G技术
+        definition: 超可靠低延迟通信，保障无人集卡等设备的厘米级精准控制与实时响应。
+        children: []
+      - term: SA架构
+        parent: 5G技术
+        definition: 5G独立组网架构，提供完整核心网，支撑港口专网低延迟高可靠通信。
+        children: []
+    - term: 5G+光纤冗余链路
+      parent: 通信技术
+      definition: 融合5G无线与光纤有线的双链路架构，用于极端气象下保障港口业务高可用性。
+      children: []
+    - term: 控制信令延迟
+      parent: 通信技术
+      definition: 设备控制指令在网络传输的耗时，港口远控场景要求严格控制在20ms内。
+      children: []
+  - term: 计算架构
+    parent: 基础设施
+    definition: 数据处理与计算资源的组织方式
+    children:
+    - term: MEC边缘计算
+      parent: 计算架构
+      definition: 在网络边缘节点部署计算能力，降低时延
+      children:
+      - term: 数据流量本地化卸载
+        parent: MEC边缘计算
+        definition: 通过边缘节点就近处理业务流量，避免回传核心网，显著降低网络延迟。
+        children: []
+    - term: 云计算平台
+      parent: 计算架构
+      definition: 集中式云端计算与存储服务
+      children:
+      - term: MaaS
+        parent: 云计算平台
+        definition: 模型即服务，将大模型能力以服务化形式提供，支持按需调用与弹性扩展。
+        children: []
+    - term: 弹性算力架构
+      parent: 计算架构
+      definition: 结合通算租赁与智算采购，实现算力资源动态调度与按需分配的底层架构。
+      children: []
+    - term: 智算中心
+      parent: 计算架构
+      definition: 面向AI算力需求构建的高性能计算集群，支撑港口大模型与智能体训练推理。
+      children: []
+  - term: ICT数字底座
+    parent: 基础设施
+    definition: 支撑港口数字化运行的底层信息通信技术设施、算力网络与云平台集合。
+    children:
+    - term: 算力底座
+      parent: ICT数字底座
+      definition: 为港口AI模型训练与推理提供高性能计算资源的硬件基础设施。
+      children: []
+    - term: 低代码开发平台
+      parent: ICT数字底座
+      definition: 提供可视化组件与拖拽能力，加速港口业务应用与智能体快速构建的环境。
+      children: []
+    - term: 工业互联网底座
+      parent: ICT数字底座
+      definition: 连接港口设备与业务系统的底层网络与平台架构，实现数据互通与协同控制。
+      children: []
+    - term: 信创算力
+      parent: ICT数字底座
+      definition: 基于国产化技术栈构建的，支撑港口核心业务运行的计算资源与处理能力。
+      children: []
+- term: 人工智能
+  parent: null
+  definition: 应用于港口场景的AI技术体系
+  children:
+  - term: 计算机视觉
+    parent: 人工智能
+    definition: 基于图像/视频的目标检测、识别与分析技术
+    children:
+    - term: 违章智能识别
+      parent: 计算机视觉
+      definition: 基于视觉分析技术自动检测并标记港口作业违规行为的技术。
+      children: []
+  - term: 知识图谱
+    parent: 人工智能
+    definition: 以图结构表示实体及实体间关系的知识表示技术
+    children:
+    - term: 专业知识库
+      parent: 知识图谱
+      definition: 汇聚港口业务规则与专家经验的数字化知识集合，支撑智能问答。
+      children: []
+  - term: 大语言模型
+    parent: 人工智能
+    definition: 基于Transformer架构的大规模预训练语言模型
+    children:
+    - term: PortGPT
+      parent: 大语言模型
+      definition: 面向港航物流场景定制训练的垂直领域大语言模型，赋能业务智能化。
+      children:
+      - term: PortGPT-CV大模型
+        parent: PortGPT
+        definition: 面向港口安全管控的视觉大模型，用于现场违章行为智能识别。
+        children: []
+    - term: 多模态大模型
+      parent: 大语言模型
+      definition: 支持文本、图像、语音等多模态数据输入输出的生成式人工智能模型。
+      children: []
+    - term: RAG技术
+      parent: 大语言模型
+      definition: 检索增强生成技术，通过外挂港口知识库提升大模型专业场景回答准确性。
+      children: []
+    - term: 行业大模型
+      parent: 大语言模型
+      definition: 针对港航垂直领域训练的专业AI模型，用于业务决策、智能客服与流程优化。
+      children: []
+  - term: 智能体
+    parent: 人工智能
+    definition: 具备自主感知、决策与执行能力的AI应用形态，用于重塑港口管理与决策流程。
+    children:
+    - term: 智能体平台
+      parent: 智能体
+      definition: 支撑港口各类AI智能体开发、部署与协同管理的底层软件平台。
+      children: []
+    - term: 智能体全生命周期管理
+      parent: 智能体
+      definition: 覆盖智能体开发、编排、纳管、运营等阶段的统一管控与运维体系。
+      children: []
+    - term: 数字员工
+      parent: 智能体
+      definition: 基于AI技术构建的虚拟劳动力，可自主执行办公审批、数据分析等重复性任务。
+      children: []
+- term: 定位导航技术
+  parent: null
+  definition: ''
+  children:
+  - term: 北斗RTK
+    parent: 定位导航技术
+    definition: 基于北斗卫星的实时动态差分技术，为AGV提供厘米级高精度位置基准。
+    children: []
+- term: 环境感知算法
+  parent: null
+  definition: ''
+  children:
+  - term: 激光雷达SLAM
+    parent: 环境感知算法
+    definition: 利用激光雷达扫描环境特征实现同步定位与建图的自主导航技术。
+    children: []
+- term: 导航控制系统
+  parent: null
+  definition: ''
+  children:
+  - term: 融合导航架构
+    parent: 导航控制系统
+    definition: 结合卫星定位与传感器SLAM的多源数据融合方案，提升复杂工况定位鲁棒性。
+    children: []
+- term: 调度管理平台
+  parent: null
+  definition: ''
+  children:
+  - term: 车队管理系统
+    parent: 调度管理平台
+    definition: 用于AGV车队集中监控、任务分配与实时路径下发的核心控制软件。
+    children: []
+- term: 主动安全技术
+  parent: null
+  definition: ''
+  children:
+  - term: 动态避障策略
+    parent: 主动安全技术
+    definition: 针对静动态障碍物采取差异化绕行或停车等待的实时路径重规划机制。
+    children: []
+- term: 链路状态监测
+  parent: null
+  definition: ''
+  children:
+  - term: 高频心跳检测
+    parent: 链路状态监测
+    definition: 通过5G网络高频发送状态信号以实时监控AGV在线状态与通信质量。
+    children: []
+last_updated: '2026-06-29T21:49:48.685559+08:00'
+total_nodes: 92
+version: '1.0'

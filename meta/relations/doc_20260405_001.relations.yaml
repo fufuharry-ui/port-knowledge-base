@@ -1,0 +1,19 @@
+doc_id: doc_20260405_001
+detected_at: '2026-06-29T22:09:51.266081+08:00'
+relations:
+- target_doc_id: doc_20260405_004
+  type: supplements
+  confidence: 0.88
+  evidence: 新文档针对港口三期码头提出了具体的5G专网+MEC技术改造方案与2026年分阶段实施计划，是对该宏观建设工作方案在工程落地与技术细节层面的直接补充。
+- target_doc_id: doc_20260412_002
+  type: supplements
+  confidence: 0.82
+  evidence: 新文档明确了岸桥远控自动化改造的通信指标与设备联调时间节点，为该简化版方案中"两升级"战略框架提供了可执行的技术路径支撑。
+- target_doc_id: doc_20260405_003
+  type: same_topic
+  confidence: 0.8
+  evidence: 两者均聚焦5G技术在智慧港口建设中的核心应用，新文档的SA架构与MEC部署实践直接呼应白皮书中关于5G低时延、高可靠特性的技术论述。
+- target_doc_id: doc_20260405_002
+  type: same_topic
+  confidence: 0.75
+  evidence: 均属于港口自动化装备的通信与控制技术方案，新文档侧重岸桥/场桥远控网络要求，现有文档侧重AGV无人导航，共同构成港口全场景自动化技术体系。

@@ -1,0 +1,19 @@
+doc_id: doc_20260405_003
+detected_at: '2026-06-29T22:07:27.494280+08:00'
+relations:
+- target_doc_id: doc_20260405_002
+  type: same_topic
+  confidence: 0.9
+  evidence: 两者均聚焦5G技术在港口自动化水平运输中的应用，新文档详述5G赋能无人集卡控制，现有文档阐述AGV无人化导航与5G通信方案，技术场景高度重合。
+- target_doc_id: doc_20260405_001
+  type: supplements
+  confidence: 0.85
+  evidence: 现有文档提出自动化装卸系统对网络实时性的需求，新文档具体给出5G（eMBB/uRLLC）及"5G+光纤"冗余链路的技术实现方案，对网络通信需求形成明确的技术补充。
+- target_doc_id: doc_20260406_008
+  type: same_topic
+  confidence: 0.8
+  evidence: 两者均涉及港口智能理货场景，新文档强调结合AI视觉技术实现超99%准确率的智能理货，现有文档总结智能理货闸口等AI应用成果，主题高度一致。
+- target_doc_id: doc_20260405_004
+  type: same_topic
+  confidence: 0.75
+  evidence: 新文档探讨5G与AI融合推动港口数字化转型，现有文档为智慧港口升级版建设工作方案，两者均围绕港口智能化升级与数字化转型核心主题。

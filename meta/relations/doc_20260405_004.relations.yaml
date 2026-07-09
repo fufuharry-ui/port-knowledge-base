@@ -1,0 +1,19 @@
+doc_id: doc_20260405_004
+detected_at: '2026-06-29T22:12:18.667904+08:00'
+relations:
+- target_doc_id: doc_20260412_002
+  type: version_iteration
+  confidence: 0.95
+  evidence: 两者标题高度一致，均针对"2026年智慧港口升级版建设工作方案"，004为详细完整版，002为简化版V2，核心战略框架与任务部署高度重合，属于同一文档的不同详略版本。
+- target_doc_id: doc_20260406_007
+  type: same_topic
+  confidence: 0.88
+  evidence: 同属天津港集团智慧港口顶层战略文件，004的2026年实施方案与007的"十五五"规划在数字孪生愿景、信创底座建设、自动化码头升级等核心方向上完全一致。
+- target_doc_id: doc_20260406_008
+  type: supplements
+  confidence: 0.82
+  evidence: 004方案中"深耕人工智能全场景应用"、"JTOS系统优化"及"大模型重塑决策"等核心任务，直接承接并规划了008报告已总结的AI在生产、安全、经营领域的应用成果，是对前期成果的深化与扩展。
+- target_doc_id: doc_20260406_009
+  type: same_topic
+  confidence: 0.78
+  evidence: 均聚焦港口大模型、智能体（数字员工）与集约化算力底座建设，004将相关技术纳入集团级升级核心任务，与009的平台建设方案在技术主题与应用场景上高度契合。

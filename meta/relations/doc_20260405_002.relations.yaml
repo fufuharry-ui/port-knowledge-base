@@ -1,0 +1,11 @@
+doc_id: doc_20260405_002
+detected_at: '2026-06-29T22:05:26.913997+08:00'
+relations:
+- target_doc_id: doc_20260405_003
+  type: same_topic
+  confidence: 0.9
+  evidence: 两者均聚焦5G通信技术在智慧港口自动化场景中的核心应用，新文档具体阐述了AGV调度对5G低延迟、高可靠网络的依赖，与白皮书的5G港口通信主题高度一致。
+- target_doc_id: doc_20260405_001
+  type: same_topic
+  confidence: 0.85
+  evidence: 两者均属于港口自动化码头技术改造的核心技术文档，分别针对水平运输（AGV导航调度）与垂直装卸系统（远控自动化）提出具体的自动化升级方案。

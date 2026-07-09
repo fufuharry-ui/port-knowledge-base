@@ -1,0 +1,19 @@
+doc_id: doc_20260412_002
+detected_at: '2026-06-29T22:23:17.817258+08:00'
+relations:
+- target_doc_id: doc_20260405_004
+  type: same_topic
+  confidence: 0.95
+  evidence: 两者均聚焦2026年港口智慧化升级战略部署，新文档的年度重点任务规划与现有建设工作方案在核心目标与实施路径上高度一致。
+- target_doc_id: doc_20260406_008
+  type: supplements
+  confidence: 0.88
+  evidence: 新文档明确将"深化人工智能在管理办公与经营决策中的全场景赋能"列为核心任务，是对现有AI应用成果总结报告的深化与下一步战略部署。
+- target_doc_id: doc_20260406_009
+  type: supplements
+  confidence: 0.82
+  evidence: 新文档提出夯实ICT与智算底座并推动行业大模型及数字员工向港外拓展，在现有数字员工平台建设方案基础上明确了商业化输出与算力底座升级方向。
+- target_doc_id: doc_20260406_007
+  type: same_topic
+  confidence: 0.8
+  evidence: 两者同属天津港集团数字化转型顶层设计文件，新文档的年度任务规划是对"十五五"规划中2026年阶段性目标的具体落实与拆解。

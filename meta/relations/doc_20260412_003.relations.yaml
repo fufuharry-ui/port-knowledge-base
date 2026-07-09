@@ -1,0 +1,15 @@
+doc_id: doc_20260412_003
+detected_at: '2026-06-29T22:25:39.503812+08:00'
+relations:
+- target_doc_id: doc_20260412_002
+  type: same_topic
+  confidence: 0.85
+  evidence: 两者均聚焦集团2026年智慧港口建设战略与实施路径，新文档侧重体制机制分析，现有文档侧重具体任务部署，核心主题高度一致。
+- target_doc_id: doc_20260406_007
+  type: same_topic
+  confidence: 0.8
+  evidence: 均围绕集团智慧港口中长期规划与数字化转型路径展开，涉及自动化码头、数据治理等共同建设领域。
+- target_doc_id: doc_20260405_004
+  type: same_topic
+  confidence: 0.75
+  evidence: 均探讨集团智慧港口升级版建设愿景与统筹推进策略，新文档从管理体制机制角度对现有文档的战略框架形成主题呼应。

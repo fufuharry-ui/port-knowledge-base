@@ -1,0 +1,15 @@
+doc_id: doc_20260406_009
+detected_at: '2026-06-29T22:20:20.235468+08:00'
+relations:
+- target_doc_id: doc_20260406_008
+  type: same_topic
+  confidence: 0.9
+  evidence: 两者均聚焦港口集团人工智能应用与数字化转型，新文档的数字员工平台方案是对现有文档中AI应用成果总结与下一步规划的具体技术承接。
+- target_doc_id: doc_20260405_004
+  type: same_topic
+  confidence: 0.85
+  evidence: 两者同属港口集团智慧化建设与数字化转型规划体系，新文档聚焦AI平台层建设，与现有文档的宏观战略升级目标高度一致。
+- target_doc_id: doc_20260412_002
+  type: same_topic
+  confidence: 0.85
+  evidence: 均围绕港口集团年度智慧化升级与数字化转型展开，新文档的AI平台建设契合现有文档的战略框架与重点任务方向。

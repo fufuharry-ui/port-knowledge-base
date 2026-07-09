@@ -20,6 +20,10 @@ frontend/.next/
 .worktrees/
 .cache/
 
+# ─── Test artifacts ───────────────────────────────────────
+frontend/test-results/
+.playwright-mcp/
+
 # ─── OS / editor ────────────────────────────────────────
 .DS_Store
 Thumbs.db

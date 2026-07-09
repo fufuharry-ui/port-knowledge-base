@@ -1,0 +1,35 @@
+doc_id: doc_20260412_002
+extracted_at: '2026-04-12T00:32:18.136489+08:00'
+ontology_nodes:
+- term: 智算中心
+  parent: 计算架构
+  definition: 面向AI算力需求构建的高性能计算集群，支撑港口大模型与智能体训练推理。
+  is_new_node: true
+- term: 工业互联网底座
+  parent: ICT数字底座
+  definition: 连接港口设备与业务系统的底层网络与平台架构，实现数据互通与协同控制。
+  is_new_node: true
+- term: 行业大模型
+  parent: 大语言模型
+  definition: 针对港航垂直领域训练的专业AI模型，用于业务决策、智能客服与流程优化。
+  is_new_node: true
+- term: 数字员工
+  parent: 智能体
+  definition: 基于AI技术构建的虚拟劳动力，可自主执行办公审批、数据分析等重复性任务。
+  is_new_node: true
+- term: 数据运营体系
+  parent: 数据治理
+  definition: 涵盖数据采集、资产化管理、价值挖掘与对外服务的全生命周期管理机制。
+  is_new_node: true
+- term: 网络安全防御体系
+  parent: 立体安全防护体系
+  definition: 覆盖网络边界、终端与数据的多层纵深防护架构，保障港口核心业务连续可控。
+  is_new_node: true
+- term: 航运服务智慧化
+  parent: 供应链物流智慧化
+  definition: 利用数字技术打通航运生产与交易环节，实现港航服务全链条协同与效率提升。
+  is_new_node: true
+- term: 数据智能驱动
+  parent: 港口数字化
+  definition: 以数据为核心要素替代传统经验，通过算法模型赋能管理决策与生产运营。
+  is_new_node: true

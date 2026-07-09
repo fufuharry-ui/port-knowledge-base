@@ -1,0 +1,35 @@
+doc_id: doc_20260406_008
+extracted_at: '2026-04-06T23:11:17.422543+08:00'
+ontology_nodes:
+- term: ART机器人
+  parent: 自动化装卸系统
+  definition: 应用于港口生产作业的自动化机器人设备，实现装卸流程自动化。
+  is_new_node: true
+- term: PortGPT-CV大模型
+  parent: PortGPT
+  definition: 面向港口安全管控的视觉大模型，用于现场违章行为智能识别。
+  is_new_node: true
+- term: 智能体平台
+  parent: 智能体
+  definition: 支撑港口各类AI智能体开发、部署与协同管理的底层软件平台。
+  is_new_node: true
+- term: 算力底座
+  parent: ICT数字底座
+  definition: 为港口AI模型训练与推理提供高性能计算资源的硬件基础设施。
+  is_new_node: true
+- term: 智能理货闸口
+  parent: 智能理货
+  definition: 集成AI识别技术的港口闸口系统，实现货物自动核验与高效放行。
+  is_new_node: true
+- term: JTOS智能算法
+  parent: JTOS
+  definition: 嵌入港口操作系统的核心调度算法，实现作业计划秒级生成与优化。
+  is_new_node: true
+- term: 专业知识库
+  parent: 知识图谱
+  definition: 汇聚港口业务规则与专家经验的数字化知识集合，支撑智能问答。
+  is_new_node: true
+- term: 违章智能识别
+  parent: 计算机视觉
+  definition: 基于视觉分析技术自动检测并标记港口作业违规行为的技术。
+  is_new_node: true

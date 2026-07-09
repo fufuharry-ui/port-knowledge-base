@@ -1,0 +1,27 @@
+doc_id: doc_20260412_003
+extracted_at: '2026-04-12T21:09:04.268822+08:00'
+ontology_nodes:
+- term: 智慧港口管理体制
+  parent: 智慧港口
+  definition: 统筹智慧港口规划、建设、运营与考核的组织架构与制度体系。
+  is_new_node: true
+- term: 业技融合
+  parent: 港口数字化
+  definition: 港口业务场景与信息技术深度结合，实现流程重构与效能提升的过程。
+  is_new_node: true
+- term: 大数据管理中心
+  parent: 数据治理
+  definition: 负责集团级数据资产统筹、标准制定与非经营性服务保障的核心机构。
+  is_new_node: true
+- term: 信创算力
+  parent: ICT数字底座
+  definition: 基于国产化技术栈构建的，支撑港口核心业务运行的计算资源与处理能力。
+  is_new_node: true
+- term: 非经营性统筹实体
+  parent: 智慧港口管理体制
+  definition: 以公共服务与战略保障为导向，弱化市场化盈利指标的资源调配与管理实体。
+  is_new_node: true
+- term: 安全合规
+  parent: 港口安全
+  definition: 满足国家数据安全法规与行业标准，保障港口信息系统合法稳健运行的要求。
+  is_new_node: true

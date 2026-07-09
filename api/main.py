@@ -25,6 +25,7 @@ from scripts.consistency import (
 app = FastAPI(title="Karpathy-Style LLM Wiki API", version="2.0.0")
 
 
+# ─── .env 加载(启动即读,避免 /health 在首次检索前读到空 env) ────────────────
 _JIEBA_READY = False
 try:
     _env_file = Path(__file__).resolve().parent.parent / ".env"
@@ -37,13 +38,15 @@ except Exception:
     pass
 
 
+# ─── jieba 预热 (Big-Loop #5, P-4) ───────────────────────────────────────────
 try:
-    import jieba
-    list(jieba.cut("warmup"))
+    import jieba  # noqa: F401
+    list(jieba.cut("智慧港口岸桥远控预热"))  # 触发词典加载
     _JIEBA_READY = True
 except Exception:
-    pass
+    pass  # jieba 不可用时 BM25 回退到空白分词,不影响启动
 
+# ─── CORS ─────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
@@ -52,6 +55,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ─── Paths ────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent.parent
 WIKI_DIR = BASE_DIR / "wiki"
 RAW_DIR = BASE_DIR / "raw"
@@ -60,6 +64,7 @@ META_DIR = BASE_DIR / "meta"
 ORIGINALS_DIR = BASE_DIR / "originals"
 ORIGINALS_DIR.mkdir(exist_ok=True)
 
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _load_index() -> dict:
     if INDEX_FILE.exists():
@@ -69,6 +74,7 @@ def _load_index() -> dict:
 
 
 def _enrich_doc_status(docs: list[dict]) -> list[dict]:
+    """用每篇 .meta.yaml 的权威 status 填充 index 条目(UX 修复)。"""
     for doc in docs:
         doc_id = doc.get("id")
         if not doc_id:
@@ -94,12 +100,13 @@ def ingest_and_compile_task(file_path: Path):
                 subprocess.run(["python", str(compile_script)], cwd=str(BASE_DIR))
             try:
                 from scripts.logger import global_logger
-                global_logger.log("api_ingest", file_path.stem, "Background task finished.")
+                global_logger.log("api_ingest", file_path.stem, "Background task finished successfully.")
             except ImportError:
                 pass
     except Exception as e:
         print(f"Background task failed: {e}")
 
+# ─── Pydantic Models ──────────────────────────────────────────────────────────
 
 class SearchQuery(BaseModel):
     query: str
@@ -109,25 +116,24 @@ class QAQuery(BaseModel):
     query: str
     history: list[dict] = []
 
+# ─── GET /api/v1/health ─────────────────────────────
 
 @app.get("/api/v1/health")
 async def health():
+    """运维健康检查。"""
     try:
         index = _load_index()
         doc_count = len(index.get("documents", []))
     except Exception:
         doc_count = 0
-
     llm_configured = bool(os.environ.get("OPENAI_API_KEY", "").strip())
     jieba_loaded = _JIEBA_READY
-
     ontology_loaded = False
     try:
         from scripts.search import GLOBAL_ONTOLOGY_FILE
         ontology_loaded = GLOBAL_ONTOLOGY_FILE.exists()
     except Exception:
         ontology_loaded = False
-
     return {
         "status": "ok",
         "doc_count": doc_count,
@@ -138,21 +144,22 @@ async def health():
     }
 
 
+# ─── GET /api/v1/wiki/index ───────────────────────────────────────────────────
+
 @app.get("/api/v1/wiki/index")
 async def wiki_index():
     index = _load_index()
     docs = _enrich_doc_status(index.get("documents", []))
     return {"total_docs": len(docs), "documents": docs}
 
+# ─── GET /api/v1/graph ───────────────────────────────────────────────────────
 
 @app.get("/api/v1/graph")
 async def graph_data():
     index = _load_index()
     docs = index.get("documents", [])
-
     nodes = [{"id": d["id"], "title": d.get("title", d["id"])} for d in docs]
     edges = []
-
     kg_file = META_DIR / "relations" / "knowledge_graph.yaml"
     if kg_file.exists():
         try:
@@ -170,7 +177,6 @@ async def graph_data():
                     })
         except Exception:
             pass
-
     seen = set()
     unique_edges = []
     for e in edges:
@@ -178,7 +184,6 @@ async def graph_data():
         if key not in seen:
             seen.add(key)
             unique_edges.append(e)
-
     return {"nodes": nodes, "edges": unique_edges}
 
 
@@ -207,7 +212,6 @@ async def entity_graph(term: str = "", depth: int = 1):
             edges = data.get("edges", [])
         except Exception:
             edges = []
-
     from scripts.ontology import get_entity_neighbors
     neighbors = get_entity_neighbors(term, edges, depth=depth) if term else []
     relevant = set(neighbors) | ({term} if term else set())
@@ -216,6 +220,7 @@ async def entity_graph(term: str = "", depth: int = 1):
     return {"term": term, "depth": depth, "neighbors": neighbors,
             "edges": related_edges, "total_edges": len(edges)}
 
+# ─── GET /api/v1/docs ────────────────────────────────────────────────────────
 
 @app.get("/api/v1/docs")
 async def list_docs():
@@ -223,6 +228,7 @@ async def list_docs():
     docs = index.get("documents", [])
     return {"documents": docs, "total": len(docs)}
 
+# ─── GET /api/v1/docs/{doc_id} ───────────────────────────────────────────────
 
 @app.get("/api/v1/docs/{doc_id}")
 async def get_doc(doc_id: str):
@@ -232,6 +238,8 @@ async def get_doc(doc_id: str):
             return doc
     raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found")
 
+
+# ─── 文档管理:删除 + 重编译(Loop #10)─────────────────────────────────────────
 
 @app.delete("/api/v1/docs/{doc_id}")
 async def delete_doc(doc_id: str):
@@ -261,33 +269,31 @@ async def recompile_doc_endpoint(doc_id: str, background_tasks: BackgroundTasks)
     background_tasks.add_task(_compile_task)
     return {"status": "recompiling", "doc_id": doc_id}
 
+# ─── POST /api/v1/upload ──────────────────────────────────
 
 @app.post("/api/v1/upload")
 async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     file_path = ORIGINALS_DIR / file.filename
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
-
     doc_id = generate_doc_id()
     background_tasks.add_task(ingest_and_compile_task, file_path)
-
     return {
         "status": "processing",
         "doc_id": doc_id,
         "filename": file.filename,
-        "message": "Ingested, compiling in background...",
+        "message": "摄入成功，后台自动编译中...",
     }
 
+# ─── POST /api/v1/ingest ─────────────────────────────────────────────────────
 
 @app.post("/api/v1/ingest")
 async def ingest_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     file_path = ORIGINALS_DIR / file.filename
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
-
     doc_id = generate_doc_id()
     background_tasks.add_task(ingest_and_compile_task, file_path)
-
     return {
         "status": "processing",
         "doc_id": doc_id,
@@ -295,6 +301,7 @@ async def ingest_document(background_tasks: BackgroundTasks, file: UploadFile = 
         "message": "File uploaded and background processing started.",
     }
 
+# ─── POST /api/v1/search (sync JSON) ─────────────────────────────────────────
 
 @app.post("/api/v1/search")
 async def search_endpoint(request: SearchQuery):
@@ -308,8 +315,9 @@ async def search_endpoint(request: SearchQuery):
         sources = [{"doc_id": sid, "title": id_to_title.get(sid)} for sid in source_ids]
         return {"answer": answer, "sources": sources}
     except Exception as e:
-        return {"answer": f"Search unavailable: {e}", "sources": []}
+        return {"answer": f"⚠️ 搜索服务暂时不可用: {e}", "sources": []}
 
+# ─── GET /api/v1/search/stream (SSE) ─────────────────────────────────────────
 
 @app.get("/api/v1/search/stream")
 async def search_stream(q: str):
@@ -318,28 +326,24 @@ async def search_stream(q: str):
             client = get_llm_client()
             index = _load_index()
             ontology = _load_ontology()
-
-            yield {"data": json.dumps({"type": "thought", "step": 1, "message": f"Filtering candidates..."})}
+            yield {"data": json.dumps({"type": "thought", "step": 1, "message": f"🔍 初筛候选文档(BM25+本体扩展)..."})}
             candidates = layer1_filter(q, index, top_k=20, ontology=ontology)
             if not candidates:
-                yield {"data": json.dumps({"delta": "No relevant documents found."})}
+                yield {"data": json.dumps({"delta": "⚠️ 未找到相关文档，请调整检索词。"})}
                 yield {"data": "[DONE]"}
                 return
-
-            yield {"data": json.dumps({"type": "thought", "step": 2, "message": f"LLM scoring ({len(candidates)} candidates)..."})}
+            yield {"data": json.dumps({"type": "thought", "step": 2, "message": f"🧠 LLM 精选 Top-5(共{len(candidates)}篇候选)..."})}
             try:
                 top_docs = layer2_score(q, candidates, client, os.environ.get("SEARCH_MODEL", "gpt-4o"), top_k=5)
             except Exception:
                 top_docs = candidates[:3]
-
             id_to_title = {d["id"]: d.get("title", d["id"]) for d in candidates}
             source_ids = [d["id"] for d in top_docs]
-            sources_line = "Sources: " + " | ".join(
+            sources_line = "📎 **来源：** " + " | ".join(
                 f"`{sid}` {id_to_title.get(sid, '')}" for sid in source_ids
             )
             yield {"data": json.dumps({"delta": sources_line + "\n\n"})}
-
-            yield {"data": json.dumps({"type": "thought", "step": 3, "message": "Generating answer..."})}
+            yield {"data": json.dumps({"type": "thought", "step": 3, "message": "✍️ 生成精确回答并注入原文引用..."})}
             try:
                 contradictions = load_contradictions().get("contradictions", [])
                 model = os.environ.get("SEARCH_MODEL", "gpt-4o")
@@ -348,15 +352,14 @@ async def search_stream(q: str):
                 ):
                     yield {"data": json.dumps({"delta": token})}
             except Exception as e:
-                yield {"data": json.dumps({"delta": f"\n\nError generating answer: {e}"})}
-
+                yield {"data": json.dumps({"delta": f"\n\n⚠️ 生成回答时出错: {e}"})}
             yield {"data": "[DONE]"}
         except Exception as e:
-            yield {"data": json.dumps({"delta": f"Search failed: {e}"})}
+            yield {"data": json.dumps({"delta": f"⚠️ 检索失败: {e}"})}
             yield {"data": "[DONE]"}
-
     return EventSourceResponse(generate())
 
+# ─── POST /api/v1/qa (SSE Q&A with thought trace) ────────────────────────────
 
 @app.post("/api/v1/qa")
 async def qa_stream(request: QAQuery):
@@ -365,7 +368,6 @@ async def qa_stream(request: QAQuery):
             client = get_llm_client()
             index = _load_index()
             model = os.environ.get("SEARCH_MODEL", "gpt-4o")
-
             ontology = _load_ontology()
             expansion_terms = []
             if ontology:
@@ -375,25 +377,20 @@ async def qa_stream(request: QAQuery):
                     )
                 except Exception:
                     expansion_terms = []
-
-            yield {"data": json.dumps({"type": "thought", "step": 1, "message": "BM25 filtering..."})}
+            yield {"data": json.dumps({"type": "thought", "step": 1, "message": "🔍 BM25 关键词初筛中..."})}
             candidates = layer1_filter(request.query, index, top_k=20, ontology=ontology)
-
             if expansion_terms:
                 shown = ", ".join(expansion_terms[:8])
-                yield {"data": json.dumps({"type": "thought", "step": 1, "message": f"Ontology expansion: {shown}"})}
-
+                yield {"data": json.dumps({"type": "thought", "step": 1, "message": f"🧭 本体扩展词: {shown}"})}
             if not candidates:
-                yield {"data": json.dumps({"type": "delta", "text": "No relevant documents found."})}
+                yield {"data": json.dumps({"type": "delta", "text": "⚠️ 未找到相关文档，请调整提问关键词。"})}
                 yield {"data": json.dumps({"type": "done"})}
                 return
-
-            yield {"data": json.dumps({"type": "thought", "step": 2, "message": f"LLM scoring ({len(candidates)} -> Top-5)..."})}
+            yield {"data": json.dumps({"type": "thought", "step": 2, "message": f"🧠 LLM 精选候选文档 ({len(candidates)} → Top-5)..."})}
             try:
                 top_docs = layer2_score(request.query, candidates, client, model, top_k=5)
             except Exception:
                 top_docs = candidates[:3]
-
             source_ids = [d["id"] for d in top_docs]
             id_to_title = {d["id"]: d.get("title", d["id"]) for d in top_docs}
             citations = [
@@ -401,11 +398,8 @@ async def qa_stream(request: QAQuery):
                 for i, sid in enumerate(source_ids)
             ]
             yield {"data": json.dumps({"type": "source", "citations": citations})}
-
             yield {"data": json.dumps({"type": "entity", "ids": source_ids})}
-
-            yield {"data": json.dumps({"type": "thought", "step": 3, "message": "Generating answer..."})}
-
+            yield {"data": json.dumps({"type": "thought", "step": 3, "message": "✍️ 生成精确回答并注入原文引用..."})}
             try:
                 contradictions = load_contradictions().get("contradictions", [])
                 for token in layer3_answer_stream(
@@ -415,32 +409,27 @@ async def qa_stream(request: QAQuery):
                     if token:
                         yield {"data": json.dumps({"type": "delta", "text": token})}
             except Exception as e:
-                yield {"data": json.dumps({"type": "delta", "text": f"\n\nAnswer generation failed: {e}"})}
-
+                yield {"data": json.dumps({"type": "delta", "text": f"\n\n⚠️ 生成回答失败: {e}"})}
             yield {"data": json.dumps({"type": "done"})}
-
         except Exception as e:
-            yield {"data": json.dumps({"type": "delta", "text": f"Service error: {e}"})}
+            yield {"data": json.dumps({"type": "delta", "text": f"⚠️ 服务异常: {e}"})}
             yield {"data": json.dumps({"type": "done"})}
-
     return EventSourceResponse(generate())
 
+# ─── POST /api/v1/lint ────────────────────────────────────────────────────────
 
 @app.post("/api/v1/lint")
 async def lint_endpoint():
     linter = Linter()
     orphans = linter.detect_orphan_pages()
     missing_concepts = linter.detect_missing_concepts()
-
     try:
         client = get_llm_client()
         search_model = os.environ.get("SEARCH_MODEL", "gpt-4o")
         contradictions = linter.detect_contradictions(client, search_model)
     except Exception:
         contradictions = []
-
     linter.run_lint()
-
     return {
         "status": "success",
         "report": {
@@ -450,6 +439,8 @@ async def lint_endpoint():
         },
     }
 
+
+# ─── GET/POST /api/v1/consistency ─────────────────────────────────────────────
 
 @app.get("/api/v1/consistency")
 async def consistency_get():
@@ -470,7 +461,7 @@ async def consistency_run():
         model = os.environ.get("RELATE_MODEL", os.environ.get("SEARCH_MODEL", "gpt-4o"))
         report = run_consistency_check(client, model)
     except Exception as e:
-        return {"status": "error", "message": f"Audit failed: {e}", "total": 0,
+        return {"status": "error", "message": f"稽核失败: {e}", "total": 0,
                 "contradictions": []}
     return {
         "status": "success",

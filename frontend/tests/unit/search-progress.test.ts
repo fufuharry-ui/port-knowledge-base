@@ -22,6 +22,7 @@ beforeEach(() => {
     mockFetch.mockReset();
 });
 
+/** 构造一个伪 SSE 响应流,按 chunks 发送给定行 */
 function mockSSEResponse(lines: string[]) {
     const encoder = new TextEncoder();
     const chunks = lines.map(l => encoder.encode(`data: ${l}\n\n`));
@@ -44,11 +45,11 @@ function mockSSEResponse(lines: string[]) {
 }
 
 describe('sse thought event parsing', () => {
-    test('onThought callback triggered by thought events', async () => {
+    test('onThought 回调被 thought 事件触发(进度反馈)', async () => {
         mockFetch.mockResolvedValueOnce(mockSSEResponse([
-            JSON.stringify({ type: 'thought', step: 1, message: 'Layer 1 BM25...' }),
-            JSON.stringify({ type: 'thought', step: 2, message: 'Layer 2 LLM...' }),
-            JSON.stringify({ delta: 'Answer content' }),
+            JSON.stringify({ type: 'thought', step: 1, message: '🔍 初筛候选文档...' }),
+            JSON.stringify({ type: 'thought', step: 2, message: '🧠 LLM 精选 Top-5...' }),
+            JSON.stringify({ delta: '答案内容' }),
             '[DONE]',
         ]));
 
@@ -66,13 +67,14 @@ describe('sse thought event parsing', () => {
 
         expect(thoughts).toHaveLength(2);
         expect(thoughts[0].step).toBe(1);
+        expect(thoughts[0].message).toContain('初筛');
         expect(thoughts[1].step).toBe(2);
-        expect(deltas).toEqual(['Answer content']);
+        expect(deltas).toEqual(['答案内容']);
     });
 
-    test('no onThought call when no thought events', async () => {
+    test('无 thought 事件时不调 onThought(向后兼容)', async () => {
         mockFetch.mockResolvedValueOnce(mockSSEResponse([
-            JSON.stringify({ delta: 'Answer' }),
+            JSON.stringify({ delta: '答案' }),
             '[DONE]',
         ]));
 

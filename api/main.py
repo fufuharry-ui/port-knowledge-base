@@ -26,6 +26,8 @@ app = FastAPI(title="Karpathy-Style LLM Wiki API", version="2.0.0")
 
 
 # ─── .env 加载(启动即读,避免 /health 在首次检索前读到空 env) ────────────────
+# 复用 scripts 的 os.environ.setdefault 语义:真实 env 优先,.env 不覆盖已设值。
+# 用直接路径,不依赖下方 BASE_DIR(其定义在本块之后,此时尚未赋值)。
 _JIEBA_READY = False
 try:
     _env_file = Path(__file__).resolve().parent.parent / ".env"
@@ -39,6 +41,7 @@ except Exception:
 
 
 # ─── jieba 预热 (Big-Loop #5, P-4) ───────────────────────────────────────────
+# 进程启动即加载分词词典,消除首次检索的冷启动延迟(~1s)。
 try:
     import jieba  # noqa: F401
     list(jieba.cut("智慧港口岸桥远控预热"))  # 触发词典加载
@@ -74,7 +77,13 @@ def _load_index() -> dict:
 
 
 def _enrich_doc_status(docs: list[dict]) -> list[dict]:
-    """用每篇 .meta.yaml 的权威 status 填充 index 条目(UX 修复)。"""
+    """用每篇 .meta.yaml 的权威 status 填充 index 条目(UX 修复)。
+
+    背景:compile.py 只更新 raw/{doc_id}.meta.yaml 的 status(raw→compiled),
+    但 wiki/index.yaml 条目的 status 字段不同步(常滞留 None)。仪表盘据此
+    统计"已编译"数,会误显示 0。这里在 /wiki/index 返回时即时用 .meta.yaml
+    的权威值覆盖,不改 compile.py 核心,也不写回 index.yaml(只读合并)。
+    """
     for doc in docs:
         doc_id = doc.get("id")
         if not doc_id:
@@ -87,7 +96,7 @@ def _enrich_doc_status(docs: list[dict]) -> list[dict]:
                 if meta.get("status"):
                     doc["status"] = meta["status"]
         except Exception:
-            pass
+            pass  # 单篇 meta 读取失败不影响整体
     return docs
 
 
@@ -114,26 +123,39 @@ class SearchQuery(BaseModel):
 
 class QAQuery(BaseModel):
     query: str
+    # Big-Loop #8: 多轮对话历史。每条 {role:'user'|'assistant', content:str}。
+    # 后端注入 Layer3 prompt,让 LLM 解析追问代词。默认空 → 单轮(向后兼容)。
     history: list[dict] = []
 
-# ─── GET /api/v1/health ─────────────────────────────
+# ─── GET /api/v1/health (落地增强:部署健康检查) ─────────────────────────────
 
 @app.get("/api/v1/health")
 async def health():
-    """运维健康检查。"""
+    """运维健康检查。返回服务状态 + 关键依赖可用性(部署监控用)。
+
+    设计:只读、快速、不调 LLM、不抛异常(即使部分依赖缺失也返回 200 + 如实字段)。
+    """
+    # 文档数
     try:
         index = _load_index()
         doc_count = len(index.get("documents", []))
     except Exception:
         doc_count = 0
+
+    # LLM 是否配置(不检查有效性,只看 Key 是否存在)
     llm_configured = bool(os.environ.get("OPENAI_API_KEY", "").strip())
+
+    # jieba 是否就绪(用预热时设的标志,比探测内部属性可靠)
     jieba_loaded = _JIEBA_READY
+
+    # 本体是否加载
     ontology_loaded = False
     try:
         from scripts.search import GLOBAL_ONTOLOGY_FILE
         ontology_loaded = GLOBAL_ONTOLOGY_FILE.exists()
     except Exception:
         ontology_loaded = False
+
     return {
         "status": "ok",
         "doc_count": doc_count,
@@ -148,6 +170,11 @@ async def health():
 
 @app.get("/api/v1/wiki/index")
 async def wiki_index():
+    """Return the full wiki index as JSON.
+
+    UX 修复:用 .meta.yaml 的权威 status 即时填充(见 _enrich_doc_status),
+    否则仪表盘"已编译"统计恒为 0。
+    """
     index = _load_index()
     docs = _enrich_doc_status(index.get("documents", []))
     return {"total_docs": len(docs), "documents": docs}
@@ -156,10 +183,19 @@ async def wiki_index():
 
 @app.get("/api/v1/graph")
 async def graph_data():
+    """Build nodes and edges from index and the knowledge graph.
+
+    Big-Loop #1 修正:旧实现读 per-doc 文件取 rel.get('source')/'target'),
+    但 per-doc 关系实际字段是 target_doc_id 且无 source;又读 KG 的 relations
+    键,但 KG 实际键是 edges → 实际返回 0 条边,前端图谱无连线。改为以
+    knowledge_graph.yaml(权威汇总)的 edges 为准。
+    """
     index = _load_index()
     docs = index.get("documents", [])
+
     nodes = [{"id": d["id"], "title": d.get("title", d["id"])} for d in docs]
     edges = []
+
     kg_file = META_DIR / "relations" / "knowledge_graph.yaml"
     if kg_file.exists():
         try:
@@ -177,6 +213,8 @@ async def graph_data():
                     })
         except Exception:
             pass
+
+    # Deduplicate edges
     seen = set()
     unique_edges = []
     for e in edges:
@@ -184,11 +222,13 @@ async def graph_data():
         if key not in seen:
             seen.add(key)
             unique_edges.append(e)
+
     return {"nodes": nodes, "edges": unique_edges}
 
 
 @app.get("/api/v1/ontology")
 async def ontology_data():
+    """Return the global ontology tree (供前端本体视图;Big-Loop #1 新增)。"""
     ont_file = META_DIR / "ontology" / "global_ontology.yaml"
     if not ont_file.exists():
         return {"ontology_tree": [], "total_nodes": 0, "last_updated": None}
@@ -203,6 +243,10 @@ async def ontology_data():
 
 @app.get("/api/v1/entity-graph")
 async def entity_graph(term: str = "", depth: int = 1):
+    """返回某术语的实体级邻居(Big-Loop #2 新增,供前端实体图谱查询)。
+
+    ?term=5G专网&depth=2 → 返回该术语在 entity_relations.yaml 中的多跳邻居 + 相关边。
+    """
     ent_file = META_DIR / "ontology" / "entity_relations.yaml"
     edges = []
     if ent_file.exists():
@@ -212,8 +256,10 @@ async def entity_graph(term: str = "", depth: int = 1):
             edges = data.get("edges", [])
         except Exception:
             edges = []
+
     from scripts.ontology import get_entity_neighbors
     neighbors = get_entity_neighbors(term, edges, depth=depth) if term else []
+    # 只返回与该 term 相关的边(邻居 + 自身)
     relevant = set(neighbors) | ({term} if term else set())
     related_edges = [e for e in edges
                      if e.get("source") in relevant or e.get("target") in relevant]
@@ -243,6 +289,10 @@ async def get_doc(doc_id: str):
 
 @app.delete("/api/v1/docs/{doc_id}")
 async def delete_doc(doc_id: str):
+    """删除文档 + 全部产物 + 清理 index/KG/entity_relations 引用。
+
+    此前知识库只能追加无法维护——上传错文档/编译失败时无法清理。
+    """
     from scripts.doc_admin import remove_doc
     summary = remove_doc(doc_id)
     if not summary.get("removed"):
@@ -252,10 +302,12 @@ async def delete_doc(doc_id: str):
 
 @app.post("/api/v1/docs/{doc_id}/recompile")
 async def recompile_doc_endpoint(doc_id: str, background_tasks: BackgroundTasks):
+    """重置文档状态为 raw 并触发重编译(error 文档重试用)。"""
     from scripts.doc_admin import recompile_doc
     result = recompile_doc(doc_id)
     if not result.get("reset"):
         raise HTTPException(status_code=404, detail=f"Document '{doc_id}' meta not found")
+    # 后台触发编译(复用 compile.compile_doc)
     def _compile_task():
         try:
             import scripts.compile as cmod
@@ -269,15 +321,18 @@ async def recompile_doc_endpoint(doc_id: str, background_tasks: BackgroundTasks)
     background_tasks.add_task(_compile_task)
     return {"status": "recompiling", "doc_id": doc_id}
 
-# ─── POST /api/v1/upload ──────────────────────────────────
+# ─── POST /api/v1/upload (alias for ingest) ──────────────────────────────────
 
 @app.post("/api/v1/upload")
 async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    """Frontend-compatible upload endpoint (alias for ingest with BackgroundTask)."""
     file_path = ORIGINALS_DIR / file.filename
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
+
     doc_id = generate_doc_id()
     background_tasks.add_task(ingest_and_compile_task, file_path)
+
     return {
         "status": "processing",
         "doc_id": doc_id,
@@ -292,8 +347,10 @@ async def ingest_document(background_tasks: BackgroundTasks, file: UploadFile = 
     file_path = ORIGINALS_DIR / file.filename
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
+
     doc_id = generate_doc_id()
     background_tasks.add_task(ingest_and_compile_task, file_path)
+
     return {
         "status": "processing",
         "doc_id": doc_id,
@@ -308,6 +365,7 @@ async def search_endpoint(request: SearchQuery):
     try:
         client = get_llm_client()
         answer = search(request.query, client, verbose=False)
+        # Extract source doc_ids from answer text
         import re
         source_ids = list({m for m in re.findall(r'\[?(doc_\w+)\]?', answer)})
         index = _load_index()
@@ -321,30 +379,42 @@ async def search_endpoint(request: SearchQuery):
 
 @app.get("/api/v1/search/stream")
 async def search_stream(q: str):
+    """SSE streaming search endpoint used by the Search page."""
     async def generate():
         try:
             client = get_llm_client()
             index = _load_index()
+            # Big-Loop #1: 本体查询扩展(缺失则降级纯 BM25)
             ontology = _load_ontology()
+
+            # 落地增强:分步 thought 事件,让用户看到检索进度(消除 14-21s 干等焦虑)
             yield {"data": json.dumps({"type": "thought", "step": 1, "message": f"🔍 初筛候选文档(BM25+本体扩展)..."})}
+            # Layer 1
             candidates = layer1_filter(q, index, top_k=20, ontology=ontology)
             if not candidates:
                 yield {"data": json.dumps({"delta": "⚠️ 未找到相关文档，请调整检索词。"})}
                 yield {"data": "[DONE]"}
                 return
+
             yield {"data": json.dumps({"type": "thought", "step": 2, "message": f"🧠 LLM 精选 Top-5(共{len(candidates)}篇候选)..."})}
+            # Layer 2
             try:
                 top_docs = layer2_score(q, candidates, client, os.environ.get("SEARCH_MODEL", "gpt-4o"), top_k=5)
             except Exception:
                 top_docs = candidates[:3]
+
+            # Emit sources as delta header
             id_to_title = {d["id"]: d.get("title", d["id"]) for d in candidates}
             source_ids = [d["id"] for d in top_docs]
             sources_line = "📎 **来源：** " + " | ".join(
                 f"`{sid}` {id_to_title.get(sid, '')}" for sid in source_ids
             )
             yield {"data": json.dumps({"delta": sources_line + "\n\n"})}
+
+            # Layer 3 - 真流式(Big-Loop #5:layer3_answer_stream 逐 token)
             yield {"data": json.dumps({"type": "thought", "step": 3, "message": "✍️ 生成精确回答并注入原文引用..."})}
             try:
+                # Big-Loop #3: 加载已知矛盾,Top 文档间有矛盾 → 回答附 ⚠️ 提示
                 contradictions = load_contradictions().get("contradictions", [])
                 model = os.environ.get("SEARCH_MODEL", "gpt-4o")
                 for token in layer3_answer_stream(
@@ -353,21 +423,28 @@ async def search_stream(q: str):
                     yield {"data": json.dumps({"delta": token})}
             except Exception as e:
                 yield {"data": json.dumps({"delta": f"\n\n⚠️ 生成回答时出错: {e}"})}
+
             yield {"data": "[DONE]"}
         except Exception as e:
             yield {"data": json.dumps({"delta": f"⚠️ 检索失败: {e}"})}
             yield {"data": "[DONE]"}
+
     return EventSourceResponse(generate())
 
 # ─── POST /api/v1/qa (SSE Q&A with thought trace) ────────────────────────────
 
 @app.post("/api/v1/qa")
 async def qa_stream(request: QAQuery):
+    """SSE streaming Q&A used by the ChatPanel on /qa page.
+    Emits: thought, source, entity, delta, done events.
+    """
     async def generate():
         try:
             client = get_llm_client()
             index = _load_index()
             model = os.environ.get("SEARCH_MODEL", "gpt-4o")
+
+            # Big-Loop #1: 本体查询扩展(缺失则降级纯 BM25)
             ontology = _load_ontology()
             expansion_terms = []
             if ontology:
@@ -377,20 +454,29 @@ async def qa_stream(request: QAQuery):
                     )
                 except Exception:
                     expansion_terms = []
+
+            # Step 1: Thought - BM25 filter
             yield {"data": json.dumps({"type": "thought", "step": 1, "message": "🔍 BM25 关键词初筛中..."})}
             candidates = layer1_filter(request.query, index, top_k=20, ontology=ontology)
+
+            # Step 1.5: 本体扩展的可 thought(若有扩展词,显式告知用户)
             if expansion_terms:
                 shown = ", ".join(expansion_terms[:8])
                 yield {"data": json.dumps({"type": "thought", "step": 1, "message": f"🧭 本体扩展词: {shown}"})}
+
             if not candidates:
                 yield {"data": json.dumps({"type": "delta", "text": "⚠️ 未找到相关文档，请调整提问关键词。"})}
                 yield {"data": json.dumps({"type": "done"})}
                 return
+
+            # Step 2: Thought - LLM scoring
             yield {"data": json.dumps({"type": "thought", "step": 2, "message": f"🧠 LLM 精选候选文档 ({len(candidates)} → Top-5)..."})}
             try:
                 top_docs = layer2_score(request.query, candidates, client, model, top_k=5)
             except Exception:
                 top_docs = candidates[:3]
+
+            # Step 3: Emit sources
             source_ids = [d["id"] for d in top_docs]
             id_to_title = {d["id"]: d.get("title", d["id"]) for d in top_docs}
             citations = [
@@ -398,9 +484,16 @@ async def qa_stream(request: QAQuery):
                 for i, sid in enumerate(source_ids)
             ]
             yield {"data": json.dumps({"type": "source", "citations": citations})}
+
+            # Step 4: Emit entity highlights
             yield {"data": json.dumps({"type": "entity", "ids": source_ids})}
+
+            # Step 5: Thought - generating answer
             yield {"data": json.dumps({"type": "thought", "step": 3, "message": "✍️ 生成精确回答并注入原文引用..."})}
+
+            # Step 6: Stream answer (Big-Loop #5: 真流式透传 token,首 token 立即可见)
             try:
+                # Big-Loop #3: 加载已知矛盾,Top 文档间有矛盾 → 回答附 ⚠️ 提示
                 contradictions = load_contradictions().get("contradictions", [])
                 for token in layer3_answer_stream(
                     request.query, top_docs, client, model, index,
@@ -410,10 +503,13 @@ async def qa_stream(request: QAQuery):
                         yield {"data": json.dumps({"type": "delta", "text": token})}
             except Exception as e:
                 yield {"data": json.dumps({"type": "delta", "text": f"\n\n⚠️ 生成回答失败: {e}"})}
+
             yield {"data": json.dumps({"type": "done"})}
+
         except Exception as e:
             yield {"data": json.dumps({"type": "delta", "text": f"⚠️ 服务异常: {e}"})}
             yield {"data": json.dumps({"type": "done"})}
+
     return EventSourceResponse(generate())
 
 # ─── POST /api/v1/lint ────────────────────────────────────────────────────────
@@ -423,13 +519,16 @@ async def lint_endpoint():
     linter = Linter()
     orphans = linter.detect_orphan_pages()
     missing_concepts = linter.detect_missing_concepts()
+
     try:
         client = get_llm_client()
         search_model = os.environ.get("SEARCH_MODEL", "gpt-4o")
         contradictions = linter.detect_contradictions(client, search_model)
     except Exception:
         contradictions = []
+
     linter.run_lint()
+
     return {
         "status": "success",
         "report": {
@@ -440,10 +539,11 @@ async def lint_endpoint():
     }
 
 
-# ─── GET/POST /api/v1/consistency ─────────────────────────────────────────────
+# ─── GET/POST /api/v1/consistency (Big-Loop #3: 跨文档一致性稽核) ─────────────
 
 @app.get("/api/v1/consistency")
 async def consistency_get():
+    """查看已知矛盾报告(不触发 LLM,只读 contradictions.yaml)。"""
     report = load_contradictions()
     return {
         "status": "success",
@@ -456,6 +556,10 @@ async def consistency_get():
 
 @app.post("/api/v1/consistency")
 async def consistency_run():
+    """触发全库一致性稽核:生成候选对 → LLM 逐对判定 → 写 contradictions.yaml。
+
+    返回报告摘要。LLM 不可用/无候选 → 返回空报告(降级,不报错)。
+    """
     try:
         client = get_llm_client()
         model = os.environ.get("RELATE_MODEL", os.environ.get("SEARCH_MODEL", "gpt-4o"))

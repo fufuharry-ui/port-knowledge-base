@@ -4,7 +4,7 @@ relations:
 - target_doc_id: doc_20260406_009
   type: supplements
   confidence: 0.88
-  evidence: 新文档明确提出"夯实算力底座、建设智能体平台"作为AI创新核心基础设施，与现有文档详细规划的算力底座构建、多模态大模型纳管及智能体全生命周期平台技术方案高度对应，现有文档为新文档的底层技术架构提供了具体实现路径的补充。
+  evidence: 新文档明确提出“夯实算力底座、建设智能体平台”作为AI创新核心基础设施，与现有文档详细规划的算力底座构建、多模态大模型纳管及智能体全生命周期平台技术方案高度对应，现有文档为新文档的底层技术架构提供了具体实现路径的补充。
 - target_doc_id: doc_20260405_004
   type: same_topic
   confidence: 0.85
@@ -12,7 +12,7 @@ relations:
 - target_doc_id: doc_20260406_007
   type: same_topic
   confidence: 0.82
-  evidence: 新文档的AI应用总结与下一步"AI+"融合规划，与现有"十五五"智慧港口规划中数字化转型与数据治理的战略路径高度一致，共同服务于集团智慧港口中长期发展目标。
+  evidence: 新文档的AI应用总结与下一步“AI+”融合规划，与现有“十五五”智慧港口规划中数字化转型与数据治理的战略路径高度一致，共同服务于集团智慧港口中长期发展目标。
 - target_doc_id: doc_20260412_002
   type: same_topic
   confidence: 0.78

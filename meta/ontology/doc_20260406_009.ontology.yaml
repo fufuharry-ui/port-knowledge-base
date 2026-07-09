@@ -49,5 +49,5 @@ ontology_nodes:
 - term: 人机协同生态
   parent: 港口新质生产力
   grandparent: null
-  definition: 以"一岗一助手"为核心，实现港口员工与数字智能体高效协作的业务新模式。
+  definition: 以“一岗一助手”为核心，实现港口员工与数字智能体高效协作的业务新模式。
   is_new_node: true

@@ -107,7 +107,7 @@ def find_contradiction_candidates(
     return result
 
 
-# ── LLM 判定的常量和工具函数 ─────────────────────────────────────
+# ── LLM 判定(下面是 C-2 的实现,需 mock client) ─────────────────────
 
 CONTRADICTION_SYSTEM = """你是知识库一致性稽核员。给定两份文档的摘要与原文片段,
 判断二者是否对【同一事实/指标/论断】给出冲突结论。
@@ -127,26 +127,46 @@ CONTRADICTION_SYSTEM = """你是知识库一致性稽核员。给定两份文档
 只输出 JSON,不要其他文字。"""
 
 
-def detect_contradiction(doc_a_id, doc_b_id, client, model, *, index=None, raw_dir=None):
-    """LLM 判定两文档是否矛盾(单对)。"""
+def detect_contradiction(
+    doc_a_id: str,
+    doc_b_id: str,
+    client,
+    model: str,
+    *,
+    index: dict | None = None,
+    raw_dir: Path | None = None,
+) -> dict | None:
+    """LLM 判定两文档是否矛盾。
+
+    读取两文档的 abstract_short(优先) + 原文片段(截断),送 LLM 判定。
+    返回 dict(has_conflict/conflict_point/reasoning_chain/confidence),
+    或 None(任一文档缺失 / LLM 不可用)。
+    """
     idx = index if index is not None else _load_index()
     rdir = raw_dir if raw_dir is not None else RAW_DIR
+
     docs_by_id = {d.get("id"): d for d in idx.get("documents", [])}
     da = docs_by_id.get(doc_a_id)
     db = docs_by_id.get(doc_b_id)
     if not da or not db:
         return None
+
     text_a = _doc_evidence(da, rdir)
     text_b = _doc_evidence(db, rdir)
     if not text_a or not text_b:
         return None
+
     if client is None:
         return None
+
     prompt = (
-        f"【文档A】{da.get('title', doc_a_id)} (id={doc_a_id})\n{text_a}\n\n"
-        f"【文档B】{db.get('title', doc_b_id)} (id={doc_b_id})\n{text_b}\n\n"
+        f"【文档A】{da.get('title', doc_a_id)} (id={doc_a_id})\n"
+        f"{text_a}\n\n"
+        f"【文档B】{db.get('title', doc_b_id)} (id={doc_b_id})\n"
+        f"{text_b}\n\n"
         f"请按系统指令判定两文档是否存在事实性冲突。"
     )
+
     try:
         resp = client.chat.completions.create(
             model=model,
@@ -160,10 +180,11 @@ def detect_contradiction(doc_a_id, doc_b_id, client, model, *, index=None, raw_d
         content = resp.choices[0].message.content
     except Exception:
         return None
+
     return _parse_contradiction_json(content)
 
 
-# ─── 批量化稽核(Loop #9) ─────────────────────────────────────────
+# ─── 批量化稽核(Loop #9,解决规模化瓶颈)──────────────────────────────────────
 
 BATCH_CONTRADICTION_SYSTEM = """你是知识库一致性稽核员。给定若干文档对的摘要与原文片段,
 逐对判断每对是否对【同一事实/指标/论断】给出冲突结论。
@@ -183,7 +204,15 @@ BATCH_CONTRADICTION_SYSTEM = """你是知识库一致性稽核员。给定若干
 只输出 JSON。"""
 
 
-def detect_contradictions_batch(pairs, client, model, *, index=None, raw_dir=None, batch_size=5):
+def detect_contradictions_batch(
+    pairs: list[tuple[str, str]],
+    client,
+    model: str,
+    *,
+    index: dict | None = None,
+    raw_dir: Path | None = None,
+    batch_size: int = 5,
+) -> list[dict | None]:
     """批量矛盾判定:多对一次 LLM 调用,把 N 次降到 ceil(N/batch_size) 次。
 
     解决规模化瓶颈:100 文档 ~222 对,单对串行 ~14 分钟;batch=10 → ~22 调用 ~2 分钟。
@@ -193,18 +222,21 @@ def detect_contradictions_batch(pairs, client, model, *, index=None, raw_dir=Non
         return []
     if client is None:
         return [None] * len(pairs)
+
     idx = index if index is not None else _load_index()
     rdir = raw_dir if raw_dir is not None else RAW_DIR
     docs_by_id = {d.get("id"): d for d in idx.get("documents", [])}
-    results_out = [None] * len(pairs)
+
+    results_out: list[dict | None] = [None] * len(pairs)
+
     for start in range(0, len(pairs), batch_size):
         batch = pairs[start:start + batch_size]
-        prompt_parts = []
+        prompt_parts = []  # (batch内序号, doc_a, doc_b)
         for i, (a, b) in enumerate(batch):
             da = docs_by_id.get(a)
             db = docs_by_id.get(b)
             if not da or not db:
-                results_out[start + i] = None
+                results_out[start + i] = None  # 证据缺失
                 continue
             prompt_parts.append((
                 i, a, b,
@@ -214,6 +246,7 @@ def detect_contradictions_batch(pairs, client, model, *, index=None, raw_dir=Non
             ))
         if not prompt_parts:
             continue
+
         prompt = "请逐对判定以下文档对是否存在事实性冲突:\n\n" + \
                  "\n\n".join(p[3] for p in prompt_parts)
         try:
@@ -225,12 +258,14 @@ def detect_contradictions_batch(pairs, client, model, *, index=None, raw_dir=Non
                 ],
                 temperature=0.0,
                 response_format={"type": "json_object"},
-                extra_body={"enable_thinking": False},
+                extra_body={"enable_thinking": False},  # 批量判定,关思考加速(Loop #5 同理)
             )
             content = resp.choices[0].message.content
         except Exception:
             content = None
+
         batch_results = _parse_batch_json(content) if content else None
+        # 按 (doc_a, doc_b) 建索引,映射回各对
         verdict_map = {}
         if batch_results:
             for r in batch_results:
@@ -247,10 +282,15 @@ def detect_contradictions_batch(pairs, client, model, *, index=None, raw_dir=Non
                     "reasoning_chain": str(r.get("reasoning_chain", "")).strip(),
                     "confidence": float(r.get("confidence", 0.0) or 0.0),
                 }
+            # 批次坏 JSON 或缺映射 → None(降级)
+
     return results_out
 
 
-def _parse_batch_json(content):
+def _parse_batch_json(content: str) -> list[dict] | None:
+    """解析批量 LLM 返回({"results": [...]})。"""
+    if not content:
+        return None
     import re
     import json as _json
     txt = content.strip()
@@ -272,7 +312,9 @@ def _parse_batch_json(content):
     return None
 
 
-def _doc_evidence(doc, raw_dir):
+
+def _doc_evidence(doc: dict, raw_dir: Path) -> str:
+    """取一条文档的稽核证据:摘要 + 原文头部(截断到 2000 字符)。"""
     parts = []
     abstract = doc.get("abstract_short") or doc.get("abstract") or ""
     if abstract:
@@ -287,9 +329,13 @@ def _doc_evidence(doc, raw_dir):
     return "\n\n".join(parts)
 
 
-def _parse_contradiction_json(content):
+def _parse_contradiction_json(content: str) -> dict | None:
+    """稳健解析 LLM 返回的 JSON(可能被包在 ```json 围栏里)。"""
+    if not content:
+        return None
     import re
     import json
+
     txt = content.strip()
     fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", txt, re.DOTALL)
     if fence:
@@ -312,7 +358,7 @@ def _parse_contradiction_json(content):
     }
 
 
-def _load_index():
+def _load_index() -> dict:
     try:
         if INDEX_FILE.exists():
             with open(INDEX_FILE, "r", encoding="utf-8") as f:
@@ -322,8 +368,23 @@ def _load_index():
     return {}
 
 
-def run_consistency_check(client, model, *, kg_file=None, entity_file=None,
-                          out_file=None, index=None, raw_dir=None, batch_size=5):
+def run_consistency_check(
+    client,
+    model: str,
+    *,
+    kg_file: Path | None = None,
+    entity_file: Path | None = None,
+    out_file: Path | None = None,
+    index: dict | None = None,
+    raw_dir: Path | None = None,
+    batch_size: int = 5,
+) -> dict:
+    """全库一致性稽核:生成候选对 → LLM 批量判定 → 写 contradictions.yaml。
+
+    Loop #9: 用 detect_contradictions_batch(多对一次调用)替代逐对串行,
+    把 N 次 LLM 降到 ceil(N/batch_size) 次。batch_size 默认 5(质量/速度平衡)。
+    返回写入的报告 dict(pairs/last_updated/total)。
+    """
     kg_path = kg_file if kg_file is not None else (
         BASE_DIR / "meta" / "relations" / "knowledge_graph.yaml"
     )
@@ -331,10 +392,14 @@ def run_consistency_check(client, model, *, kg_file=None, entity_file=None,
         BASE_DIR / "meta" / "ontology" / "entity_relations.yaml"
     )
     out_path = out_file if out_file is not None else CONTRADICTIONS_FILE
+
     kg_edges = _safe_load_edges(kg_path)
     ent_edges = _safe_load_edges(ent_path)
+
     candidates = find_contradiction_candidates(kg_edges, ent_edges)
+
     contradictions = []
+    # Loop #9: 批量判定(降 N 次→N/batch_size 次)
     verdicts = detect_contradictions_batch(
         candidates, client, model,
         index=index, raw_dir=raw_dir, batch_size=batch_size,
@@ -349,12 +414,14 @@ def run_consistency_check(client, model, *, kg_file=None, entity_file=None,
                 "confidence": result.get("confidence", 0.0),
                 "detected_at": datetime.now(TZ_CST).isoformat(),
             })
+
     report = {
         "contradictions": contradictions,
         "total": len(contradictions),
         "candidates_checked": len(candidates),
         "last_updated": datetime.now(TZ_CST).isoformat(),
     }
+
     try:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "w", encoding="utf-8") as f:
@@ -364,7 +431,7 @@ def run_consistency_check(client, model, *, kg_file=None, entity_file=None,
     return report
 
 
-def _safe_load_edges(path):
+def _safe_load_edges(path: Path) -> list[dict]:
     try:
         if path.exists():
             with open(path, "r", encoding="utf-8") as f:
@@ -375,7 +442,8 @@ def _safe_load_edges(path):
     return []
 
 
-def load_contradictions(path=None):
+def load_contradictions(path: Path | None = None) -> dict:
+    """读取已知矛盾报告(供 Layer3 / API 查询)。缺失 → 空 dict。"""
     p = path if path is not None else CONTRADICTIONS_FILE
     try:
         if p.exists():
@@ -386,7 +454,14 @@ def load_contradictions(path=None):
     return {"contradictions": [], "total": 0}
 
 
-def contradictions_for_docs(doc_ids, contradictions=None):
+def contradictions_for_docs(
+    doc_ids: list[str],
+    contradictions: list[dict] | None = None,
+) -> list[dict]:
+    """筛选涉及给定文档集合的已知矛盾(供 Layer3 在 Top 文档间查)。
+
+    纯函数:便于单测。contradictions 为 None 时读文件。
+    """
     if contradictions is None:
         contradictions = load_contradictions().get("contradictions", [])
     target = set(doc_ids)

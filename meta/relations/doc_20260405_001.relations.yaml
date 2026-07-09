@@ -8,7 +8,7 @@ relations:
 - target_doc_id: doc_20260412_002
   type: supplements
   confidence: 0.82
-  evidence: 新文档明确了岸桥远控自动化改造的通信指标与设备联调时间节点，为该简化版方案中"两升级"战略框架提供了可执行的技术路径支撑。
+  evidence: 新文档明确了岸桥远控自动化改造的通信指标与设备联调时间节点，为该简化版方案中“两升级”战略框架提供了可执行的技术路径支撑。
 - target_doc_id: doc_20260405_003
   type: same_topic
   confidence: 0.8

@@ -49,12 +49,12 @@ D:\ProgramData\anaconda3\python.exe -m pytest tests/ -v
 *   **执行步骤**：
     1. 运行命令 `D:\ProgramData\anaconda3\python.exe scripts/ingest.py`。
 *   **预期结果**：
-    *   在控制台输出"处理文件: 01_port_auto_spec.md，成功摄入"。
+    *   在控制台输出“处理文件: 01_port_auto_spec.md，成功摄入”。
     *   `raw/` 目录下新增对应 SHA256 唯一生成的文档 `.txt` 文件与对应的 `.meta.yaml`。
     *   `meta.yaml` 状态初始化为 `status: raw`。
 
 ### UAT-02: LLM 无向量编译与知识提取 (Compile)
-*   **测试目的**：验证 LLM Agent 能否充当"编译器"，基于全文生成高密度摘要并识别本体节点。
+*   **测试目的**：验证 LLM Agent 能否充当“编译器”，基于全文生成高密度摘要并识别本体节点。
 *   **前置条件**：前序 UAT-01 执行成功，且 `.env` 配置合法。
 *   **执行步骤**：
     1. 运行命令 `D:\ProgramData\anaconda3\python.exe scripts/compile.py`。
@@ -82,5 +82,5 @@ D:\ProgramData\anaconda3\python.exe -m pytest tests/ -v
 *   **预期结果**：
     *   终端正确吐出树状关联结构。
     *   列出关系类别（如 `同主题`，`补充说明`），并给出该关联的置信度百分比。
-    *   LLM 生成的人类可读的原因解释（如"两者均围绕港口作业展开，一侧重垂直作业，一侧重水平作业"）。
+    *   LLM 生成的人类可读的原因解释（如“两者均围绕港口作业展开，一侧重垂直作业，一侧重水平作业”）。
     *   `meta/relations/knowledge_graph.yaml` 更新并长期固化该关联网络（Edges）。

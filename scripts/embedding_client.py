@@ -28,8 +28,8 @@ class EmbeddingClient:
 
         if not self.api_key:
             raise RuntimeError(
-                "[EmbeddingClient] EMBEDDING_API_KEY not set.\n"
-                "Please configure in .env or environment:\n"
+                "[EmbeddingClient] EMBEDDING_API_KEY 未设置。\n"
+                "请在 .env 或环境变量中配置：\n"
                 "  EMBEDDING_API_KEY=<your-key>\n"
                 "  EMBEDDING_BASE_URL=<api-base-url>\n"
                 "  EMBEDDING_MODEL_NAME=<model-name>"

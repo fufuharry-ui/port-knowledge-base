@@ -1,6 +1,7 @@
 /**
  * tests/unit/wiki-polling.test.tsx — 仪表盘编译轮询测试 (Loop #11)
  * 验证:有 raw/compiling 文档时显示"编译中"提示;全 compiled 时无提示。
+ * (interval 行为由 React useEffect 管理,这里测其可见的驱动状态)
  */
 import '@testing-library/jest-dom';
 import React from 'react';
@@ -16,10 +17,10 @@ jest.mock('@/lib/api', () => ({
 
 const mockedFetch = fetchWikiIndex as jest.MockedFunction<typeof fetchWikiIndex>;
 
-describe('Wiki polling (Loop #11)', () => {
+describe('Wiki 仪表盘编译轮询 (Loop #11)', () => {
     beforeEach(() => { mockedFetch.mockReset(); });
 
-    test('shows compiling hint when raw docs exist', async () => {
+    test('有 raw 文档时显示"编译中自动刷新"提示', async () => {
         mockedFetch.mockResolvedValue({
             total_docs: 1,
             documents: [{ id: 'doc_1', title: 'T', status: 'raw' }] as any,
@@ -28,12 +29,13 @@ describe('Wiki polling (Loop #11)', () => {
         expect(await screen.findByTestId('compiling-hint')).toBeInTheDocument();
     });
 
-    test('no compiling hint when all compiled', async () => {
+    test('全部 compiled 时无编译提示', async () => {
         mockedFetch.mockResolvedValue({
             total_docs: 1,
             documents: [{ id: 'doc_1', title: 'T', status: 'compiled' }] as any,
         });
         await act(async () => { render(<WikiPage />); });
+        // 等加载完
         await screen.findByTestId('doc-count');
         expect(screen.queryByTestId('compiling-hint')).toBeNull();
     });

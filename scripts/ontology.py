@@ -259,6 +259,7 @@ def rebuild_tree_from_nodes(seed_tree, per_doc_nodes):
             _ensure(n.get(key))
 
     # 1d. 为种子树中"parent 标签不在注册表"的引用也建占位符根
+    #     (涵盖历史孤儿悬空的 parent,如 北斗RTK→定位导航技术 后者从未建为节点)
     for term, info in list(reg.items()):
         p = info["parent"]
         if p is not None and p not in reg:

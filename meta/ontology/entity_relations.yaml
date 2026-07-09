@@ -39,7 +39,7 @@ edges:
   target: 5G+光纤冗余链路
   type: part_of
   confidence: 0.85
-  evidence: 构建"5G+光纤"冗余链路，5G技术为其核心组成
+  evidence: 构建“5G+光纤”冗余链路，5G技术为其核心组成
   doc_id: doc_20260405_003
 - source: 场桥远控
   target: 自动化装卸系统

@@ -37,6 +37,7 @@ class Linter:
         return list(orphans)
 
     def detect_missing_concepts(self) -> list[str]:
+        # 简单实现：提取所有文档摘要中的词进行统计对比
         index_file = self.wiki_dir / "index.yaml"
         ontology_file = self.meta_dir / "ontology" / "global_ontology.yaml"
         
@@ -46,6 +47,8 @@ class Linter:
         with open(ontology_file, "r", encoding="utf-8") as f:
             ont_data = yaml.safe_load(f) or {"terms": {}}
         existing_terms = set(ont_data.get("terms", {}).keys())
+        
+        # 这里仅为占位逻辑，返回缺少的概念列表
         return []
 
     def detect_contradictions(self, client, model: str) -> list[dict]:
@@ -60,6 +63,7 @@ class Linter:
         if len(docs) < 2:
             return []
             
+        # 把前10个文档给LLM检查
         candidates = docs[:10]
         context = "\n---\n".join(
             f"doc_id: {d['id']}\n摘要: {d.get('abstract_short', '')}" 

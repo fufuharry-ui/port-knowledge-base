@@ -8,7 +8,7 @@ relations:
 - target_doc_id: doc_20260406_008
   type: supplements
   confidence: 0.88
-  evidence: 新文档明确将"深化人工智能在管理办公与经营决策中的全场景赋能"列为核心任务，是对现有AI应用成果总结报告的深化与下一步战略部署。
+  evidence: 新文档明确将“深化人工智能在管理办公与经营决策中的全场景赋能”列为核心任务，是对现有AI应用成果总结报告的深化与下一步战略部署。
 - target_doc_id: doc_20260406_009
   type: supplements
   confidence: 0.82
@@ -16,4 +16,4 @@ relations:
 - target_doc_id: doc_20260406_007
   type: same_topic
   confidence: 0.8
-  evidence: 两者同属天津港集团数字化转型顶层设计文件，新文档的年度任务规划是对"十五五"规划中2026年阶段性目标的具体落实与拆解。
+  evidence: 两者同属天津港集团数字化转型顶层设计文件，新文档的年度任务规划是对“十五五”规划中2026年阶段性目标的具体落实与拆解。

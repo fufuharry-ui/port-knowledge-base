@@ -8,7 +8,7 @@ relations:
 - target_doc_id: doc_20260405_001
   type: supplements
   confidence: 0.85
-  evidence: 现有文档提出自动化装卸系统对网络实时性的需求，新文档具体给出5G（eMBB/uRLLC）及"5G+光纤"冗余链路的技术实现方案，对网络通信需求形成明确的技术补充。
+  evidence: 现有文档提出自动化装卸系统对网络实时性的需求，新文档具体给出5G（eMBB/uRLLC）及“5G+光纤”冗余链路的技术实现方案，对网络通信需求形成明确的技术补充。
 - target_doc_id: doc_20260406_008
   type: same_topic
   confidence: 0.8

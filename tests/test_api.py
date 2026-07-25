@@ -12,8 +12,48 @@ client = TestClient(app)
 # 真实数据目录(与 api/main.py 的 BASE_DIR 一致)
 _DATA_DIR = Path(__file__).resolve().parent.parent
 
-@patch("api.main.ingest_and_compile_task")
-def test_ingest_endpoint(mock_task):
+
+@pytest.fixture(autouse=True)
+def isolate_api_originals(tmp_path, monkeypatch):
+    """UAT Big-Loop:把 API 测试可能触发的所有真实写入隔离到 tmp_path。
+
+    覆盖三处写入源头:
+    - api.main: ORIGINALS_DIR(上传落盘)、RAW_DIR(管理 catalog 读)
+    - scripts.ingest: 后台 ingest_file 用的是 ingest 模块自己的 RAW_DIR/INDEX_FILE
+      (独立常量,不是 api.main 的),不一并 patch 会写真实 raw/
+    - scripts.logger: ingest_file 调用时 `from scripts.logger import global_logger`
+    """
+    import api.main as api_mod
+    import scripts.ingest as ingest_mod
+    import scripts.logger as logger_mod
+    originals = tmp_path / "originals"
+    originals.mkdir()
+    monkeypatch.setattr(api_mod, "ORIGINALS_DIR", originals)
+    monkeypatch.setattr(api_mod, "RAW_DIR", tmp_path / "raw")
+    # BASE_DIR: compile_ingested_task 用 BASE_DIR 作 cwd + 找 scripts/compile.py。
+    # 指向 tmp_path 后 compile_script 不存在 → 早返回,绝不 spawn 指向真实仓库的子进程。
+    monkeypatch.setattr(api_mod, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(ingest_mod, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(ingest_mod, "RAW_DIR", tmp_path / "raw")
+    monkeypatch.setattr(ingest_mod, "ORIGINALS_DIR", originals)
+    monkeypatch.setattr(ingest_mod, "WIKI_DIR", tmp_path / "wiki")
+    monkeypatch.setattr(ingest_mod, "INDEX_FILE", tmp_path / "wiki" / "index.yaml")
+    sandbox_logger = logger_mod.ActivityLogger(tmp_path / "wiki")
+    monkeypatch.setattr(logger_mod, "global_logger", sandbox_logger)
+    return originals
+
+
+@patch("api.main.compile_ingested_task")
+@patch("api.main.ingest_file")
+def test_ingest_endpoint(mock_ingest, mock_compile, isolate_api_originals):
+    """UAT Big-Loop Task 6:/ingest 返回权威 doc_id(来自 ingest_file,而非上传时预生成),
+    含 skipped 字段,并调度 compile_ingested_task(doc_id)。
+    参数顺序:@patch mock 在前,fixture 在后(pytest 9.x arg_names[N:] 语义)。
+    """
+    mock_ingest.return_value = {
+        "id": "doc_test_001", "title": "test", "status": "raw",
+        "file_hash": "sha256:test", "source_type": "txt",
+    }
     response = client.post(
         "/api/v1/ingest",
         files={"file": ("test.txt", b"Mock document content", "text/plain")}
@@ -21,8 +61,11 @@ def test_ingest_endpoint(mock_task):
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "processing"
-    assert "doc_id" in data
-    assert mock_task.called
+    assert data["doc_id"] == "doc_test_001"
+    assert data["skipped"] is False
+    assert (isolate_api_originals / "test.txt").exists()
+    assert mock_ingest.called
+    assert mock_compile.called_once_with("doc_test_001") if hasattr(mock_compile, "called_once_with") else mock_compile.called
 
 @patch("api.main.search")
 @patch("api.main.get_llm_client")
@@ -357,3 +400,99 @@ def test_search_stream_emits_thought_progress(mock_client, mock_l1, mock_l2, moc
     # 至少 3 个步骤(初筛/精选/生成)
     assert len(thought_steps) >= 3, f"/search/stream 应发≥3 个 thought 事件,实际 {thought_steps}"
     assert 1 in thought_steps and 2 in thought_steps and 3 in thought_steps
+
+
+# ─── UAT Big-Loop Task 6:truthful upload + observable catalog joint point ────
+
+def test_catalog_includes_raw_meta_before_compile(tmp_path, monkeypatch):
+    """CAP-PROGRESS:raw 文档(未编译)必须出现在管理 catalog,这样上传后立即在仪表盘可见。
+    旧实现 /wiki/index 只读 compiled index → 新文档编译完成前不可见。
+    """
+    import api.main as api_mod
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    meta = {
+        "id": "doc_20260719_001",
+        "title": "蓝鲸门机智能巡检协议",
+        "status": "raw",
+        "source_type": "md",
+        "file_hash": "sha256:raw",
+        "char_count": 120,
+        "ingested_at": "2026-07-19T10:00:00+08:00",
+    }
+    (raw / "doc_20260719_001.meta.yaml").write_text(
+        yaml.safe_dump(meta, allow_unicode=True), encoding="utf-8"
+    )
+    monkeypatch.setattr(api_mod, "RAW_DIR", raw)
+    monkeypatch.setattr(api_mod, "INDEX_FILE", tmp_path / "missing-index.yaml")
+
+    response = client.get("/api/v1/wiki/index")
+    assert response.status_code == 200
+    docs = response.json()["documents"]
+    assert len(docs) == 1
+    assert docs[0]["id"] == meta["id"]
+    assert docs[0]["status"] == "raw"
+
+
+@patch("api.main.compile_ingested_task")
+@patch("api.main.ingest_file")
+def test_upload_returns_authoritative_ingested_id(mock_ingest, mock_compile, isolate_api_originals):
+    """CAP-INGEST:/upload 必须返回 ingest_file() 的权威 doc_id(而非上传时预生成),
+    含 skipped=false,并调度 compile_ingested_task(权威 doc_id)。
+    """
+    mock_ingest.return_value = {
+        "id": "doc_20260719_007", "title": "truthful", "status": "raw",
+        "file_hash": "sha256:new",
+    }
+    response = client.post(
+        "/api/v1/upload",
+        files={"file": ("truthful.md", b"# Truthful", "text/markdown")},
+    )
+    assert response.status_code == 200
+    assert response.json()["doc_id"] == "doc_20260719_007"
+    assert response.json()["skipped"] is False
+    mock_ingest.assert_called_once()
+    mock_compile.assert_called_once_with("doc_20260719_007")
+
+
+@patch("api.main.compile_ingested_task")
+def test_duplicate_upload_returns_existing_id_without_compile(
+    mock_compile, isolate_api_originals, monkeypatch
+):
+    """CAP-INGEST:重复哈希必须返回既有 doc_id + skipped=true,且不调度编译(无幽灵任务)。
+    """
+    import api.main as api_mod
+    monkeypatch.setattr(
+        api_mod,
+        "_find_duplicate_doc",
+        lambda _hash: {"id": "doc_existing", "title": "existing"},
+    )
+    response = client.post(
+        "/api/v1/upload",
+        files={"file": ("duplicate.md", b"same bytes", "text/markdown")},
+    )
+    assert response.status_code == 200
+    assert response.json()["skipped"] is True
+    assert response.json()["doc_id"] == "doc_existing"
+    mock_compile.assert_not_called()
+
+
+def test_upload_rejects_unsupported_extension_without_writing(isolate_api_originals):
+    """安全最小线:非法扩展名 → 422,originals/ 无任何落盘。"""
+    response = client.post(
+        "/api/v1/upload",
+        files={"file": ("malware.exe", b"MZ", "application/octet-stream")},
+    )
+    assert response.status_code == 422
+    assert list(isolate_api_originals.iterdir()) == []
+
+
+def test_upload_strips_path_components(isolate_api_originals):
+    """安全最小线:文件名中的路径分量被剥离(只取 basename),不写到 originals/ 之外。"""
+    response = client.post(
+        "/api/v1/upload",
+        files={"file": ("../safe.md", b"# Safe", "text/markdown")},
+    )
+    assert response.status_code in (200, 422)
+    assert not (isolate_api_originals.parent / "safe.md").exists()

@@ -31,7 +31,7 @@ describe('DocHub 文档智能枢纽', () => {
         render(<DocHub doc={doc} relatedDocs={[]} contradictions={[]} />);
         expect(screen.getByText('岸桥远控方案')).toBeInTheDocument();
         expect(screen.getByText(/网络延迟要求与架构/)).toBeInTheDocument();
-        expect(screen.getByText(/compiled/)).toBeInTheDocument();
+        expect(screen.getByText(/已编译|compiled/)).toBeInTheDocument();
     });
 
     test('实体 chip 可点击,链接到实体图谱页并预填 term', () => {

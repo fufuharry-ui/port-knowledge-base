@@ -1,6 +1,10 @@
 'use client';
 import React, { useRef, useState, useCallback } from 'react';
+import Link from 'next/link';
+import { UploadCloud, CheckCircle2, XCircle, ArrowRight } from 'lucide-react';
+import { Spinner } from '@/components/ui/Spinner';
 import type { UploadResult } from '@/lib/api';
+import { cn } from '@/lib/utils';
 
 interface UploadItem {
     file: File;
@@ -53,102 +57,108 @@ export default function UploadZone({ onUpload }: UploadZoneProps) {
     const isUploading = items.some(i => i.state === 'uploading');
 
     return (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-            {/* Drop zone */}
+        <div className="flex flex-col gap-4">
+            {/* 拖放区(键盘可达) */}
             <div
                 data-testid="dropzone"
+                role="button"
+                tabIndex={0}
+                aria-label="上传文件:拖入文件,或按回车选择文件"
                 onDrop={handleDrop}
                 onDragOver={e => { e.preventDefault(); setIsDragging(true); }}
                 onDragEnter={() => setIsDragging(true)}
                 onDragLeave={() => setIsDragging(false)}
                 onClick={() => fileInputRef.current?.click()}
-                className={`dropzone-base${isDragging ? ' drag-over' : ''}`}
-                style={{
-                    display: 'flex', flexDirection: 'column',
-                    alignItems: 'center', justifyContent: 'center',
-                    gap: '16px', padding: '56px 24px',
+                onKeyDown={e => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        fileInputRef.current?.click();
+                    }
                 }}
+                className={cn(
+                    'dropzone-base flex flex-col items-center justify-center gap-4 px-6 py-14',
+                    isDragging && 'drag-over',
+                )}
             >
                 <input
                     ref={fileInputRef}
                     type="file"
                     multiple
                     accept={ACCEPTED_EXTENSIONS.join(',')}
-                    onChange={e => { Array.from(e.target.files ?? []).forEach(processFile); if (fileInputRef.current) fileInputRef.current.value = ''; }}
-                    style={{ display: 'none' }}
+                    onChange={e => {
+                        Array.from(e.target.files ?? []).forEach(processFile);
+                        if (fileInputRef.current) fileInputRef.current.value = '';
+                    }}
+                    className="hidden"
+                    aria-hidden="true"
+                    tabIndex={-1}
                 />
 
                 {isUploading ? (
-                    <span data-testid="uploading-spinner" className="spin" style={{
-                        display: 'inline-block', width: '40px', height: '40px',
-                        border: '3px solid var(--accent-blue)', borderTopColor: 'transparent', borderRadius: '50%',
-                    }} />
+                    <Spinner size={36} data-testid="uploading-spinner" />
                 ) : (
-                    <span style={{ fontSize: '36px' }}>☁️</span>
+                    <span className="flex h-14 w-14 items-center justify-center rounded-full bg-accent-soft text-accent">
+                        <UploadCloud size={26} strokeWidth={1.75} />
+                    </span>
                 )}
 
-                <div style={{ textAlign: 'center' }}>
-                    <p style={{ fontSize: '14px', color: 'var(--text-secondary)', margin: '0 0 4px' }}>
-                        拖拽文件至此或<span style={{ color: 'var(--accent-blue)' }}>点击上传</span>
+                <div className="text-center">
+                    <p className="text-[15px] font-medium text-ink">
+                        拖拽文件至此,或<span className="text-accent">点击上传</span>
                     </p>
-                    <p data-testid="accepted-types" style={{ fontSize: '12px', color: 'var(--text-muted)', margin: 0 }}>
+                    <p data-testid="accepted-types" className="mt-1.5 text-xs text-ink-3">
                         支持格式：PDF · DOCX · MD · TXT · HTML
                     </p>
                 </div>
             </div>
 
-            {/* Type error */}
+            {/* 类型错误 */}
             {typeError && (
-                <div data-testid="upload-error" style={{
-                    display: 'flex', alignItems: 'center', gap: '8px',
-                    color: 'var(--accent-red)', fontSize: '13px',
-                    padding: '12px 16px', borderRadius: '12px',
-                    background: 'rgba(248,113,113,0.08)', border: '1px solid rgba(248,113,113,0.20)',
-                }}>
-                    ⚠ {typeError}
+                <div
+                    data-testid="upload-error"
+                    role="alert"
+                    className="flex items-center gap-2 rounded-lg border border-danger/25 bg-danger-soft px-4 py-3 text-[13px] font-medium text-danger-ink"
+                >
+                    <XCircle size={16} className="shrink-0" />
+                    {typeError}
                 </div>
             )}
 
-            {/* Upload items */}
+            {/* 上传条目 */}
             {items.length > 0 && (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                <div className="flex flex-col gap-2">
                     {items.map((item, i) => (
                         <div
                             key={`${item.file.name}-${item.file.lastModified}`}
                             data-testid={item.result?.doc_id ? `upload-item-${item.result.doc_id}` : `upload-item-${i}`}
-                            className={`upload-item-${item.state}`}
-                            style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '12px 16px' }}
-                        >
-                            {item.state === 'uploading' && (
-                                <span className="spin" style={{
-                                    display: 'inline-block', width: '14px', height: '14px',
-                                    border: '2px solid var(--accent-blue)', borderTopColor: 'transparent', borderRadius: '50%',
-                                }} />
+                            className={cn(
+                                'flex items-center gap-3 rounded-lg border px-4 py-3',
+                                item.state === 'done' && 'upload-item-done',
+                                item.state === 'error' && 'upload-item-error',
+                                item.state === 'uploading' && 'upload-item-uploading',
                             )}
-                            {item.state === 'done' && <span>✅</span>}
-                            {item.state === 'error' && <span>❌</span>}
+                        >
+                            {item.state === 'uploading' && <Spinner size={14} className="shrink-0" />}
+                            {item.state === 'done' && <CheckCircle2 size={16} className="shrink-0 text-success" />}
+                            {item.state === 'error' && <XCircle size={16} className="shrink-0 text-danger" />}
 
-                            <div style={{ flex: 1, minWidth: 0 }}>
-                                <p style={{ margin: 0, fontSize: '13px', color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                    {item.file.name}
-                                </p>
+                            <div className="min-w-0 flex-1">
+                                <p className="truncate text-[13px] font-medium text-ink">{item.file.name}</p>
                                 {item.result?.doc_id && (
-                                    <p style={{ margin: 0, fontSize: '10px', fontFamily: 'monospace', color: 'var(--text-muted)' }}>
-                                        {item.result.doc_id}
-                                    </p>
+                                    <p className="mt-0.5 font-mono text-[10px] text-ink-3">{item.result.doc_id}</p>
                                 )}
                                 {item.state === 'done' && !item.result?.skipped && (
-                                    <p style={{ margin: 0, fontSize: '11px', color: 'var(--accent-green)' }}>
+                                    <p className="mt-0.5 text-[11px] text-success-ink">
                                         摄入成功，后台编译中…
-                                        <a href="/wiki" style={{ marginLeft: '8px', color: 'var(--accent-blue)', textDecoration: 'none' }}>
-                                            去仪表盘看编译进度 →
-                                        </a>
+                                        <Link href="/wiki" className="ml-2 inline-flex items-center gap-0.5 font-medium text-accent hover:underline">
+                                            去仪表盘看编译进度 <ArrowRight size={11} />
+                                        </Link>
                                     </p>
                                 )}
                                 {item.result?.skipped && (
-                                    <p style={{ margin: 0, fontSize: '11px', color: 'var(--accent-amber)' }}>文件已存在，已跳过</p>
+                                    <p className="mt-0.5 text-[11px] font-medium text-warning-ink">文件已存在，已跳过</p>
                                 )}
-                                {item.error && <p style={{ margin: 0, fontSize: '11px', color: 'var(--accent-red)' }}>{item.error}</p>}
+                                {item.error && <p className="mt-0.5 text-[11px] text-danger-ink">{item.error}</p>}
                             </div>
                         </div>
                     ))}

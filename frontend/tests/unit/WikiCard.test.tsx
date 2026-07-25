@@ -30,20 +30,20 @@ describe('WikiCard', () => {
     test('shows compiled badge with green indicator', () => {
         render(<WikiCard doc={baseDoc} />);
         const badge = screen.getByTestId('status-badge');
-        expect(badge).toHaveTextContent('compiled');
+        expect(badge).toHaveTextContent('已编译');
         expect(badge.className).toMatch(/badge-compiled|green|success|emerald/i);
     });
 
     test('shows compiling badge with spinner for raw status', () => {
         render(<WikiCard doc={{ ...baseDoc, status: 'raw' }} />);
         const badge = screen.getByTestId('status-badge');
-        expect(badge).toHaveTextContent('raw');
+        expect(badge).toHaveTextContent('待编译');
     });
 
     test('shows compiling badge with spinning animation', () => {
         render(<WikiCard doc={{ ...baseDoc, status: 'compiling' }} />);
         // Should show a spinner/loading indicator
-        expect(screen.getByTestId('status-badge')).toHaveTextContent('compiling');
+        expect(screen.getByTestId('status-badge')).toHaveTextContent('编译中');
         // Spinner element should exist
         expect(screen.getByTestId('compiling-spinner')).toBeInTheDocument();
     });
@@ -51,7 +51,7 @@ describe('WikiCard', () => {
     test('shows error badge in red for error status', () => {
         render(<WikiCard doc={{ ...baseDoc, status: 'error' }} />);
         const badge = screen.getByTestId('status-badge');
-        expect(badge).toHaveTextContent('error');
+        expect(badge).toHaveTextContent('编译失败');
         expect(badge.className).toMatch(/badge-error|red|danger|destructive/i);
     });
 

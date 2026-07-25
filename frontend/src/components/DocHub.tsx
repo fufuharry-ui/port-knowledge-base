@@ -11,7 +11,11 @@
  */
 import React from 'react';
 import Link from 'next/link';
+import { ArrowLeft, FileText, Tags, Link2, AlertTriangle, FileSearch } from 'lucide-react';
 import type { DocMeta } from '@/lib/api';
+import { Card } from '@/components/ui/Card';
+import { Badge, STATUS_BADGE_VARIANT, STATUS_BADGE_LABEL } from '@/components/ui/Badge';
+import { cn } from '@/lib/utils';
 
 export interface RelatedDoc {
     doc_id: string;
@@ -42,94 +46,119 @@ const TYPE_LABEL: Record<string, string> = {
     related_to: '相关',
 };
 
+function SectionTitle({ icon: Icon, children, tone }: {
+    icon: React.ComponentType<{ size?: number; className?: string }>;
+    children: React.ReactNode;
+    tone?: 'danger';
+}) {
+    return (
+        <h2 className={cn(
+            'mb-3.5 flex items-center gap-1.5 text-sm font-semibold',
+            tone === 'danger' ? 'text-danger-ink' : 'text-ink',
+        )}>
+            <Icon size={15} className={tone === 'danger' ? 'text-danger' : 'text-accent'} />
+            {children}
+        </h2>
+    );
+}
+
 export default function DocHub({ doc, relatedDocs, contradictions, notFound }: DocHubProps) {
     if (notFound) {
         return (
-            <div style={{ maxWidth: '780px', margin: '0 auto', padding: '80px 24px', textAlign: 'center' }}>
-                <span style={{ fontSize: '48px' }}>🔍</span>
-                <h1 style={{ fontSize: '22px', color: 'var(--text-primary)', margin: '16px 0 8px' }}>
-                    文档不存在
-                </h1>
-                <p style={{ color: 'var(--text-muted)', fontSize: '13px', marginBottom: '24px' }}>
+            <div className="mx-auto max-w-3xl px-6 py-20 text-center">
+                <span className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-subtle text-ink-3">
+                    <FileSearch size={24} strokeWidth={1.75} />
+                </span>
+                <h1 className="text-xl font-semibold text-ink">文档不存在</h1>
+                <p className="mb-6 mt-2 text-[13px] text-ink-3">
                     该文档可能已被删除或 ID 有误。
                 </p>
-                <Link href="/wiki" style={backLinkStyle}>← 返回知识库</Link>
+                <Link
+                    href="/wiki"
+                    className="inline-flex items-center gap-1.5 text-[13px] font-medium text-accent no-underline hover:underline"
+                >
+                    <ArrowLeft size={14} /> 返回知识库
+                </Link>
             </div>
         );
     }
 
     const terms = (doc.ontology_terms ?? []).filter(t => t && t.length >= 2);
+    const status = doc.status ?? 'raw';
     // 矛盾里"另一方"的文档 id(去掉当前 doc)
     const otherInContradiction = (c: DocContradiction) =>
         c.doc_a === doc.id ? c.doc_b : c.doc_a;
 
     return (
-        <div style={{ maxWidth: '900px', margin: '0 auto', padding: '40px 24px' }}>
+        <div className="mx-auto max-w-4xl px-6 py-10">
             {/* 返回 */}
-            <Link href="/wiki" style={backLinkStyle}>← 知识库</Link>
+            <Link
+                href="/wiki"
+                className="mb-4 inline-flex items-center gap-1 text-xs font-medium text-ink-3 no-underline transition-colors hover:text-ink"
+            >
+                <ArrowLeft size={13} /> 知识库
+            </Link>
 
-            {/* 标题区 */}
-            <div style={{ marginBottom: '24px' }}>
-                <h1 style={{ fontSize: '26px', fontWeight: 700, color: 'var(--text-primary)', margin: '0 0 8px' }}>
-                    {doc.title || doc.id}
-                </h1>
-                <div style={{ display: 'flex', gap: '16px', fontSize: '12px', color: 'var(--text-muted)', flexWrap: 'wrap' }}>
-                    <span style={{ fontFamily: 'monospace' }}>{doc.id}</span>
+            {/* Hero:标题 + 状态 + 元信息 + 摘要 */}
+            <Card className="mb-4 p-6">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                    <h1 className="text-[22px] font-bold leading-snug tracking-tight text-ink">
+                        {doc.title || doc.id}
+                    </h1>
                     {doc.status && (
-                        <span style={{ color: doc.status === 'compiled' ? 'var(--accent-green)' : 'var(--accent-amber)' }}>
-                            {doc.status === 'compiled' ? '✓ ' : '○ '}{doc.status}
-                        </span>
+                        <Badge variant={STATUS_BADGE_VARIANT[status as keyof typeof STATUS_BADGE_VARIANT] ?? 'raw'}>
+                            {STATUS_BADGE_LABEL[status as keyof typeof STATUS_BADGE_LABEL] ?? status}
+                        </Badge>
                     )}
-                    {doc.char_count ? <span>{doc.char_count.toLocaleString()} 字</span> : null}
+                </div>
+                <div className="mt-2 flex flex-wrap gap-4 text-xs text-ink-3">
+                    <span className="font-mono">{doc.id}</span>
+                    {doc.char_count ? <span>{doc.char_count.toLocaleString('zh-CN')} 字</span> : null}
                     {doc.ingested_at ? <span>{doc.ingested_at.slice(0, 10)}</span> : null}
                 </div>
-            </div>
-
-            {/* 摘要 */}
-            {doc.abstract_short && (
-                <section style={sectionStyle}>
-                    <h2 style={h2Style}>📝 摘要</h2>
-                    <p style={{ fontSize: '14px', lineHeight: 1.8, color: 'var(--text-secondary)', margin: 0 }}>
+                {doc.abstract_short && (
+                    <p className="mt-4 border-t border-line pt-4 text-sm leading-7 text-ink-2">
                         {doc.abstract_short}
                     </p>
-                </section>
-            )}
+                )}
+            </Card>
 
             {/* 实体面板:chip → 实体图谱页(预填 term,打通穿梭) */}
-            <section style={sectionStyle}>
-                <h2 style={h2Style}>🏷️ 实体概念</h2>
+            <Card className="mb-4 p-5">
+                <SectionTitle icon={Tags}>实体概念</SectionTitle>
                 {terms.length > 0 ? (
-                    <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                    <div className="flex flex-wrap gap-2">
                         {terms.map(term => (
                             <Link
                                 key={term}
                                 href={`/entity-graph?term=${encodeURIComponent(term)}&depth=2`}
-                                style={chipStyle}
+                                className="rounded-full border border-accent/25 bg-accent-soft px-3 py-1 text-xs font-medium text-accent-ink no-underline transition-colors hover:bg-accent/15"
                             >
                                 {term}
                             </Link>
                         ))}
                     </div>
                 ) : (
-                    <p style={emptyStyle}>暂无实体概念</p>
+                    <p className="text-xs text-ink-3">暂无实体概念</p>
                 )}
-            </section>
+            </Card>
 
             {/* 关联文档面板 */}
-            <section style={sectionStyle}>
-                <h2 style={h2Style}>🔗 关联文档</h2>
+            <Card className="mb-4 p-5">
+                <SectionTitle icon={Link2}>关联文档</SectionTitle>
                 {relatedDocs.length > 0 ? (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    <div className="flex flex-col gap-2">
                         {relatedDocs.map(rd => (
                             <Link
                                 key={rd.doc_id}
                                 href={`/wiki/${rd.doc_id}`}
-                                style={relatedCardStyle}
+                                className="flex items-center gap-2 rounded-lg border border-line bg-surface px-3.5 py-2.5 no-underline transition-colors hover:border-line-strong hover:bg-hover"
                             >
-                                <span style={{ fontWeight: 500, color: 'var(--text-primary)' }}>
+                                <FileText size={14} className="shrink-0 text-ink-3" />
+                                <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-ink">
                                     {rd.title || rd.doc_id}
                                 </span>
-                                <span style={{ fontSize: '11px', color: 'var(--accent-blue)', fontFamily: 'monospace', marginLeft: '8px' }}>
+                                <span className="shrink-0 rounded-full bg-subtle px-2 py-0.5 font-mono text-[10px] text-ink-2">
                                     {TYPE_LABEL[rd.type] || rd.type}
                                     {rd.confidence ? ` · ${(rd.confidence * 100).toFixed(0)}%` : ''}
                                 </span>
@@ -137,68 +166,46 @@ export default function DocHub({ doc, relatedDocs, contradictions, notFound }: D
                         ))}
                     </div>
                 ) : (
-                    <p style={emptyStyle}>暂无关联文档</p>
+                    <p className="text-xs text-ink-3">暂无关联文档</p>
                 )}
-            </section>
+            </Card>
 
             {/* 矛盾面板 */}
             {contradictions.length > 0 && (
-                <section style={sectionStyle}>
-                    <h2 style={{ ...h2Style, color: 'var(--accent-red)' }}>⚠️ 涉及的矛盾</h2>
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                <Card className="border-danger/25 p-5">
+                    <SectionTitle icon={AlertTriangle} tone="danger">涉及的矛盾</SectionTitle>
+                    <div className="flex flex-col gap-2.5">
                         {contradictions.map((c, i) => {
                             const other = otherInContradiction(c);
                             return (
-                                <div key={i} style={contradictionStyle}>
-                                    <div style={{ fontSize: '13px', color: 'var(--text-primary)', marginBottom: '4px' }}>
-                                        与 <Link href={`/wiki/${other}`} style={{ color: 'var(--accent-blue)' }}>{other}</Link> 冲突
-                                        {c.confidence != null && ` · 置信度 ${(c.confidence * 100).toFixed(0)}%`}
-                                    </div>
-                                    <div style={{ fontSize: '12px', color: 'var(--accent-amber)', marginBottom: '4px' }}>
+                                <div
+                                    key={i}
+                                    className="rounded-lg border border-danger/20 bg-danger-soft px-4 py-3"
+                                >
+                                    <p className="mb-1 text-[13px] text-ink">
+                                        与{' '}
+                                        <Link href={`/wiki/${other}`} className="font-mono text-xs text-accent hover:underline">
+                                            {other}
+                                        </Link>{' '}
+                                        冲突
+                                        {c.confidence != null && (
+                                            <span className="text-ink-3"> · 置信度 {(c.confidence * 100).toFixed(0)}%</span>
+                                        )}
+                                    </p>
+                                    <p className="mb-1 text-xs text-warning-ink">
                                         冲突点: {c.conflict_point || '未指明'}
-                                    </div>
+                                    </p>
                                     {c.reasoning_chain && (
-                                        <div style={{ fontSize: '12px', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+                                        <p className="text-xs leading-6 text-ink-2">
                                             推理链: {c.reasoning_chain}
-                                        </div>
+                                        </p>
                                     )}
                                 </div>
                             );
                         })}
                     </div>
-                </section>
+                </Card>
             )}
         </div>
     );
 }
-
-const backLinkStyle: React.CSSProperties = {
-    display: 'inline-block', fontSize: '12px', color: 'var(--text-muted)',
-    textDecoration: 'none', marginBottom: '16px',
-};
-const sectionStyle: React.CSSProperties = {
-    padding: '20px 24px', marginBottom: '16px', borderRadius: '14px',
-    background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)',
-};
-const h2Style: React.CSSProperties = {
-    fontSize: '14px', fontWeight: 600, color: 'var(--text-secondary)',
-    margin: '0 0 14px', letterSpacing: '0.3px',
-};
-const chipStyle: React.CSSProperties = {
-    display: 'inline-block', padding: '5px 12px', borderRadius: '999px',
-    fontSize: '12px', color: 'var(--accent-cyan)', textDecoration: 'none',
-    background: 'rgba(34,211,238,0.08)', border: '1px solid rgba(34,211,238,0.20)',
-    transition: 'all 0.15s',
-};
-const relatedCardStyle: React.CSSProperties = {
-    display: 'flex', alignItems: 'center', gap: '4px', padding: '10px 14px',
-    borderRadius: '10px', textDecoration: 'none',
-    background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)',
-};
-const emptyStyle: React.CSSProperties = {
-    fontSize: '12px', color: 'var(--text-muted)', margin: 0,
-};
-const contradictionStyle: React.CSSProperties = {
-    padding: '12px 14px', borderRadius: '10px',
-    background: 'rgba(248,113,113,0.06)', border: '1px solid rgba(248,113,113,0.18)',
-};

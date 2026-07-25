@@ -2,56 +2,58 @@
 import React from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
+import {
+    Anchor, BookOpen, Search, Network, ListTree, Share2, ShieldCheck, MessageSquareText, Upload,
+} from 'lucide-react';
+import { cn } from '@/lib/utils';
 
 const NAV_ITEMS = [
-    { href: '/wiki', label: '知识库', icon: '📚' },
-    { href: '/search', label: '检索', icon: '🔍' },
-    { href: '/graph', label: '知识图谱', icon: '🕸️' },
-    { href: '/ontology', label: '本体', icon: '🌳' },
-    { href: '/entity-graph', label: '实体', icon: '🔗' },
-    { href: '/consistency', label: '稽核', icon: '🛡️' },
-    { href: '/qa', label: '问答', icon: '🧠' },
-    { href: '/upload', label: '上传', icon: '⬆️' },
+    { href: '/wiki', label: '知识库', icon: BookOpen },
+    { href: '/search', label: '检索', icon: Search },
+    { href: '/graph', label: '知识图谱', icon: Network },
+    { href: '/ontology', label: '本体', icon: ListTree },
+    { href: '/entity-graph', label: '实体', icon: Share2 },
+    { href: '/consistency', label: '稽核', icon: ShieldCheck },
+    { href: '/qa', label: '问答', icon: MessageSquareText },
+    { href: '/upload', label: '上传', icon: Upload },
 ] as const;
 
 export default function NavBar() {
     const pathname = usePathname();
 
     return (
-        <header className="nav-glass" style={{
-            position: 'fixed', top: 0, left: 0, right: 0, zIndex: 200,
-            height: '56px'
-        }}>
-            <nav style={{
-                maxWidth: '1100px', margin: '0 auto',
-                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                padding: '0 24px', height: '100%'
-            }}>
-                {/* Logo */}
-                <Link href="/wiki" style={{ textDecoration: 'none', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                    <span className="gradient-text" style={{ fontSize: '17px', fontWeight: 700, letterSpacing: '-0.3px' }}>
-                        KnowledgeBase
+        <header className="nav-glass fixed inset-x-0 top-0 z-[200] h-14">
+            <nav className="mx-auto flex h-full max-w-6xl items-center justify-between gap-4 px-4 sm:px-6">
+                {/* 品牌 lockup:港口域 Anchor 标识 + 统一品牌名(消除 KnowledgeBase/PortGPT 漂移) */}
+                <Link href="/wiki" className="flex shrink-0 items-center gap-2 no-underline">
+                    <span className="flex h-7 w-7 items-center justify-center rounded-md bg-accent text-white shadow-xs">
+                        <Anchor size={15} strokeWidth={2.5} />
                     </span>
-                    <span style={{ fontSize: '10px', color: 'var(--text-muted)', fontFamily: 'monospace' }}>v2.0</span>
+                    <span className="hidden text-[16px] font-bold tracking-tight text-ink xs:inline sm:inline">
+                        智能知识库
+                    </span>
+                    <span className="font-mono text-[10px] font-medium text-ink-3">港口</span>
                 </Link>
 
-                {/* Nav links */}
-                <div style={{ display: 'flex', gap: '4px' }}>
-                    {NAV_ITEMS.map(({ href, label, icon }) => {
+                {/* 导航链接:窄屏仅图标,md+ 图标+文字 */}
+                <div className="flex items-center gap-0.5 overflow-x-auto">
+                    {NAV_ITEMS.map(({ href, label, icon: Icon }) => {
                         const isActive = pathname === href || pathname.startsWith(href + '/');
                         return (
-                            <Link key={href} href={href} style={{
-                                textDecoration: 'none',
-                                display: 'flex', alignItems: 'center', gap: '5px',
-                                padding: '6px 14px', borderRadius: '10px',
-                                fontSize: '13px', fontWeight: 500,
-                                transition: 'all 0.15s',
-                                background: isActive ? 'rgba(255,255,255,0.10)' : 'transparent',
-                                color: isActive ? '#f0f0f5' : 'rgba(240,240,245,0.45)',
-                                border: isActive ? '1px solid rgba(255,255,255,0.12)' : '1px solid transparent',
-                            }}>
-                                <span>{icon}</span>
-                                {label}
+                            <Link
+                                key={href}
+                                href={href}
+                                title={label}
+                                aria-current={isActive ? 'page' : undefined}
+                                className={cn(
+                                    'flex shrink-0 items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[13px] font-medium transition-colors sm:px-3',
+                                    isActive
+                                        ? 'bg-accent-soft text-accent-ink'
+                                        : 'text-ink-2 hover:bg-hover hover:text-ink',
+                                )}
+                            >
+                                <Icon size={16} strokeWidth={2} />
+                                <span className="hidden md:inline">{label}</span>
                             </Link>
                         );
                     })}

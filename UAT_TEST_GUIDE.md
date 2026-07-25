@@ -1,86 +1,85 @@
-# Karpathy-Style 知识库系统：自动化测试与 UAT 验收指南
+# 知识库系统:自动化测试与 UAT 验收指南
 
-本文档旨在为开发人员、测试人员及最终用户说明如何启动、运行和验证该知识库系统的各项能力。整个系统的构建严格遵照了 TDD (测试驱动开发) 理念，并在真实领域数据上通过了 UAT 验收。
+> 本文档区分四层测试与各自的证据要求。所有声称都以新鲜运行为准(无 mock 伪装、无弱化断言)。
+> 个人知识工作者端到端 UAT 见文末"四、隔离真实栈 UAT"。
 
-## 一、 测试启动说明 🚀
+## 0. 环境准备
 
-### 1. 基础环境准备
-确保您已正确安装 Python 3.10+，并已安装所需的核心包及测试支持库。
 ```bash
-# 进入项目根目录
 cd d:\administrator\Desktop\大模型产品化\知识库研究
-
-# 安装生产与测试依赖
-pip install -r requirements.txt
-pip install pytest
+pip install -r requirements.txt          # 生产 + 测试依赖
 ```
 
-### 2. 环境变量配置
-系统的 TDD 测试框架（`pytest`）使用Mock技术完全离线运行，**无需** API Key 即可进行单元测试。
-但在进行真实调用（如下文的 UAT 测试）时，根目录下必须具有合法的 `.env` 文件：
-```ini
-OPENAI_API_KEY=sk-xxxxxx
-# 使用阿里百炼时的自定义地址
-OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+- Python 解释器:**`D:\ProgramData\anaconda3\python.exe`**(不要依赖 PATH 上的 `python`——Windows 会解析到 WindowsApps 桩并报 "Python was not found")。
+- 离线单测**无需** API Key;真实栈 UAT 需根目录 `.env`(见 `.env.example`):
+  ```ini
+  OPENAI_API_KEY=sk-...
+  OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+  COMPILE_MODEL=qwen-plus   # ONTOLOGY_MODEL / RELATE_MODEL / SEARCH_MODEL 同
+  ```
+- 生产 CORS / 部署密钥由运维单独配置;本地 dev 允许 3000/3001 两个回环端口(见 `api/main.py`)。
 
-COMPILE_MODEL=qwen3.6-plus
-ONTOLOGY_MODEL=qwen3.6-plus
-RELATE_MODEL=qwen3.6-plus
-SEARCH_MODEL=qwen3.6-plus
-```
+## 一、离线单测(pytest)— 确定性逻辑
 
-### 3. 运行 TDD 自动化单元测试
-我们的 `tests/` 目录中共有 4 个主要测试模块，全面覆盖核心脚本逻辑（共 67 个 Test Cases）。
 ```bash
-# 运行完整的自动化测试栈，并输出详细信息
 D:\ProgramData\anaconda3\python.exe -m pytest tests/ -v
 ```
-> **测试沙盒保护机制**：`conftest.py` 配置了自动目录注入，测试框架将在 `tmp_path` 下自动构建虚拟文件树（临时隔离的 `wiki/`, `meta/`, `raw/` 等目录），**完全不会**影响或污染生产知识库数据，请放心运行。
 
----
+- 覆盖 ingest/compile/search/relate/consistency/doc_admin 与 `api/main.py` 契约。
+- LLM 全 mock,无网络、无 Key。`tests/conftest.py` 把每个引擎的路径常量 + 全局 logger 重定向到 `tmp_path`,**绝不污染真实 `raw/`、`wiki/`、`meta/`、`originals/`**。
+- 预期:**241 passed**(基线 235 + Task 1 审计隔离守卫 1 + Task 6 上传/目录契约 5)。
 
-## 二、 UAT 用户验收测试用例 📋
+## 二、前端单测(Jest)
 
-在真实环境/生产环境中，我们可以通过下列 UAT 黑盒测试用例来验证项目四大核心模块能否跑通。系统已预先在 `originals/` 中内置了三份完整的真实场景文档用于测试校验。
+```bash
+cd frontend && npm test -- --runInBand
+```
 
-### UAT-01: 多格式文档的解析与摄入 (Ingest)
-*   **测试目的**：验证系统能否将任意排版风格的非结构化文件标准化摄入。
-*   **前置条件**：`originals/` 目录中已放置测试文件 `01_port_auto_spec.md`。
-*   **执行步骤**：
-    1. 运行命令 `D:\ProgramData\anaconda3\python.exe scripts/ingest.py`。
-*   **预期结果**：
-    *   在控制台输出“处理文件: 01_port_auto_spec.md，成功摄入”。
-    *   `raw/` 目录下新增对应 SHA256 唯一生成的文档 `.txt` 文件与对应的 `.meta.yaml`。
-    *   `meta.yaml` 状态初始化为 `status: raw`。
+- 预期:**99 passed**,无 `Unknown option` 配置告警(`setupFilesAfterEnv`)。
 
-### UAT-02: LLM 无向量编译与知识提取 (Compile)
-*   **测试目的**：验证 LLM Agent 能否充当“编译器”，基于全文生成高密度摘要并识别本体节点。
-*   **前置条件**：前序 UAT-01 执行成功，且 `.env` 配置合法。
-*   **执行步骤**：
-    1. 运行命令 `D:\ProgramData\anaconda3\python.exe scripts/compile.py`。
-*   **预期结果**：
-    *   根据文档内容生成 `xxx.summary.yaml`。
-    *   LLM 成功抽取出强业务语义的关键词（如 `5G技术`、`控制信令延迟` 等）并写入 `xxx.ontology.yaml`。
-    *   全局文件 `wiki/index.yaml` 以及 `meta/ontology/global_ontology.yaml` 更新。
-    *   该文档的 `.meta.yaml` 状态自动流转为 `compiled`。
+## 三、Mocked UI E2E(Playwright,快速 UI 回归)
 
-### UAT-03: 三层渐进式降维检索体验 (Search)
-*   **测试目的**：验证无向量环境下的 "Context Stuffing" 长下文直接检索与引用溯源能力。
-*   **前置条件**：至少三份文档已被成功 Compile。
-*   **执行步骤**：
-    1. 执行命令 `D:\ProgramData\anaconda3\python.exe scripts/search.py "岸桥 远控 网络 延迟"`。
-*   **预期结果**：
-    *   **Layer 1**：基于 BM25 的标点/空格分词，快速筛选出候选文档（耗时应极短）。
-    *   **Layer 2**：LLM 对候选集进行去伪存真，精准剔除仅有字面匹配但上下文无关的文档。
-    *   **Layer 3**：LLM 通过直接读取 Layer 2 中胜出文档的 Raw Text，推理生成最终答案，并在答案末尾带有严格的 Markdown 格式引用（格式：`[文档标题 · 章节]`）。
+```bash
+cd frontend && npm run test:e2e
+```
 
-### UAT-04: 全局语义知识关联与重组 (Relate)
-*   **测试目的**：验证系统的跨文本推荐以及图谱边建立的功能。
-*   **前置条件**：多份知识重叠的文档均被成功 Compile。
-*   **执行步骤**：
-    1. 执行命令对某文档强制进行图谱关联推荐：`D:\ProgramData\anaconda3\python.exe scripts/relate.py --recommend <特定doc_id>`。
-*   **预期结果**：
-    *   终端正确吐出树状关联结构。
-    *   列出关系类别（如 `同主题`，`补充说明`），并给出该关联的置信度百分比。
-    *   LLM 生成的人类可读的原因解释（如“两者均围绕港口作业展开，一侧重垂直作业，一侧重水平作业”）。
-    *   `meta/relations/knowledge_graph.yaml` 更新并长期固化该关联网络（Edges）。
+- 后端 mock 的 UI 回归(页面/交互/可视化),不启动真实 FastAPI;用于捕捉 UI 倒退。预期:既有 mocked 用例保持绿色。
+
+## 四、隔离真实栈 UAT(Playwright live)— 端到端业务证据
+
+> 这是唯一能证明"用户真实旅程跑通"的层。真实 FastAPI + 真实 Next + 真实 LLM(限量),数据落在隔离副本。
+
+```bash
+cd frontend && npm run test:e2e:live
+```
+
+### 它做什么
+
+- `tests/uat/live_server.py` 把 `api/`+`scripts/`+`raw/`+`wiki/`+`meta/`+`originals/` 复制到 `.uat/runtime/`,从副本启动真实 FastAPI(8001);Next dev 起在 3001(`NEXT_PUBLIC_API_BASE=http://127.0.0.1:8001`)。
+- 启动前对源数据 76 文件逐个 SHA-256 指纹;UAT 后 `tests/uat/verify_source_unchanged.py` 逐文件比对——**源数据零污染**是硬验收。
+- `.uat/` 为运行产物(gitignored);证据落到 `UAT测试日志/<YYYYMMDD>/evidence/`(JSON reporter、截图、source-unchanged.txt)。
+
+### 用例(八字段见 `UAT测试日志/<YYYYMMDD>/uat-matrix.md`)
+
+`personal-kb-loop.spec.ts` 串行跑一条完整链:上传→权威回执→仪表盘编译可见→多轮带引用问答→引用穿梭+实体探索→重复/非法文件诚实处理→重编译→删除清理。P0/P1 必须 100%。
+
+### LLM 成本与环境
+
+- 仅:一个短文档编译 + 一次重编译 + 两轮 QA。`compile_ingested_task` 用 `sys.executable`(anaconda)而非 PATH 上的 `python`。
+- 单 worker、0 retry,避免共享状态竞争与重复计费。
+- 外部 LLM 超时/不可用 → 标"环境未验证",**不伪造通过**(NFR: <10K 字编译 ≤60s、首问 ≤25s)。
+
+### Windows 注意
+
+- 服务器终止后 `.uat/runtime` 可能因文件句柄延迟释放而 rmtree 失败;`live_server._rmtree_robust` 已重试 6×1s。
+- Next 16 默认只允许 localhost 访问 dev 资源;`next.config.ts` 的 `allowedDevOrigins` 已放开 `127.0.0.1`。
+
+## 五、验收阈值(本轮)
+
+| 项 | 阈值 |
+|---|---|
+| pytest | 241 passed,源数据指纹不变 |
+| Jest | 99 passed,无配置告警 |
+| 链路 lint/build | touched code 0 ESLint error,`next build` exit 0 |
+| Mocked E2E | 既有用例保持绿色 |
+| Live UAT | P0/P1 100%(P2 ≥60%),源 76 文件 SHA-256 前后一致 |

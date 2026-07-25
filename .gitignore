@@ -23,6 +23,7 @@ frontend/.next/
 # ─── Test artifacts ───────────────────────────────────────
 frontend/test-results/
 .playwright-mcp/
+.uat/
 
 # ─── OS / editor ────────────────────────────────────────
 .DS_Store

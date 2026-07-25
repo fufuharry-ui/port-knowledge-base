@@ -1,6 +1,12 @@
 import { test, expect } from '@playwright/test';
 
-test.describe('PortGPT Q&A Streaming UAT', () => {
+// ⚠️ 本 spec 已冻结(skip):它面向已废弃的"图谱页内嵌问答面板"架构编写
+//    (beforeEach 去 /graph 找 chat-panel,且无 API mock,依赖真实后端)。
+//    现行架构:独立 /qa 全幅聊天页。等价且更新的覆盖见:
+//      - mocked: tests/e2e/uat.spec.ts UAT-F06(SSE mock 已与 api/main.py 真实契约对齐)
+//      - LIVE:   tests/e2e-live/personal-kb-loop.spec.ts(真实栈)
+//    保留文件仅作历史参照;如需恢复,请先按现行架构重写 mock 与页面目标。
+test.describe.skip('PortGPT Q&A Streaming UAT', () => {
     test.setTimeout(120000);
 
     test.beforeEach(async ({ page }) => {

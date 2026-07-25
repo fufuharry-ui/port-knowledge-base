@@ -5,6 +5,12 @@
  */
 'use client';
 import React, { useEffect, useState, useCallback } from 'react';
+import { ShieldCheck, RefreshCw, AlertTriangle, CheckCircle2, Clock, GitCompareArrows } from 'lucide-react';
+import { PageHeader } from '@/components/ui/PageHeader';
+import { StatTile } from '@/components/ui/StatTile';
+import { Card } from '@/components/ui/Card';
+import { Button } from '@/components/ui/Button';
+import { Skeleton, SkeletonText } from '@/components/ui/Skeleton';
 import {
     fetchConsistency, triggerConsistencyCheck, type ConsistencyReport,
 } from '@/lib/api';
@@ -50,158 +56,117 @@ export default function ConsistencyPage() {
     const candidates = report?.candidates_checked ?? 0;
 
     return (
-        <div style={{ maxWidth: '1100px', margin: '0 auto', padding: '40px 24px' }}>
-            {/* Header */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '24px' }}>
-                <span style={{ fontSize: '28px' }}>🔍</span>
-                <div style={{ flex: 1 }}>
-                    <h1 style={{
-                        fontSize: '24px', fontWeight: 700,
-                        color: 'var(--text-primary)', margin: '0 0 4px',
-                    }}>
-                        一致性稽核
-                    </h1>
-                    <p style={{ fontSize: '12px', color: 'var(--text-muted)', margin: 0 }}>
-                        跨文档矛盾检出——当多文档对同一事实有冲突论断时,提示用户甄别
-                    </p>
-                </div>
-                <button
-                    onClick={runCheck}
-                    disabled={checking}
-                    style={{
-                        padding: '10px 20px', borderRadius: '10px', border: 'none',
-                        background: checking ? 'rgba(255,255,255,0.08)' : 'var(--accent-blue)',
-                        color: '#fff', fontSize: '13px', fontWeight: 600,
-                        cursor: checking ? 'wait' : 'pointer', whiteSpace: 'nowrap',
-                    }}
-                >
-                    {checking ? '稽核中…' : '🔄 触发稽核'}
-                </button>
-            </div>
+        <div className="mx-auto max-w-5xl px-6 py-10">
+            <PageHeader
+                icon={ShieldCheck}
+                title="一致性稽核"
+                subtitle="跨文档矛盾检出——当多文档对同一事实有冲突论断时,提示用户甄别"
+                className="mb-6"
+                action={
+                    <Button onClick={runCheck} disabled={checking}>
+                        <RefreshCw size={15} className={checking ? 'spin' : undefined} />
+                        {checking ? '稽核中…' : '触发稽核'}
+                    </Button>
+                }
+            />
 
             {/* Stats */}
-            <div style={{ display: 'flex', gap: '16px', marginBottom: '20px', flexWrap: 'wrap' }}>
-                <StatCard
+            <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-3">
+                <StatTile
+                    icon={AlertTriangle}
                     label="检出矛盾"
                     value={total}
-                    tone={total > 0 ? 'red' : 'green'}
+                    tone={total > 0 ? 'danger' : 'success'}
                 />
-                <StatCard label="稽核候选对" value={candidates} tone="neutral" />
+                <StatTile icon={GitCompareArrows} label="稽核候选对" value={candidates} />
                 {report?.last_updated && (
-                    <StatCard
+                    <StatTile
+                        icon={Clock}
                         label="最后稽核"
-                        value={report.last_updated.slice(0, 16).replace('T', ' ')}
-                        tone="neutral"
+                        value={
+                            <span className="text-sm">
+                                {report.last_updated.slice(0, 16).replace('T', ' ')}
+                            </span>
+                        }
                     />
                 )}
             </div>
 
-            {loading && <Spinner />}
+            {loading && (
+                <Card className="p-6">
+                    <Skeleton className="h-5 w-48" />
+                    <SkeletonText lines={4} className="mt-4" />
+                </Card>
+            )}
 
             {error && (
-                <div style={{
-                    color: 'var(--accent-red)', fontSize: '13px', padding: '16px', borderRadius: '12px',
-                    background: 'rgba(248,113,113,0.08)', border: '1px solid rgba(248,113,113,0.20)',
-                    marginBottom: '16px',
-                }}>
+                <div
+                    role="alert"
+                    className="mb-4 rounded-lg border border-danger/25 bg-danger-soft px-4 py-3 text-[13px] text-danger-ink"
+                >
                     ⚠ {error}
                 </div>
             )}
 
             {!loading && !error && report && (
-                <div className="glass-card" style={{ padding: '20px' }}>
+                <Card className="p-5">
                     {total === 0 ? (
-                        <div data-role="consistency-clean" style={{
-                            textAlign: 'center', padding: '32px',
-                            color: 'var(--accent-green, #34d399)', fontSize: '14px',
-                        }}>
-                            ✅ 知识库内一致,未检出矛盾
+                        <div data-role="consistency-clean" className="py-8 text-center">
+                            <span className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-full bg-success-soft text-success">
+                                <CheckCircle2 size={22} strokeWidth={2} />
+                            </span>
+                            <p className="text-sm font-medium text-success-ink">
+                                知识库内一致,未检出矛盾
+                            </p>
                             {candidates > 0 && (
-                                <div style={{
-                                    fontSize: '12px', color: 'var(--text-muted)', marginTop: '8px',
-                                }}>
+                                <p className="mt-1.5 text-xs text-ink-3">
                                     (已比对 {candidates} 对候选文档)
-                                </div>
+                                </p>
                             )}
                         </div>
                     ) : (
                         <div data-role="consistency-conflicts">
-                            <div style={{
-                                color: 'var(--accent-red)', fontSize: '13px',
-                                marginBottom: '14px', fontWeight: 600,
-                            }}>
-                                ⚠️ 检出 {total} 处跨文档矛盾:
-                            </div>
-                            {contradictions.map((c, i) => (
-                                <div key={i} style={{
-                                    padding: '12px 14px', marginBottom: '10px', borderRadius: '10px',
-                                    background: 'rgba(248,113,113,0.06)',
-                                    border: '1px solid rgba(248,113,113,0.18)',
-                                }}>
-                                    <div style={{
-                                        display: 'flex', gap: '8px', alignItems: 'center',
-                                        marginBottom: '6px', flexWrap: 'wrap',
-                                    }}>
-                                        <code style={{
-                                            fontSize: '12px', color: 'var(--text-primary)',
-                                            background: 'rgba(255,255,255,0.06)', padding: '2px 6px', borderRadius: '4px',
-                                        }}>{c.doc_a}</code>
-                                        <span style={{ color: 'var(--text-muted)' }}>↔</span>
-                                        <code style={{
-                                            fontSize: '12px', color: 'var(--text-primary)',
-                                            background: 'rgba(255,255,255,0.06)', padding: '2px 6px', borderRadius: '4px',
-                                        }}>{c.doc_b}</code>
-                                        {c.confidence != null && (
-                                            <span style={{
-                                                fontSize: '11px', color: 'var(--text-muted)',
-                                                marginLeft: 'auto',
-                                            }}>
-                                                置信度 {c.confidence.toFixed(2)}
-                                            </span>
+                            <p className="mb-3.5 flex items-center gap-1.5 text-[13px] font-semibold text-danger-ink">
+                                <AlertTriangle size={14} />
+                                检出 {total} 处跨文档矛盾:
+                            </p>
+                            <div className="flex flex-col gap-2.5">
+                                {contradictions.map((c, i) => (
+                                    <div
+                                        key={i}
+                                        className="rounded-lg border border-danger/20 bg-danger-soft px-4 py-3"
+                                    >
+                                        <div className="mb-1.5 flex flex-wrap items-center gap-2">
+                                            <code className="rounded-sm border border-line bg-surface px-1.5 py-0.5 font-mono text-[11px] text-ink">
+                                                {c.doc_a}
+                                            </code>
+                                            <span className="text-ink-3">↔</span>
+                                            <code className="rounded-sm border border-line bg-surface px-1.5 py-0.5 font-mono text-[11px] text-ink">
+                                                {c.doc_b}
+                                            </code>
+                                            {c.confidence != null && (
+                                                <span className="ml-auto text-[11px] text-ink-3">
+                                                    置信度 {c.confidence.toFixed(2)}
+                                                </span>
+                                            )}
+                                        </div>
+                                        {c.conflict_point && (
+                                            <p className="mb-1 text-[13px] text-ink">
+                                                <strong className="font-semibold">冲突点:</strong> {c.conflict_point}
+                                            </p>
+                                        )}
+                                        {c.reasoning_chain && (
+                                            <p className="text-xs leading-6 text-ink-3">
+                                                {c.reasoning_chain}
+                                            </p>
                                         )}
                                     </div>
-                                    {c.conflict_point && (
-                                        <div style={{ fontSize: '13px', color: 'var(--text-primary)', marginBottom: '4px' }}>
-                                            <strong>冲突点:</strong> {c.conflict_point}
-                                        </div>
-                                    )}
-                                    {c.reasoning_chain && (
-                                        <div style={{ fontSize: '12px', color: 'var(--text-muted)', lineHeight: 1.6 }}>
-                                            {c.reasoning_chain}
-                                        </div>
-                                    )}
-                                </div>
-                            ))}
+                                ))}
+                            </div>
                         </div>
                     )}
-                </div>
+                </Card>
             )}
-        </div>
-    );
-}
-
-function StatCard({ label, value, tone }: {
-    label: string; value: React.ReactNode;
-    tone: 'red' | 'green' | 'neutral';
-}) {
-    const color = tone === 'red' ? 'var(--accent-red)'
-        : tone === 'green' ? 'var(--accent-green, #34d399)'
-        : 'var(--text-primary)';
-    return (
-        <div className="glass-card" style={{ padding: '12px 18px', minWidth: '120px' }}>
-            <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginBottom: '2px' }}>{label}</div>
-            <div style={{ fontSize: '18px', fontWeight: 600, color }}>{value}</div>
-        </div>
-    );
-}
-
-function Spinner() {
-    return (
-        <div style={{ display: 'flex', justifyContent: 'center', padding: '80px 0' }}>
-            <span className="spin" style={{
-                display: 'inline-block', width: '28px', height: '28px',
-                border: '3px solid var(--accent-blue)', borderTopColor: 'transparent', borderRadius: '50%',
-            }} />
         </div>
     );
 }

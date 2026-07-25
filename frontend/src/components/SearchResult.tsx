@@ -1,7 +1,10 @@
 'use client';
 import React from 'react';
 import Link from 'next/link';
+import ReactMarkdown from 'react-markdown';
+import { Paperclip } from 'lucide-react';
 import type { SearchSource } from '@/lib/api';
+import { Spinner } from '@/components/ui/Spinner';
 
 interface SearchResultProps {
     answer: string;
@@ -12,56 +15,42 @@ interface SearchResultProps {
 export default function SearchResult({ answer, sources, isLoading }: SearchResultProps) {
     if (!isLoading && !answer) {
         return (
-            <div data-testid="answer-empty" style={{
-                textAlign: 'center', color: 'var(--text-muted)',
-                padding: '48px 0', fontSize: '14px', lineHeight: 1.7,
-            }}>
-                在上方输入您的问题，我将从知识库中检索相关文档并给出专业回答。
-                <br />
-                <span style={{ fontSize: '12px', marginTop: '8px', display: 'block', color: 'var(--text-muted)' }}>
+            <div
+                data-testid="answer-empty"
+                className="rounded-xl border border-dashed border-line-strong bg-surface px-6 py-12 text-center"
+            >
+                <p className="text-sm leading-7 text-ink-2">
+                    在上方输入您的问题,我将从知识库中检索相关文档并给出专业回答。
+                </p>
+                <p className="mt-2 text-xs text-ink-3">
                     支持中文自然语言提问 · 三层渐进式检索 · SSE 流式输出
-                </span>
+                </p>
             </div>
         );
     }
 
     return (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+        <div className="flex flex-col gap-5">
             {/* Answer block */}
-            <div className="answer-block" style={{ padding: '24px', position: 'relative' }}>
+            <div className="answer-block relative p-6">
                 {isLoading && !answer && (
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', color: 'var(--accent-blue)' }}>
-                        <span data-testid="answer-spinner" className="spin" style={{
-                            display: 'inline-block', width: '14px', height: '14px',
-                            border: '2px solid var(--accent-blue)', borderTopColor: 'transparent', borderRadius: '50%',
-                        }} />
-                        <span style={{ fontSize: '14px' }}>正在检索知识库...</span>
+                    <div className="flex items-center gap-2.5 text-accent">
+                        <Spinner size={14} data-testid="answer-spinner" label="检索中" />
+                        <span className="text-sm">正在检索知识库…</span>
                     </div>
                 )}
 
                 {answer && (
                     <>
                         {isLoading && (
-                            <span data-testid="answer-spinner" className="spin" style={{
-                                position: 'absolute', top: '14px', right: '14px',
-                                display: 'inline-block', width: '10px', height: '10px',
-                                border: '1.5px solid var(--accent-blue)', borderTopColor: 'transparent', borderRadius: '50%',
-                            }} />
+                            <span className="absolute right-3.5 top-3.5">
+                                <Spinner size={10} data-testid="answer-spinner" label="生成中" />
+                            </span>
                         )}
-                        <div
-                            data-testid="answer-text"
-                            style={{
-                                fontSize: '14px', lineHeight: 1.8,
-                                color: 'var(--text-primary)',
-                                whiteSpace: 'pre-wrap',
-                            }}
-                        >
-                            {answer}
+                        <div data-testid="answer-text" className="md-body">
+                            <ReactMarkdown>{answer}</ReactMarkdown>
                             {isLoading && (
-                                <span className="cursor-blink" style={{
-                                    display: 'inline-block', width: '2px', height: '16px',
-                                    background: 'var(--accent-blue)', marginLeft: '2px', verticalAlign: 'middle',
-                                }} />
+                                <span className="cursor-blink ml-0.5 inline-block h-4 w-0.5 bg-accent align-middle" />
                             )}
                         </div>
                     </>
@@ -70,25 +59,25 @@ export default function SearchResult({ answer, sources, isLoading }: SearchResul
 
             {/* Sources */}
             {sources.length > 0 && (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                    <div style={{ fontSize: '11px', color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: '5px' }}>
-                        <span>📎</span> 引用来源
+                <div className="flex flex-col gap-2">
+                    <div className="flex items-center gap-1.5 text-[11px] font-medium text-ink-3">
+                        <Paperclip size={12} />
+                        引用来源
                     </div>
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                    <div className="flex flex-wrap gap-2">
                         {sources.map(src => (
                             <Link
                                 key={src.doc_id}
                                 href={`/wiki/${src.doc_id}`}
                                 data-testid={`source-badge-${src.doc_id}`}
-                                className="source-badge"
-                                style={{ textDecoration: 'none', cursor: 'pointer' }}
+                                className="source-badge no-underline"
                                 title={`查看《${src.title ?? src.doc_id}》文档详情`}
                             >
-                                <span style={{ fontFamily: 'monospace', fontSize: '10px', color: '#60a5fa' }}>{src.doc_id}</span>
+                                <span className="font-mono text-[10px] text-accent-ink">{src.doc_id}</span>
                                 {src.title && (
                                     <>
-                                        <span style={{ color: 'var(--text-muted)' }}>·</span>
-                                        <span style={{ maxWidth: '160px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                        <span className="text-ink-3">·</span>
+                                        <span className="max-w-[180px] overflow-hidden text-ellipsis whitespace-nowrap">
                                             {src.title}
                                         </span>
                                     </>

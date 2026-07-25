@@ -1,9 +1,20 @@
 'use client';
 import React, { useEffect, useState } from 'react';
+import Link from 'next/link';
+import { useRouter } from 'next/navigation';
+import { BookOpen, Upload, FileText, CheckCircle2, Clock } from 'lucide-react';
 import WikiCard from '@/components/WikiCard';
+import { PageHeader } from '@/components/ui/PageHeader';
+import { StatTile } from '@/components/ui/StatTile';
+import { EmptyState } from '@/components/ui/EmptyState';
+import { Button } from '@/components/ui/Button';
+import { Skeleton } from '@/components/ui/Skeleton';
+import { useToast } from '@/components/ui/Toast';
 import { fetchWikiIndex, deleteDoc, recompileDoc, type DocMeta } from '@/lib/api';
 
 export default function WikiPage() {
+    const router = useRouter();
+    const toast = useToast();
     const [docs, setDocs] = useState<DocMeta[]>([]);
     const [total, setTotal] = useState(0);
     const [loading, setLoading] = useState(true);
@@ -17,7 +28,6 @@ export default function WikiPage() {
     }, []);
 
     // Loop #11: 任一文档编译中时,每 10s 轮询刷新;全部编译完自动停止。
-    // 解决:上传后用户需手动反复刷新才知道编译完成。
     const hasPending = docs.some(d => d.status === 'raw' || d.status === 'compiling');
     useEffect(() => {
         if (!hasPending) return;
@@ -30,107 +40,102 @@ export default function WikiPage() {
     }, [hasPending]);
 
     const compiled = docs.filter(d => d.status === 'compiled').length;
+    const pendingCount = docs.filter(d => d.status === 'raw' || d.status === 'compiling').length;
 
     return (
-        <div style={{ maxWidth: '1100px', margin: '0 auto', padding: '40px 24px' }}>
-            {/* Header */}
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '36px' }}>
-                <div>
-                    <h1 style={{ fontSize: '26px', fontWeight: 700, color: 'var(--text-primary)', margin: '0 0 6px' }}>
-                        知识库仪表盘
-                    </h1>
-                    <p style={{ fontSize: '13px', color: 'var(--text-muted)', margin: 0 }}>
-                        零向量数据库 · Context Stuffing 检索引擎
-                    </p>
-                    {hasPending && (
-                        <p data-testid="compiling-hint" style={{
-                            fontSize: '12px', color: 'var(--accent-amber)', margin: '6px 0 0',
-                            display: 'flex', alignItems: 'center', gap: '6px',
-                        }}>
-                            <span className="spin" style={{
-                                display: 'inline-block', width: '10px', height: '10px',
-                                border: '1.5px solid var(--accent-amber)', borderTopColor: 'transparent',
-                                borderRadius: '50%',
-                            }} />
-                            有文档编译中,每 10 秒自动刷新…
-                        </p>
-                    )}
-                </div>
-                <div style={{ display: 'flex', gap: '32px', textAlign: 'right' }}>
-                    <div>
-                        <p data-testid="doc-count" style={{ fontSize: '28px', fontWeight: 700, color: 'var(--text-primary)', margin: 0 }}>{total}</p>
-                        <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: 0 }}>文档总数</p>
-                    </div>
-                    <div>
-                        <p style={{ fontSize: '28px', fontWeight: 700, color: 'var(--accent-green)', margin: 0 }}>{compiled}</p>
-                        <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: 0 }}>已编译</p>
-                    </div>
-                </div>
+        <div className="mx-auto max-w-6xl px-6 py-10">
+            <PageHeader
+                icon={BookOpen}
+                title="知识库仪表盘"
+                subtitle="零向量数据库 · Context Stuffing 检索引擎"
+                action={
+                    <Link href="/upload">
+                        <Button><Upload size={16} />上传文档</Button>
+                    </Link>
+                }
+            />
+
+            {/* 编译中提示(保留 testid) */}
+            {hasPending && (
+                <p data-testid="compiling-hint" className="mt-3 flex items-center gap-2 text-[13px] font-medium text-warning-ink">
+                    <span className="spin inline-block h-3 w-3 rounded-full border-2 border-warning border-t-transparent" />
+                    有文档编译中,每 10 秒自动刷新…
+                </p>
+            )}
+
+            {/* 统计瓦片(替代裸文本统计;保留 doc-count testid) */}
+            <div className="mt-6 grid grid-cols-2 gap-3 sm:grid-cols-3">
+                <StatTile icon={FileText} label="文档总数" value={<span data-testid="doc-count">{total}</span>} />
+                <StatTile icon={CheckCircle2} label="已编译" value={compiled} tone="success" />
+                <StatTile icon={Clock} label="编译中 / 待编译" value={pendingCount} tone={pendingCount > 0 ? 'warning' : 'default'} />
             </div>
 
-            {/* Loading */}
+            {/* 加载:骨架屏(替代裸 spinner) */}
             {loading && (
-                <div style={{ display: 'flex', justifyContent: 'center', padding: '80px 0' }}>
-                    <span className="spin" style={{
-                        display: 'inline-block', width: '28px', height: '28px',
-                        border: '3px solid var(--accent-blue)', borderTopColor: 'transparent', borderRadius: '50%',
-                    }} />
+                <div className="mt-8 grid grid-cols-[repeat(auto-fill,minmax(300px,1fr))] gap-4">
+                    {Array.from({ length: 6 }).map((_, i) => (
+                        <div key={i} className="rounded-lg border border-line bg-surface p-4 shadow-card">
+                            <Skeleton className="h-5 w-20 rounded-full" />
+                            <Skeleton className="mt-3 h-4 w-3/4" />
+                            <Skeleton className="mt-2 h-3 w-full" />
+                            <Skeleton className="mt-1.5 h-3 w-5/6" />
+                        </div>
+                    ))}
                 </div>
             )}
 
-            {/* Error */}
+            {/* 错误 */}
             {error && (
-                <div style={{
-                    color: 'var(--accent-red)', fontSize: '13px', padding: '16px', borderRadius: '12px',
-                    background: 'rgba(248,113,113,0.08)', border: '1px solid rgba(248,113,113,0.20)',
-                }}>
-                    ⚠ 加载失败：{error}
+                <div role="alert" className="mt-6 rounded-lg border border-danger/25 bg-danger-soft px-4 py-3 text-[13px] text-danger-ink">
+                    ⚠ 加载失败:{error}
                 </div>
             )}
 
-            {/* Empty */}
+            {/* 空态(保留 testid;带引导) */}
             {!loading && !error && docs.length === 0 && (
-                <div data-testid="empty-state" style={{
-                    display: 'flex', flexDirection: 'column', alignItems: 'center',
-                    justifyContent: 'center', padding: '80px 0',
-                    color: 'var(--text-muted)', gap: '12px',
-                }}>
-                    <span style={{ fontSize: '48px' }}>🗄️</span>
-                    <p style={{ fontSize: '13px', margin: 0 }}>暂无文档，请上传第一份文件开始构建知识库</p>
+                <div className="mt-8" data-testid="empty-state">
+                    <EmptyState
+                        icon={FileText}
+                        title="暂无文档"
+                        description="上传第一份文件,开始构建你的港口智慧化知识库。"
+                        action={
+                            <Link href="/upload">
+                                <Button><Upload size={16} />去上传</Button>
+                            </Link>
+                        }
+                    />
                 </div>
             )}
 
-            {/* Grid */}
+            {/* 卡片网格(挂载错落) */}
             {!loading && docs.length > 0 && (
-                <div style={{
-                    display: 'grid',
-                    gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))',
-                    gap: '16px',
-                }}>
-                    {docs.map(doc => (
-                        <WikiCard
-                            key={doc.id}
-                            doc={doc}
-                            onExpand={id => window.location.assign(`/wiki/${id}`)}
-                            onDelete={async id => {
-                                try {
-                                    await deleteDoc(id);
-                                    setDocs(ds => ds.filter(d => d.id !== id));
-                                    setTotal(t => Math.max(0, t - 1));
-                                } catch (e) {
-                                    alert(`删除失败: ${e instanceof Error ? e.message : e}`);
-                                }
-                            }}
-                            onRecompile={async id => {
-                                try {
-                                    await recompileDoc(id);
-                                    // 状态先标 compiling(后台编译中),稍后刷新
-                                    setDocs(ds => ds.map(d => d.id === id ? { ...d, status: 'compiling' } : d));
-                                } catch (e) {
-                                    alert(`重编译失败: ${e instanceof Error ? e.message : e}`);
-                                }
-                            }}
-                        />
+                <div className="mt-8 grid grid-cols-[repeat(auto-fill,minmax(300px,1fr))] gap-4">
+                    {docs.map((doc, i) => (
+                        <div key={doc.id} className="fade-in-up" style={{ animationDelay: `${Math.min(i, 8) * 40}ms` }}>
+                            <WikiCard
+                                doc={doc}
+                                onExpand={id => router.push(`/wiki/${id}`)}
+                                onDelete={async id => {
+                                    try {
+                                        await deleteDoc(id);
+                                        setDocs(ds => ds.filter(d => d.id !== id));
+                                        setTotal(t => Math.max(0, t - 1));
+                                        toast.push('文档已删除', 'success');
+                                    } catch (e) {
+                                        toast.push(`删除失败: ${e instanceof Error ? e.message : e}`, 'error');
+                                    }
+                                }}
+                                onRecompile={async id => {
+                                    try {
+                                        await recompileDoc(id);
+                                        setDocs(ds => ds.map(d => d.id === id ? { ...d, status: 'compiling' } : d));
+                                        toast.push('已触发重编译,稍候自动刷新', 'info');
+                                    } catch (e) {
+                                        toast.push(`重编译失败: ${e instanceof Error ? e.message : e}`, 'error');
+                                    }
+                                }}
+                            />
+                        </div>
                     ))}
                 </div>
             )}

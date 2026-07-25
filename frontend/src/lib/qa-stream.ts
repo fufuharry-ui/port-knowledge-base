@@ -62,16 +62,20 @@ export interface ChatTurn {
 /**
  * streamQA — 向后端发起 POST /api/v1/qa，返回 QAEvent 异步可迭代对象
  * Big-Loop #8: history 携带多轮对话,让后端解析追问代词。默认空(单轮,向后兼容)。
+ * Phase 3: signal 支持中途取消(停止生成按钮)。abort 时 fetch/reader 抛 AbortError,
+ * 由调用方捕获并标注"已停止生成"。
  */
 export async function* streamQA(
     query: string,
     history: ChatTurn[] = [],
     apiBase = `${API_BASE}/api/v1`,
+    signal?: AbortSignal,
 ): AsyncIterable<QAEvent> {
     const response = await fetch(`${apiBase}/qa`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query, history }),
+        signal,
     });
 
     if (!response.ok || !response.body) {

@@ -67,6 +67,13 @@ def patch_ingest_paths(project_dir, monkeypatch):
     monkeypatch.setattr(mod, "ORIGINALS_DIR", project_dir / "originals")
     monkeypatch.setattr(mod, "WIKI_DIR", project_dir / "wiki")
     monkeypatch.setattr(mod, "INDEX_FILE", project_dir / "wiki" / "index.yaml")
+    # UAT Big-Loop: ingest_file() 内 `from scripts.logger import global_logger`
+    # 在调用时解析模块属性;global_logger 用相对路径 "wiki/log.md"(按 CWD 解析)。
+    # 若不隔离,测试的审计会写到真实仓库 wiki/log.md。按调用时解析语义,
+    # patch 模块属性即可让 ingest_file 拿到 sandbox logger。
+    import scripts.logger as logger_mod
+    sandbox_logger = logger_mod.ActivityLogger(project_dir / "wiki")
+    monkeypatch.setattr(logger_mod, "global_logger", sandbox_logger)
     return mod
 
 

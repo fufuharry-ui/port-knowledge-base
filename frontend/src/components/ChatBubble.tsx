@@ -1,8 +1,11 @@
 'use client';
 import React from 'react';
 import Link from 'next/link';
+import ReactMarkdown from 'react-markdown';
 import * as Tooltip from '@radix-ui/react-tooltip';
+import { FileText } from 'lucide-react';
 import type { CitationMeta } from '@/lib/qa-stream';
+import { cn } from '@/lib/utils';
 
 interface ChatBubbleProps {
     role: 'user' | 'assistant';
@@ -11,161 +14,127 @@ interface ChatBubbleProps {
 }
 
 /**
- * 将内容按 [N] 引用标记切分为「文本段」和「引用标记」交替数组
+ * linkifyCitations — 把正文中的引用标记改写为 markdown 链接,交给 react-markdown
+ * 渲染,再由 components.a 拦截 `#cite-<doc_id>` 还原为可交互的引用 Tooltip。
+ * 支持两种引用格式(与 Big-Loop #1 修复一致,逻辑未变,仅输出形式改为链接):
+ *  1) [N] 数字引用(后端 citations 的 ref,如 "[1]")
+ *  2) [标题 · 章节] 引用 — layer3 prompt(scripts/search.py,冻结)约定的格式。
+ * 链接 label 保留原始标记文本(如 "[1]"),利用 CommonMark 平衡括号规则:
+ * "[[1]](#cite-doc_001)" 的 label 即 "[1]"。
  */
-function parseContentWithCitations(
-    content: string,
-    citations: CitationMeta[],
-): Array<{ type: 'text'; value: string } | { type: 'citation'; meta: CitationMeta; ref: string }> {
-    const citationMap = new Map(citations.map(c => [c.ref, c]));
-    // 匹配 [1] [2] ... [99]
-    const parts = content.split(/(\[\d+\])/);
+export function linkifyCitations(content: string, citations: CitationMeta[]): string {
+    const byRef = new Map(citations.map(c => [c.ref, c]));
+    const byTitle = new Map(citations.filter(c => c.title).map(c => [c.title!, c] as const));
+    const parts = content.split(/(\[[^\]]+?\s*·\s*[^\]]+\]|\[\d+\])/);
     return parts.map(part => {
-        if (citationMap.has(part)) {
-            return { type: 'citation' as const, meta: citationMap.get(part)!, ref: part };
+        let meta: CitationMeta | undefined = byRef.get(part);
+        if (!meta) {
+            const m = part.match(/^\[([^\]]+?)\s*·\s*[^\]]+\]$/);
+            if (m) meta = byTitle.get(m[1].trim()) ?? byRef.get(m[0]);
         }
-        return { type: 'text' as const, value: part };
-    });
+        if (meta) {
+            // label 保留原标记(含外层方括号 → 双层括号,CommonMark 平衡括号合法)
+            return `[${part}](#cite-${meta.doc_id})`;
+        }
+        return part;
+    }).join('');
+}
+
+/** 引用标记:sup 触发器 + 浅色 Tooltip(来源标题/章节/doc_id + 穿梭链接) */
+function CitationTrigger({ meta, refText }: { meta: CitationMeta; refText: string }) {
+    return (
+        <Tooltip.Root>
+            <Tooltip.Trigger asChild>
+                <sup
+                    data-testid="citation-trigger"
+                    className="ml-0.5 inline-block cursor-pointer select-none rounded-sm border border-accent/25 bg-accent-soft px-1 py-px align-super text-[11px] font-semibold leading-4 text-accent-ink transition-colors hover:bg-accent/15"
+                >
+                    {refText}
+                </sup>
+            </Tooltip.Trigger>
+            <Tooltip.Portal>
+                <Tooltip.Content
+                    side="top"
+                    sideOffset={6}
+                    className="z-[9999] max-w-[300px] rounded-lg border border-line bg-surface px-3.5 py-2.5 shadow-lg"
+                >
+                    <div className="flex items-center gap-1.5 text-[12px] font-semibold text-ink">
+                        <FileText size={12} className="shrink-0 text-accent" />
+                        {meta.title ?? meta.doc_id}
+                    </div>
+                    {meta.section && (
+                        <div className="mt-0.5 text-[11px] text-ink-3">§ {meta.section}</div>
+                    )}
+                    <div className="mt-1 font-mono text-[10px] text-ink-3">{meta.doc_id}</div>
+                    <Link
+                        href={`/wiki/${meta.doc_id}`}
+                        data-testid={`citation-link-${meta.doc_id}`}
+                        className="mt-2 block border-t border-line pt-1.5 text-[11px] font-medium text-accent no-underline hover:underline"
+                    >
+                        查看文档详情 →
+                    </Link>
+                    <Tooltip.Arrow className="fill-line" />
+                </Tooltip.Content>
+            </Tooltip.Portal>
+        </Tooltip.Root>
+    );
 }
 
 export default function ChatBubble({ role, content, citations }: ChatBubbleProps) {
     const isUser = role === 'user';
-    const segments = parseContentWithCitations(content, citations);
+    const byId = new Map(citations.map(c => [c.doc_id, c]));
 
     return (
         <div
             data-testid="chat-bubble"
             data-role={role}
-            style={{
-                display: 'flex',
-                flexDirection: 'column',
-                alignItems: isUser ? 'flex-end' : 'flex-start',
-                marginBottom: '16px',
-            }}
+            className={cn('mb-4 flex flex-col fade-in-up', isUser ? 'items-end' : 'items-start')}
         >
             {/* Role label */}
-            <span style={{
-                fontSize: '10px',
-                color: 'var(--text-muted)',
-                marginBottom: '4px',
-                fontFamily: 'var(--font-mono, monospace)',
-                textTransform: 'uppercase',
-                letterSpacing: '0.1em',
-            }}>
-                {isUser ? '你' : 'PortGPT'}
+            <span className="mb-1 font-mono text-[10px] uppercase tracking-[0.1em] text-ink-3">
+                {isUser ? '你' : '智能知识库'}
             </span>
 
             {/* Bubble */}
-            <div style={{
-                maxWidth: '82%',
-                padding: '12px 16px',
-                borderRadius: isUser ? '16px 4px 16px 16px' : '4px 16px 16px 16px',
-                background: isUser
-                    ? 'linear-gradient(135deg, rgba(59,130,246,0.25), rgba(139,92,246,0.20))'
-                    : 'rgba(255,255,255,0.04)',
-                border: `1px solid ${isUser
-                    ? 'rgba(59,130,246,0.30)'
-                    : 'rgba(255,255,255,0.08)'}`,
-                fontSize: '14px',
-                lineHeight: '1.7',
-                color: 'var(--text-primary)',
-                backdropFilter: 'blur(8px)',
-                transition: 'all 0.2s ease',
-            }}>
-                <Tooltip.Provider delayDuration={200}>
-                    {segments.map((seg, i) => {
-                        if (seg.type === 'text') {
-                            return (
-                                <span key={`text-${i}`} style={{ whiteSpace: 'pre-wrap' }}>
-                                    {seg.value}
-                                </span>
-                            );
-                        }
-                        // Citation marker with tooltip
-                        return (
-                            <Tooltip.Root key={`citation-${i}`}>
-                                <Tooltip.Trigger asChild>
-                                    <sup
-                                        data-testid="citation-trigger"
-                                        style={{
-                                            display: 'inline-block',
-                                            padding: '0 4px',
-                                            marginLeft: '1px',
-                                            fontSize: '11px',
-                                            fontWeight: 600,
-                                            color: '#60a5fa',
-                                            background: 'rgba(59,130,246,0.15)',
-                                            borderRadius: '4px',
-                                            border: '1px solid rgba(59,130,246,0.25)',
-                                            cursor: 'pointer',
-                                            userSelect: 'none',
-                                            transition: 'background 0.15s',
-                                        }}
-                                    >
-                                        {seg.ref}
-                                    </sup>
-                                </Tooltip.Trigger>
-                                <Tooltip.Portal>
-                                    <Tooltip.Content
-                                        side="top"
-                                        sideOffset={6}
-                                        style={{
-                                            background: 'rgba(10,10,18,0.96)',
-                                            border: '1px solid rgba(255,255,255,0.12)',
-                                            borderRadius: '10px',
-                                            padding: '10px 14px',
-                                            maxWidth: '280px',
-                                            backdropFilter: 'blur(16px)',
-                                            boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
-                                            zIndex: 9999,
-                                        }}
-                                    >
-                                        <div style={{
-                                            fontSize: '12px',
-                                            fontWeight: 600,
-                                            color: '#93c5fd',
-                                            marginBottom: '4px',
-                                        }}>
-                                            📄 {seg.meta.title ?? seg.meta.doc_id}
-                                        </div>
-                                        {seg.meta.section && (
-                                            <div style={{
-                                                fontSize: '11px',
-                                                color: 'var(--text-muted)',
-                                            }}>
-                                                § {seg.meta.section}
-                                            </div>
-                                        )}
-                                        <div style={{
-                                            fontSize: '10px',
-                                            color: 'rgba(255,255,255,0.3)',
-                                            marginTop: '4px',
-                                            fontFamily: 'monospace',
-                                        }}>
-                                            {seg.meta.doc_id}
-                                        </div>
-                                        <Link
-                                            href={`/wiki/${seg.meta.doc_id}`}
-                                            data-testid={`citation-link-${seg.meta.doc_id}`}
-                                            style={{
-                                                display: 'block',
-                                                marginTop: '8px',
-                                                fontSize: '11px',
-                                                color: '#93c5fd',
-                                                textDecoration: 'none',
-                                                borderTop: '1px solid rgba(255,255,255,0.08)',
-                                                paddingTop: '6px',
-                                            }}
-                                        >
-                                            查看文档详情 →
-                                        </Link>
-                                        <Tooltip.Arrow style={{ fill: 'rgba(255,255,255,0.12)' }} />
-                                    </Tooltip.Content>
-                                </Tooltip.Portal>
-                            </Tooltip.Root>
-                        );
-                    })}
-                </Tooltip.Provider>
+            <div
+                className={cn(
+                    'max-w-[85%] rounded-xl px-4 py-3 text-sm leading-7',
+                    isUser
+                        ? 'rounded-br-sm bg-accent text-white shadow-xs'
+                        : 'rounded-bl-sm border border-line bg-surface text-ink shadow-xs',
+                )}
+            >
+                {isUser ? (
+                    <span className="whitespace-pre-wrap">{content}</span>
+                ) : (
+                    <Tooltip.Provider delayDuration={200}>
+                        <div className="md-body">
+                            <ReactMarkdown
+                                components={{
+                                    a: ({ href, children }) => {
+                                        const m = href?.match(/^#cite-(.+)$/);
+                                        const meta = m ? byId.get(m[1]) : undefined;
+                                        if (meta) {
+                                            return (
+                                                <CitationTrigger
+                                                    meta={meta}
+                                                    refText={typeof children === 'string' ? children : String(children ?? '')}
+                                                />
+                                            );
+                                        }
+                                        return (
+                                            <a href={href} target="_blank" rel="noreferrer">
+                                                {children}
+                                            </a>
+                                        );
+                                    },
+                                }}
+                            >
+                                {linkifyCitations(content, citations)}
+                            </ReactMarkdown>
+                        </div>
+                    </Tooltip.Provider>
+                )}
             </div>
         </div>
     );

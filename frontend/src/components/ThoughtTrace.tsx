@@ -12,6 +12,7 @@ interface ThoughtTraceProps {
     isStreaming: boolean;
 }
 
+/** 推理轨迹终端面板(保留终端美学:浅色界面中的深色"代码块"是有意的视觉锚点) */
 export default function ThoughtTrace({ thoughts, isStreaming }: ThoughtTraceProps) {
     const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -24,34 +25,15 @@ export default function ThoughtTrace({ thoughts, isStreaming }: ThoughtTraceProp
     return (
         <div
             data-testid="thought-trace"
-            style={{
-                margin: '8px 0 12px 0',
-                padding: '12px 16px',
-                background: 'rgba(0,0,0,0.35)',
-                border: '1px solid rgba(255,255,255,0.06)',
-                borderRadius: '12px',
-                fontFamily: 'var(--font-mono, "JetBrains Mono", "Fira Code", monospace)',
-                fontSize: '12px',
-                lineHeight: '1.8',
-                maxHeight: '160px',
-                overflowY: 'auto',
-                scrollbarWidth: 'thin',
-                scrollbarColor: 'rgba(255,255,255,0.1) transparent',
-            }}
+            className="my-2 max-h-40 overflow-y-auto rounded-lg border border-slate-700/60 bg-slate-900 px-4 py-3 font-mono text-xs leading-7 shadow-md"
         >
             {/* Terminal header bar */}
-            <div style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: '6px',
-                marginBottom: '8px',
-                opacity: 0.5,
-            }}>
-                <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#f87171' }} />
-                <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#fbbf24' }} />
-                <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#34d399' }} />
-                <span style={{ marginLeft: 6, color: 'rgba(255,255,255,0.3)', fontSize: 10 }}>
-                    portgpt — reasoning trace
+            <div className="mb-2 flex items-center gap-1.5 opacity-60">
+                <div className="h-2 w-2 rounded-full bg-red-400" />
+                <div className="h-2 w-2 rounded-full bg-amber-400" />
+                <div className="h-2 w-2 rounded-full bg-emerald-400" />
+                <span className="ml-1.5 text-[10px] text-slate-500">
+                    knowledge-base — reasoning trace
                 </span>
             </div>
 
@@ -60,18 +42,13 @@ export default function ThoughtTrace({ thoughts, isStreaming }: ThoughtTraceProp
                 <div
                     key={`${t.step}-${t.timestamp}`}
                     data-testid={`thought-step-${t.step}`}
-                    style={{
-                        display: 'flex',
-                        gap: '8px',
-                        animation: 'fadeInUp 0.3s ease both',
-                        animationDelay: `${idx * 0.05}s`,
-                        marginBottom: '2px',
-                    }}
+                    className="fade-in-up mb-0.5 flex gap-2"
+                    style={{ animationDelay: `${idx * 0.05}s` }}
                 >
-                    <span style={{ color: '#34d399', flexShrink: 0 }}>
+                    <span className="shrink-0 text-emerald-400">
                         {`[${t.step.toString().padStart(2, '0')}]`}
                     </span>
-                    <span style={{ color: 'rgba(240,240,245,0.75)', wordBreak: 'break-all' }}>
+                    <span className="break-all text-slate-300">
                         {t.message}
                     </span>
                 </div>
@@ -79,31 +56,13 @@ export default function ThoughtTrace({ thoughts, isStreaming }: ThoughtTraceProp
 
             {/* Blinking cursor while streaming */}
             {isStreaming && (
-                <div style={{ display: 'flex', gap: '8px', marginBottom: '2px' }}>
-                    <span style={{ color: '#34d399' }}>{'[--]'}</span>
-                    <span style={{
-                        display: 'inline-block',
-                        width: 8,
-                        height: 14,
-                        background: '#34d399',
-                        animation: 'blink 1s step-end infinite',
-                        verticalAlign: 'middle',
-                    }} />
+                <div className="mb-0.5 flex gap-2">
+                    <span className="text-emerald-400">{'[--]'}</span>
+                    <span className="cursor-blink inline-block h-3.5 w-2 self-center bg-emerald-400" />
                 </div>
             )}
 
             <div ref={bottomRef} />
-
-            <style>{`
-                @keyframes fadeInUp {
-                    from { opacity: 0; transform: translateY(4px); }
-                    to   { opacity: 1; transform: translateY(0); }
-                }
-                @keyframes blink {
-                    0%, 100% { opacity: 1; }
-                    50%       { opacity: 0; }
-                }
-            `}</style>
         </div>
     );
 }

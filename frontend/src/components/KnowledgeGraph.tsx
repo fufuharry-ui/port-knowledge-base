@@ -1,7 +1,9 @@
 'use client';
 import React, { useMemo } from 'react';
 import ReactECharts from 'echarts-for-react';
+import { Network } from 'lucide-react';
 import type { GraphNode, GraphEdge } from '@/lib/api';
+import { EmptyState } from '@/components/ui/EmptyState';
 
 interface KnowledgeGraphProps {
     nodes: GraphNode[];
@@ -10,27 +12,42 @@ interface KnowledgeGraphProps {
     highlightIds?: string[];
 }
 
+/* 关系类型配色(浅色可读,语义对齐 design tokens) */
 const EDGE_COLORS: Record<string, string> = {
-    supplements: '#60a5fa',
-    contradicts: '#f87171',
-    same_topic: '#34d399',
-    expands: '#a78bfa',
+    supplements: '#2563eb',   // accent 蓝
+    contradicts: '#dc2626',   // danger 红
+    same_topic: '#16a34a',    // success 绿
+    expands: '#9333ea',       // 紫(扩展)
 };
 
-const HIGHLIGHT_COLOR = '#fbbf24';   // 金色高亮
-const DEFAULT_COLOR = '#3b82f6';
+const RELATION_LABELS: Record<string, string> = {
+    supplements: '补充',
+    contradicts: '矛盾',
+    same_topic: '同主题',
+    expands: '扩展',
+};
+
+const HIGHLIGHT_COLOR = '#f59e0b';  // 琥珀高亮
+const HIGHLIGHT_BORDER = '#fbbf24';
+const DEFAULT_COLOR = '#2563eb';
+const DEFAULT_BORDER = '#93c5fd';
 
 export default function KnowledgeGraph({ nodes, edges, highlightIds = [] }: KnowledgeGraphProps) {
     const highlightSet = useMemo(() => new Set(highlightIds), [highlightIds]);
     const highlightCount = nodes.filter(n => highlightSet.has(n.id)).length;
+    const relationTypes = useMemo(
+        () => [...new Set(edges.map(e => e.type))],
+        [edges],
+    );
 
     const option = useMemo(() => ({
         backgroundColor: 'transparent',
         tooltip: {
             trigger: 'item',
-            backgroundColor: 'rgba(10,10,18,0.92)',
-            borderColor: 'rgba(255,255,255,0.10)',
-            textStyle: { color: '#f0f0f5', fontSize: 12 },
+            backgroundColor: '#ffffff',
+            borderColor: '#e5e7eb',
+            textStyle: { color: '#0f172a', fontSize: 12 },
+            extraCssText: 'box-shadow: 0 4px 12px rgb(15 23 42 / 0.10); border-radius: 8px;',
         },
         series: [{
             type: 'graph',
@@ -42,13 +59,13 @@ export default function KnowledgeGraph({ nodes, edges, highlightIds = [] }: Know
                     id: n.id,
                     name: n.title ?? n.id,
                     symbolSize: isHighlighted ? 56 : 40,
-                    label: { show: true, color: '#f0f0f5', fontSize: 10, overflow: 'truncate', width: 80 },
+                    label: { show: true, color: '#475569', fontSize: 10, overflow: 'truncate', width: 80 },
                     itemStyle: {
                         color: isHighlighted ? HIGHLIGHT_COLOR : DEFAULT_COLOR,
-                        borderColor: isHighlighted ? '#fde68a' : '#60a5fa',
+                        borderColor: isHighlighted ? HIGHLIGHT_BORDER : DEFAULT_BORDER,
                         borderWidth: isHighlighted ? 3 : 2,
-                        shadowBlur: isHighlighted ? 16 : 0,
-                        shadowColor: isHighlighted ? 'rgba(251,191,36,0.6)' : 'transparent',
+                        shadowBlur: isHighlighted ? 14 : 6,
+                        shadowColor: isHighlighted ? 'rgba(245,158,11,0.45)' : 'rgba(37,99,235,0.20)',
                     },
                 };
             }),
@@ -57,8 +74,8 @@ export default function KnowledgeGraph({ nodes, edges, highlightIds = [] }: Know
                 target: e.target,
                 type: e.type,
                 confidence: e.confidence,
-                lineStyle: { color: EDGE_COLORS[e.type] ?? '#6b7280', width: 1.5, curveness: 0.15, opacity: 0.7 },
-                label: { show: true, formatter: e.type, fontSize: 9, color: EDGE_COLORS[e.type] ?? '#9ca3af' },
+                lineStyle: { color: EDGE_COLORS[e.type] ?? '#94a3b8', width: 1.5, curveness: 0.15, opacity: 0.65 },
+                label: { show: true, formatter: RELATION_LABELS[e.type] ?? e.type, fontSize: 9, color: EDGE_COLORS[e.type] ?? '#94a3b8' },
             })),
             force: { repulsion: 200, gravity: 0.1, edgeLength: [80, 200] },
             roam: true,
@@ -68,21 +85,20 @@ export default function KnowledgeGraph({ nodes, edges, highlightIds = [] }: Know
 
     if (nodes.length === 0) {
         return (
-            <div data-testid="knowledge-graph" style={{ padding: '24px' }}>
-                <div data-testid="graph-empty" style={{
-                    display: 'flex', flexDirection: 'column', alignItems: 'center',
-                    justifyContent: 'center', height: '280px',
-                    color: 'var(--text-muted)', gap: '10px',
-                }}>
-                    <span style={{ fontSize: '40px' }}>🕸️</span>
-                    <p style={{ fontSize: '13px', color: 'var(--text-muted)' }}>暂无图谱数据，请先上传并编译文档</p>
+            <div data-testid="knowledge-graph" className="p-6">
+                <div data-testid="graph-empty">
+                    <EmptyState
+                        icon={Network}
+                        title="暂无图谱数据"
+                        description="上传并编译文档后,系统将自动构建跨文档语义关联图谱。"
+                    />
                 </div>
             </div>
         );
     }
 
     return (
-        <div data-testid="knowledge-graph" style={{ position: 'relative' }}>
+        <div data-testid="knowledge-graph" className="relative">
             <ReactECharts
                 data-testid="echarts-mock"
                 data-nodes={nodes.length}
@@ -91,13 +107,23 @@ export default function KnowledgeGraph({ nodes, edges, highlightIds = [] }: Know
                 style={{ height: '520px', width: '100%' }}
                 notMerge
             />
-            {/* Stats bar */}
-            <div className="graph-legend" style={{
-                position: 'absolute', bottom: '12px', right: '12px',
-                display: 'flex', gap: '16px', fontSize: '12px', color: 'var(--text-muted)',
-            }}>
-                <span>节点: <b data-testid="node-count" style={{ color: 'var(--text-secondary)' }}>{nodes.length}</b></span>
-                <span>边: <b data-testid="edge-count" style={{ color: 'var(--text-secondary)' }}>{edges.length}</b></span>
+            {/* Stats + 关系类型图例 */}
+            <div className="graph-legend absolute bottom-3 right-3 flex items-center gap-4 text-xs text-ink-3">
+                {relationTypes.map(t => (
+                    <span key={t} className="flex items-center gap-1.5">
+                        <span
+                            className="inline-block h-2 w-2 rounded-full"
+                            style={{ background: EDGE_COLORS[t] ?? '#94a3b8' }}
+                        />
+                        {RELATION_LABELS[t] ?? t}
+                    </span>
+                ))}
+                <span className="border-l border-line pl-4">
+                    节点: <b data-testid="node-count" className="font-semibold text-ink-2">{nodes.length}</b>
+                </span>
+                <span>
+                    边: <b data-testid="edge-count" className="font-semibold text-ink-2">{edges.length}</b>
+                </span>
                 {highlightCount > 0 && (
                     <span style={{ color: HIGHLIGHT_COLOR }}>
                         高亮: <b>{highlightCount}</b>

@@ -2,6 +2,7 @@
 import React, { useState, useCallback, useRef } from 'react';
 import SearchBox from '@/components/SearchBox';
 import SearchResult from '@/components/SearchResult';
+import { Spinner } from '@/components/ui/Spinner';
 import { startStreamSearch } from '@/lib/sse';
 import type { SearchSource } from '@/lib/api';
 
@@ -33,9 +34,14 @@ export default function SearchPage() {
             onDone: () => {
                 setIsLoading(false);
                 setThought('');
-                const sourceMatches = [...fullAnswerRef.current.matchAll(/\[(doc_\w+)\]/g)];
-                if (sourceMatches.length > 0) {
-                    setSources(sourceMatches.map(m => ({ doc_id: m[1] })));
+                // 真实来源行格式(api/main.py):"📎 **来源：** `doc_id` 标题 | ...";
+                // 兼容旧 [doc_id] 标记。解析出 doc_id + 标题,供引用来源徽章穿梭。
+                const seen = new Map<string, string | undefined>();
+                for (const m of fullAnswerRef.current.matchAll(/[`[](doc_\w+)[`\]]\s*([^|\n`]*)/g)) {
+                    if (!seen.has(m[1])) seen.set(m[1], m[2].trim() || undefined);
+                }
+                if (seen.size > 0) {
+                    setSources([...seen].map(([doc_id, title]) => ({ doc_id, title })));
                 }
             },
             onError: (err) => {
@@ -48,16 +54,14 @@ export default function SearchPage() {
     }, []);
 
     return (
-        <div style={{ maxWidth: '780px', margin: '0 auto', padding: '64px 24px', display: 'flex', flexDirection: 'column', gap: '40px' }}>
-            {/* Hero */}
-            <div style={{ textAlign: 'center', display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                <div style={{ fontSize: '12px', color: 'var(--accent-blue)', fontFamily: 'monospace', letterSpacing: '2px', textTransform: 'uppercase' }}>
-                    ⚡ Knowledge Search
-                </div>
-                <h1 style={{ fontSize: '32px', fontWeight: 700, color: 'var(--text-primary)', margin: 0 }}>
-                    智能知识检索
-                </h1>
-                <p style={{ fontSize: '13px', color: 'var(--text-muted)', margin: 0 }}>
+        <div className="mx-auto flex max-w-3xl flex-col gap-9 px-6 py-14">
+            {/* Hero(居中层级:kicker / title / sub) */}
+            <div className="flex flex-col items-center gap-2.5 text-center">
+                <span className="font-mono text-[11px] font-medium uppercase tracking-[0.2em] text-accent">
+                    Knowledge Search
+                </span>
+                <h1 className="text-[32px] font-bold tracking-tight text-ink">智能知识检索</h1>
+                <p className="text-[13px] text-ink-2">
                     三层渐进式检索 · BM25 初筛 → LLM 精选 → 原文注入
                 </p>
             </div>
@@ -66,17 +70,8 @@ export default function SearchPage() {
 
             {/* 进度反馈:检索各阶段提示(消除 14-21s 干等焦虑) */}
             {isLoading && thought && (
-                <div style={{
-                    display: 'flex', alignItems: 'center', gap: '10px',
-                    padding: '12px 16px', borderRadius: '12px',
-                    background: 'rgba(96,165,250,0.08)', border: '1px solid rgba(96,165,250,0.18)',
-                    fontSize: '13px', color: 'var(--text-secondary)',
-                }}>
-                    <span className="spin" style={{
-                        display: 'inline-block', width: '14px', height: '14px',
-                        border: '2px solid var(--accent-blue)', borderTopColor: 'transparent',
-                        borderRadius: '50%',
-                    }} />
+                <div className="fade-in flex items-center gap-2.5 rounded-lg border border-accent/20 bg-accent-soft px-4 py-3 text-[13px] text-accent-ink">
+                    <Spinner size={14} />
                     {thought}
                 </div>
             )}

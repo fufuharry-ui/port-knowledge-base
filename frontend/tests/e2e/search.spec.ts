@@ -14,9 +14,11 @@ async function mockSearchApi(page: Page) {
     await page.route('**/api/v1/search', (route) =>
         route.fulfill({ json: mockSearchResponse })
     );
-    // SSE stream mock
+    // SSE stream mock — 与 api/main.py 真实契约对齐:
+    // 来源行 "📎 **来源：** `doc_id` 标题"(反引号包裹),随后是回答 delta
     await page.route('**/api/v1/search/stream*', (route) => {
         const body = [
+            'data: {"delta":"📎 **来源：** `doc_001` 岸桥远控技术方案\\n\\n"}\n\n',
             'data: {"delta":"根据《岸桥远控技术方案》"}\n\n',
             'data: {"delta":"，延迟≤50ms"}\n\n',
             'data: [DONE]\n\n',

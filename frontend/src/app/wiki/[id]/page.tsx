@@ -9,7 +9,12 @@
 import React, { useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
 import DocHub, { type RelatedDoc, type DocContradiction } from '@/components/DocHub';
+import { Card } from '@/components/ui/Card';
+import { Skeleton, SkeletonText } from '@/components/ui/Skeleton';
 import { API_BASE, type DocMeta } from '@/lib/api';
+
+interface GraphEdgeLike { source: string; target: string; type?: string; confidence?: number }
+interface GraphNodeLike { id: string; title?: string }
 
 export default function DocDetailPage() {
     const params = useParams<{ id: string }>();
@@ -18,18 +23,20 @@ export default function DocDetailPage() {
     const [doc, setDoc] = useState<DocMeta | null>(null);
     const [relatedDocs, setRelatedDocs] = useState<RelatedDoc[]>([]);
     const [contradictions, setContradictions] = useState<DocContradiction[]>([]);
-    const [loading, setLoading] = useState(true);
+    // 加载态派生自"已完成加载的 docId",避免在 effect 里同步 setState
+    const [loadedId, setLoadedId] = useState<string | null>(null);
     const [notFound, setNotFound] = useState(false);
 
     useEffect(() => {
         if (!docId) return;
-        setLoading(true);
+        let cancelled = false;
         // 并发取三份数据:文档详情 + 全图(筛关联)+ 矛盾报告(筛涉及本 doc)
         Promise.allSettled([
             fetch(`${API_BASE}/api/v1/docs/${docId}`).then(r => r.ok ? r.json() : Promise.reject(r.status)),
             fetch(`${API_BASE}/api/v1/graph`).then(r => r.ok ? r.json() : Promise.reject(r.status)),
             fetch(`${API_BASE}/api/v1/consistency`).then(r => r.ok ? r.json() : Promise.reject(r.status)),
         ]).then(([docRes, graphRes, conRes]) => {
+            if (cancelled) return;
             if (docRes.status === 'fulfilled' && docRes.value) {
                 setDoc(docRes.value as DocMeta);
             } else {
@@ -37,10 +44,10 @@ export default function DocDetailPage() {
             }
             if (graphRes.status === 'fulfilled') {
                 // 筛:与本 doc 相关的边(任一端 == docId),另一端为关联文档
-                const edges = (graphRes.value?.edges ?? []) as any[];
+                const edges = (graphRes.value?.edges ?? []) as GraphEdgeLike[];
                 const related: RelatedDoc[] = [];
-                const titles = (graphRes.value?.nodes ?? []) as any[];
-                const titleMap = new Map(titles.map((n: any) => [n.id, n.title ?? n.id]));
+                const titles = (graphRes.value?.nodes ?? []) as GraphNodeLike[];
+                const titleMap = new Map(titles.map(n => [n.id, n.title ?? n.id]));
                 for (const e of edges) {
                     if (e.source === docId || e.target === docId) {
                         const otherId = e.source === docId ? e.target : e.source;
@@ -58,16 +65,25 @@ export default function DocDetailPage() {
                 const cons = (conRes.value?.contradictions ?? []) as DocContradiction[];
                 setContradictions(cons.filter(c => c.doc_a === docId || c.doc_b === docId));
             }
-        }).finally(() => setLoading(false));
+            setLoadedId(docId);
+        });
+        return () => { cancelled = true; };
     }, [docId]);
+
+    const loading = !docId || loadedId !== docId;
 
     if (loading) {
         return (
-            <div style={{ display: 'flex', justifyContent: 'center', padding: '120px 0' }}>
-                <span className="spin" style={{
-                    display: 'inline-block', width: '28px', height: '28px',
-                    border: '3px solid var(--accent-blue)', borderTopColor: 'transparent', borderRadius: '50%',
-                }} />
+            <div className="mx-auto max-w-4xl px-6 py-10">
+                <Card className="mb-4 p-6">
+                    <Skeleton className="h-7 w-2/3" />
+                    <Skeleton className="mt-3 h-3 w-40" />
+                    <SkeletonText lines={3} className="mt-5" />
+                </Card>
+                <Card className="p-5">
+                    <Skeleton className="h-4 w-24" />
+                    <SkeletonText lines={2} className="mt-3" />
+                </Card>
             </div>
         );
     }

@@ -427,3 +427,18 @@ Files created: raw/doc_20260708_001.txt, raw/doc_20260708_001.meta.yaml
 ## [2026-07-08 21:22:45] ingest | my_doc
 Files created: raw/doc_20260708_001.txt, raw/doc_20260708_001.meta.yaml
 
+## [2026-07-10 21:48:55] ingest | 测试文档
+Files created: raw/doc_20260710_001.txt, raw/doc_20260710_001.meta.yaml
+
+## [2026-07-10 21:48:55] ingest | test
+Files created: raw/doc_20260710_001.txt, raw/doc_20260710_001.meta.yaml
+
+## [2026-07-10 21:48:56] ingest | doc
+Files created: raw/doc_20260710_001.txt, raw/doc_20260710_001.meta.yaml
+
+## [2026-07-10 21:48:56] ingest | complete_test
+Files created: raw/doc_20260710_001.txt, raw/doc_20260710_001.meta.yaml
+
+## [2026-07-10 21:48:56] ingest | my_doc
+Files created: raw/doc_20260710_001.txt, raw/doc_20260710_001.meta.yaml
+

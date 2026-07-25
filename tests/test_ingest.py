@@ -254,3 +254,28 @@ class TestMetadataFormat:
         md_file.write_text(SAMPLE_CHINESE_TEXT, encoding="utf-8")
         result = patch_ingest_paths.ingest_file(md_file)
         assert result["source_original"] == "originals/my_doc.md"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4. 审计日志隔离测试(UAT Big-Loop: 测试不得污染真实 wiki/log.md)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_ingest_audit_log_stays_in_project_dir(
+    patch_ingest_paths, project_dir, tmp_path
+):
+    """RED 守卫:ingest 的审计日志必须写进 sandbox(project_dir/wiki/log.md),
+    而不是真实仓库的 wiki/log.md。
+
+    根因:scripts/logger.py 的 global_logger 用相对路径 "wiki/log.md",
+    按 CWD 解析;patch_ingest_paths 此前只 patch 路径常量,未 patch logger,
+    导致 ingest_file() 内 `from scripts.logger import global_logger` 写到真实仓库。
+    """
+    source = tmp_path / "audit_isolation.md"
+    source.write_text("# 审计隔离\n\n岸桥远控测试内容。", encoding="utf-8")
+
+    meta = patch_ingest_paths.ingest_file(source)
+
+    assert meta is not None
+    sandbox_log = project_dir / "wiki" / "log.md"
+    assert sandbox_log.exists()
+    assert "audit_isolation" in sandbox_log.read_text(encoding="utf-8")

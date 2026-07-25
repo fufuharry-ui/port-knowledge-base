@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import './globals.css';
 import NavBar from '@/components/NavBar';
+import { ToastProvider } from '@/components/ui/Toast';
 
 export const metadata: Metadata = {
   title: '智能知识库 · KnowledgeBase',
@@ -16,10 +17,12 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
       </head>
       <body>
-        <NavBar />
-        <main style={{ paddingTop: '56px', position: 'relative', zIndex: 1 }}>
-          {children}
-        </main>
+        <ToastProvider>
+          <NavBar />
+          <main style={{ paddingTop: '56px', position: 'relative', zIndex: 1 }}>
+            {children}
+          </main>
+        </ToastProvider>
       </body>
     </html>
   );

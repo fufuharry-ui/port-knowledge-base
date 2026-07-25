@@ -31,9 +31,9 @@ test.describe('Knowledge Graph Page', () => {
 
     test('renders ECharts canvas or container', async ({ page }) => {
         await page.goto('/graph');
-        // ECharts renders a canvas element
+        // canvas 渲染在 knowledge-graph 容器内,二者都会命中 → 取首个
         await expect(
-            page.locator('canvas, [data-testid="knowledge-graph"]')
+            page.locator('canvas, [data-testid="knowledge-graph"]').first()
         ).toBeVisible({ timeout: 8000 });
     });
 

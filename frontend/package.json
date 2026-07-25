@@ -10,7 +10,9 @@
     "test": "jest --passWithNoTests",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "test:e2e:live": "playwright test --config playwright.live.config.ts",
+    "test:e2e:live:list": "playwright test --config playwright.live.config.ts --list"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.15",

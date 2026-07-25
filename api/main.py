@@ -2,6 +2,8 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from typing import AsyncIterable
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
@@ -11,7 +13,7 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 import yaml
 
-from scripts.ingest import ingest_file, generate_doc_id
+from scripts.ingest import PARSERS, get_file_hash, ingest_file
 from scripts.search import (
     search, get_llm_client, layer1_filter, layer2_score, layer3_answer,
     layer3_answer_stream, _load_ontology,
@@ -52,7 +54,11 @@ except Exception:
 # ─── CORS ─────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=[
+        # 常规本地 dev(3000)+ UAT 隔离 live 套件(3001);均为本地回环,非生产策略。
+        "http://localhost:3000", "http://127.0.0.1:3000",
+        "http://localhost:3001", "http://127.0.0.1:3001",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -100,20 +106,142 @@ def _enrich_doc_status(docs: list[dict]) -> list[dict]:
     return docs
 
 
-def ingest_and_compile_task(file_path: Path):
-    try:
-        result = ingest_file(file_path)
-        if result:
-            compile_script = BASE_DIR / "scripts" / "compile.py"
-            if compile_script.exists():
-                subprocess.run(["python", str(compile_script)], cwd=str(BASE_DIR))
-            try:
-                from scripts.logger import global_logger
-                global_logger.log("api_ingest", file_path.stem, "Background task finished successfully.")
-            except ImportError:
-                pass
-    except Exception as e:
-        print(f"Background task failed: {e}")
+def _load_document_catalog() -> list[dict]:
+    """管理端 catalog:compiled index + raw meta 合并投影。
+
+    供 /wiki/index、/docs、/docs/{id} 使用,让 raw/compiling 文档也立即可见
+    (CAP-PROGRESS)。搜索与 /qa 继续用 _load_index()(只读 compiled),不污染候选。
+    compiled index 条目被 raw meta 的权威字段(title/status/file_hash/...)覆盖。
+    """
+    compiled = _load_index().get("documents", [])
+    by_id = {doc["id"]: dict(doc) for doc in compiled if doc.get("id")}
+
+    for meta_path in sorted(RAW_DIR.glob("*.meta.yaml")):
+        try:
+            meta = yaml.safe_load(meta_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            continue
+        doc_id = meta.get("id")
+        if not doc_id:
+            continue
+        doc = by_id.setdefault(doc_id, {"id": doc_id, "abstract_short": "", "ontology_terms": []})
+        for key in ("title", "status", "source_type", "file_hash", "char_count",
+                    "language", "ingested_at", "error_message"):
+            if key in meta:
+                doc[key] = meta[key]
+
+    return sorted(by_id.values(), key=lambda d: d.get("ingested_at", ""), reverse=True)
+
+
+def _find_duplicate_doc(file_hash: str) -> dict | None:
+    """按 file_hash 查既有文档(跨 compiled+raw),命中即跳过,避免幽灵任务。"""
+    for doc in _load_document_catalog():
+        if doc.get("file_hash") == file_hash:
+            return doc
+    return None
+
+
+def _safe_upload_name(filename: str | None) -> str:
+    """只取 basename(剥离路径分量),并校验扩展名在 PARSERS 内,否则 422。"""
+    supplied = filename or ""
+    safe = Path(supplied).name
+    suffix = Path(safe).suffix.lower()
+    if not safe or suffix not in PARSERS:
+        raise HTTPException(status_code=422, detail=f"不支持的文件格式 '{suffix or supplied}'")
+    return safe
+
+
+def _unique_original_path(filename: str) -> Path:
+    """originals/ 内避免重名:同名时追加 _2/_3/..."""
+    candidate = ORIGINALS_DIR / filename
+    if not candidate.exists():
+        return candidate
+    stem, suffix = candidate.stem, candidate.suffix
+    sequence = 2
+    while True:
+        candidate = ORIGINALS_DIR / f"{stem}_{sequence}{suffix}"
+        if not candidate.exists():
+            return candidate
+        sequence += 1
+
+
+def _stage_upload(file: UploadFile) -> tuple[Path | None, dict | None]:
+    """落盘 + 哈希去重。返回 (staged_path, None) 或 (None, duplicate_doc)。
+
+    先写临时文件再哈希,命中重复则删临时文件(不写最终 originals/);否则原子替换到唯一目标。
+    """
+    filename = _safe_upload_name(file.filename)
+    ORIGINALS_DIR.mkdir(parents=True, exist_ok=True)
+    suffix = Path(filename).suffix.lower()
+    with tempfile.NamedTemporaryFile(dir=ORIGINALS_DIR, suffix=suffix, delete=False) as handle:
+        shutil.copyfileobj(file.file, handle)
+        staged = Path(handle.name)
+
+    file_hash = get_file_hash(staged)
+    duplicate = _find_duplicate_doc(file_hash)
+    if duplicate:
+        staged.unlink(missing_ok=True)
+        return None, duplicate
+
+    destination = _unique_original_path(filename)
+    staged.replace(destination)
+    return destination, None
+
+
+def compile_ingested_task(doc_id: str) -> None:
+    """后台编译"指定"doc_id。
+
+    三个 Windows/核心引擎事实,均在 wrapper 层规避(不改 compile.py):
+    1) 用 sys.executable(anaconda),不用 PATH 上的 "python"(WindowsApps 桩)。
+    2) 用 `python -m scripts.compile` 而非 `python scripts/compile.py`:脚本模式下
+       cwd 不在 sys.path,compile.py 内 `from scripts.ontology import ...` 会
+       ModuleNotFoundError;-m 模式把 cwd 加入 sys.path,包内导入才可用。
+    3) PYTHONUTF8=1:compile.py 的 print 含 emoji(✅📌),Windows GBK 控制台会
+       UnicodeEncodeError;UTF-8 模式下正常。
+    继承父进程 env(含 OPENAI_API_KEY 等从 .env 加载的密钥)。
+    """
+    compile_script = BASE_DIR / "scripts" / "compile.py"
+    if not compile_script.exists():
+        return
+    env = {**os.environ, "PYTHONUTF8": "1"}
+    subprocess.run(
+        [sys.executable, "-m", "scripts.compile", doc_id],
+        cwd=str(BASE_DIR),
+        env=env,
+        check=False,
+    )
+
+
+def _accept_upload(background_tasks: BackgroundTasks, file: UploadFile) -> dict:
+    """权威上传契约:落盘 → 去重 → 同步 ingest_file → 调度按 doc_id 编译。
+
+    返回权威 doc_id(来自 ingest_file,而非上传时预生成),含 skipped 字段。
+    /upload 与 /ingest 共用此契约。
+    """
+    stored, duplicate = _stage_upload(file)
+    if duplicate:
+        return {
+            "status": "skipped",
+            "skipped": True,
+            "doc_id": duplicate["id"],
+            "filename": file.filename,
+            "message": "文件已存在，已跳过",
+        }
+
+    assert stored is not None
+    meta = ingest_file(stored)
+    if not meta:
+        raise HTTPException(status_code=422, detail="文件无法解析或内容为空")
+
+    doc_id = meta["id"]
+    background_tasks.add_task(compile_ingested_task, doc_id)
+    return {
+        "status": "processing",
+        "skipped": False,
+        "doc_id": doc_id,
+        "filename": stored.name,
+        "message": "摄入成功，后台自动编译中...",
+    }
 
 # ─── Pydantic Models ──────────────────────────────────────────────────────────
 
@@ -170,13 +298,12 @@ async def health():
 
 @app.get("/api/v1/wiki/index")
 async def wiki_index():
-    """Return the full wiki index as JSON.
+    """Return the full wiki document catalog (compiled + raw) as JSON.
 
-    UX 修复:用 .meta.yaml 的权威 status 即时填充(见 _enrich_doc_status),
-    否则仪表盘"已编译"统计恒为 0。
+    CAP-PROGRESS:用 _load_document_catalog 让 raw/compiling 文档立即可见,
+    而非等编译完成。搜索/QA 继续走 _load_index()(只 compiled),不污染候选。
     """
-    index = _load_index()
-    docs = _enrich_doc_status(index.get("documents", []))
+    docs = _load_document_catalog()
     return {"total_docs": len(docs), "documents": docs}
 
 # ─── GET /api/v1/graph ───────────────────────────────────────────────────────
@@ -270,16 +397,14 @@ async def entity_graph(term: str = "", depth: int = 1):
 
 @app.get("/api/v1/docs")
 async def list_docs():
-    index = _load_index()
-    docs = index.get("documents", [])
+    docs = _load_document_catalog()
     return {"documents": docs, "total": len(docs)}
 
 # ─── GET /api/v1/docs/{doc_id} ───────────────────────────────────────────────
 
 @app.get("/api/v1/docs/{doc_id}")
 async def get_doc(doc_id: str):
-    index = _load_index()
-    for doc in index.get("documents", []):
+    for doc in _load_document_catalog():
         if doc["id"] == doc_id:
             return doc
     raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found")
@@ -325,38 +450,15 @@ async def recompile_doc_endpoint(doc_id: str, background_tasks: BackgroundTasks)
 
 @app.post("/api/v1/upload")
 async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    """Frontend-compatible upload endpoint (alias for ingest with BackgroundTask)."""
-    file_path = ORIGINALS_DIR / file.filename
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    doc_id = generate_doc_id()
-    background_tasks.add_task(ingest_and_compile_task, file_path)
-
-    return {
-        "status": "processing",
-        "doc_id": doc_id,
-        "filename": file.filename,
-        "message": "摄入成功，后台自动编译中...",
-    }
+    """Frontend-compatible upload endpoint. 返回权威 doc_id + skipped 字段。"""
+    return _accept_upload(background_tasks, file)
 
 # ─── POST /api/v1/ingest ─────────────────────────────────────────────────────
 
 @app.post("/api/v1/ingest")
 async def ingest_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    file_path = ORIGINALS_DIR / file.filename
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    doc_id = generate_doc_id()
-    background_tasks.add_task(ingest_and_compile_task, file_path)
-
-    return {
-        "status": "processing",
-        "doc_id": doc_id,
-        "filename": file.filename,
-        "message": "File uploaded and background processing started.",
-    }
+    """Alias of /upload — 同一权威契约(权威 doc_id + skipped + 按 doc_id 编译)。"""
+    return _accept_upload(background_tasks, file)
 
 # ─── POST /api/v1/search (sync JSON) ─────────────────────────────────────────
 

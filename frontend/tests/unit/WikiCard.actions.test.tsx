@@ -1,6 +1,7 @@
 /**
  * tests/unit/WikiCard.actions.test.tsx — 文档管理操作按钮测试 (Loop #10)
- * 验证删除/重编译按钮渲染 + stopPropagation(不误触展开)+ 删除需 confirm
+ * 验证删除/重编译按钮渲染 + stopPropagation(不误触展开)+ 删除需确认对话框
+ * (Phase 3:window.confirm → radix ConfirmDialog)
  */
 import '@testing-library/jest-dom';
 import React from 'react';
@@ -16,27 +17,26 @@ describe('WikiCard 管理操作 (Loop #10)', () => {
         expect(screen.getByTestId('delete-btn')).toBeInTheDocument();
     });
 
-    test('点删除按钮触发 confirm,确认后才调 onDelete', () => {
-        const confirmSpy = jest.spyOn(window, 'confirm').mockReturnValue(true);
+    test('点删除按钮弹出确认对话框,确认后才调 onDelete', () => {
         const onDelete = jest.fn();
         render(<WikiCard doc={baseDoc} onDelete={onDelete} />);
         fireEvent.click(screen.getByTestId('delete-btn'));
-        expect(confirmSpy).toHaveBeenCalled();
+        // 未确认前不调 onDelete
+        expect(onDelete).not.toHaveBeenCalled();
+        expect(screen.getByTestId('confirm-dialog')).toBeInTheDocument();
+        fireEvent.click(screen.getByTestId('confirm-accept'));
         expect(onDelete).toHaveBeenCalledWith('doc_1');
-        confirmSpy.mockRestore();
     });
 
-    test('点删除按钮 confirm 取消时不调 onDelete', () => {
-        const confirmSpy = jest.spyOn(window, 'confirm').mockReturnValue(false);
+    test('确认对话框取消时不调 onDelete', () => {
         const onDelete = jest.fn();
         render(<WikiCard doc={baseDoc} onDelete={onDelete} />);
         fireEvent.click(screen.getByTestId('delete-btn'));
+        fireEvent.click(screen.getByTestId('confirm-cancel'));
         expect(onDelete).not.toHaveBeenCalled();
-        confirmSpy.mockRestore();
     });
 
     test('点删除按钮不触发卡片展开(stopPropagation)', () => {
-        jest.spyOn(window, 'confirm').mockReturnValue(true);
         const onExpand = jest.fn();
         const onDelete = jest.fn();
         render(<WikiCard doc={baseDoc} onExpand={onExpand} onDelete={onDelete} />);
@@ -50,9 +50,18 @@ describe('WikiCard 管理操作 (Loop #10)', () => {
         expect(screen.getByTestId('recompile-btn')).toBeInTheDocument();
     });
 
-    test('非 error 状态不渲染重编译按钮', () => {
+    test('compiled 状态渲染重编译按钮(big-loop #1 扩展:刷新摘要)', () => {
         const onRecompile = jest.fn();
         render(<WikiCard doc={baseDoc} onRecompile={onRecompile} />);
+        expect(screen.getByTestId('recompile-btn')).toBeInTheDocument();
+    });
+
+    test('raw/compiling 状态不渲染重编译按钮', () => {
+        const onRecompile = jest.fn();
+        const { unmount } = render(<WikiCard doc={{ ...baseDoc, status: 'raw' }} onRecompile={onRecompile} />);
+        expect(screen.queryByTestId('recompile-btn')).toBeNull();
+        unmount();
+        render(<WikiCard doc={{ ...baseDoc, status: 'compiling' }} onRecompile={onRecompile} />);
         expect(screen.queryByTestId('recompile-btn')).toBeNull();
     });
 

@@ -75,21 +75,24 @@ function buildSseBody(events: Array<Record<string, unknown>>, done = true): stri
     return lines.join('');
 }
 
+// 与 api/main.py 真实 SSE 契约对齐:/search/stream 发 {type:thought,step,message} + {delta} + [DONE];
+// 来源行真实格式为 "📎 **来源：** `doc_id` 标题 | ..."(反引号包裹)
 const MOCK_SEARCH_SSE = buildSseBody([
-    { type: 'thought', content: '正在执行 Layer 1 BM25 关键词粗筛...' },
-    { type: 'thought', content: 'Layer 2 LLM 摘要评分，候选文档 2 篇。' },
-    { type: 'source', doc_id: 'doc_001', title: '岸桥远控技术方案' },
-    { type: 'delta', content: '根据《岸桥远控技术方案》，' },
-    { type: 'delta', content: '端到端延迟≤50ms，5G空口延迟≤20ms。' },
+    { type: 'thought', step: 1, message: '🔍 初筛候选文档(BM25+本体扩展)...' },
+    { type: 'thought', step: 2, message: '🧠 LLM 精选 Top-5(共2篇候选)...' },
+    { delta: '📎 **来源：** `doc_001` 岸桥远控技术方案 | `doc_002` 5G专网部署规范\n\n' },
+    { delta: '根据《岸桥远控技术方案》,' },
+    { delta: '端到端延迟≤50ms,5G空口延迟≤20ms。' },
 ]);
 
+// 与 api/main.py /qa 真实契约对齐:thought(step,message) → source(citations[]) →
+// entity(ids[]) → delta(text)×N → done
 const MOCK_QA_SSE = buildSseBody([
-    { type: 'thought', content: '检索到 2 篇相关文档...' },
-    { type: 'source', doc_id: 'doc_001', title: '岸桥远控技术方案' },
-    { type: 'entity', entity: '岸桥远控' },
-    { type: 'entity', entity: '5G专网' },
-    { type: 'delta', content: '岸桥由岸桥控制系统、远控工作站和5G传输网络三部分组成。' },
-    { type: 'done', total_tokens: 128 },
+    { type: 'thought', step: 1, message: '🔍 BM25 关键词初筛中...' },
+    { type: 'source', citations: [{ ref: '[1]', doc_id: 'doc_001', title: '岸桥远控技术方案', section: '第3章 网络方案' }] },
+    { type: 'entity', ids: ['doc_001'] },
+    { type: 'delta', text: '岸桥由岸桥控制系统、远控工作站和5G传输网络三部分组成[1]。' },
+    { type: 'done' },
 ]);
 
 // ─── Setup Helpers ───────────────────────────────────────────────────────────
@@ -135,16 +138,20 @@ test.describe('UAT-F01: 全局导航与页面加载', () => {
         await mockAllApis(page);
     });
 
-    test('F01-T01: 访问根路径自动跳转到 /wiki', async ({ page }) => {
+    test('F01-T01: 着陆页渲染产品主张,CTA 可进入 /wiki', async ({ page }) => {
         await page.goto('/');
+        await expect(page.locator('h1').first()).toBeVisible({ timeout: 5000 });
+        await page.getByRole('link', { name: '进入知识库' }).first().click();
         await expect(page).toHaveURL(/\/wiki/, { timeout: 5000 });
     });
 
     test('F01-T02: 顶部导航栏所有页面链接可点击', async ({ page }) => {
         await page.goto('/wiki');
         const navLinks = ['检索', '知识图谱', '问答', '上传'];
+        // 限定 navigation  landmarks(/wiki 页内有"上传文档" CTA,防止跨区误配)
+        const nav = page.getByRole('navigation');
         for (const label of navLinks) {
-            await expect(page.getByRole('link', { name: new RegExp(label) })).toBeVisible();
+            await expect(nav.getByRole('link', { name: new RegExp(label) })).toBeVisible();
         }
     });
 
@@ -186,13 +193,13 @@ test.describe('UAT-F02: 知识库仪表盘', () => {
     });
 
     test('F02-T03: compiled 文档徽章样式有别于 raw 文档', async ({ page }) => {
+        // 先等首枚徽章出现(避免加载竞态),再区分两种状态标签
+        await expect(page.locator('[data-testid="status-badge"]').first()).toBeVisible({ timeout: 5000 });
         const badges = await page.locator('[data-testid="status-badge"]').all();
         expect(badges.length).toBeGreaterThanOrEqual(2);
-        const compiledBadge = badges.find(async (b) => (await b.textContent())?.includes('compiled'));
-        const rawBadge = badges.find(async (b) => (await b.textContent())?.includes('raw'));
-        // Verify they have distinct class names
-        expect(compiledBadge).toBeDefined();
-        expect(rawBadge).toBeDefined();
+        const texts = await Promise.all(badges.map(b => b.textContent()));
+        expect(texts.some(t => t?.includes('已编译'))).toBe(true);
+        expect(texts.some(t => t?.includes('待编译'))).toBe(true);
     });
 
     test('F02-T04: 点击卡片后保持在 wiki 域（展开详情或导航）', async ({ page }) => {
@@ -369,21 +376,20 @@ test.describe('UAT-F04: 语义检索（SSE 流式）', () => {
     });
 
     test('F04-T06: SSE 流式输出过程中显示加载状态', async ({ page }) => {
-        // Simulate a slow SSE stream
+        // 真正的"慢"流:fulfill 是瞬时的,必须延迟 3s 返回,否则 loading 态一闪而过
         await page.route('**/api/v1/search/stream*', async (route) => {
+            await new Promise(r => setTimeout(r, 3000));
             await route.fulfill({
                 status: 200,
                 headers: { 'Content-Type': 'text/event-stream' },
-                body: 'data: {"type":"thought","content":"正在检索..."}\n\n',
+                body: 'data: {"type":"thought","step":1,"message":"正在检索..."}\n\n',
             });
         });
         const input = page.locator('[role="textbox"]').first();
         await input.fill('测试慢速流');
         await input.press('Enter');
-        // Some loading indicator should appear
-        await expect(
-            page.locator('[data-testid="loading-indicator"], [class*="loading"], [class*="spinner"]').first()
-        ).toBeVisible({ timeout: 5000 });
+        // 加载指示的语义契约:检索框内 spinner testid
+        await expect(page.getByTestId('search-spinner')).toBeVisible({ timeout: 5000 });
     });
 });
 
@@ -398,8 +404,9 @@ test.describe('UAT-F05: 知识图谱可视化', () => {
     });
 
     test('F05-T01: 图谱页面正确渲染 ECharts Canvas 或容器', async ({ page }) => {
+        // canvas 与容器 testid 均命中(ECharts 在容器内渲染 canvas),取首个即可
         await expect(
-            page.locator('canvas, [data-testid="knowledge-graph"]')
+            page.locator('canvas, [data-testid="knowledge-graph"]').first()
         ).toBeVisible({ timeout: 8000 });
     });
 
@@ -409,9 +416,9 @@ test.describe('UAT-F05: 知识图谱可视化', () => {
     });
 
     test('F05-T03: 关系图例包含所有关系类型标注', async ({ page }) => {
-        // Legend should list relation types
-        const legend = page.locator('[class*="legend"], text=/补充关联|矛盾冲突|同类主题/');
-        await expect(legend.first()).toBeVisible({ timeout: 5000 });
+        // 图例随 mock 边类型动态渲染(MOCK_GRAPH: supplements + same_topic)
+        await expect(page.getByText('补充', { exact: true })).toBeVisible({ timeout: 5000 });
+        await expect(page.getByText('同主题', { exact: true })).toBeVisible();
     });
 
     test('F05-T04: 空图谱时展示空状态提示', async ({ page }) => {
@@ -432,7 +439,8 @@ test.describe('UAT-F06: PortGPT 智能问答', () => {
 
     test.beforeEach(async ({ page }) => {
         await mockAllApis(page);
-        await page.goto('/graph');
+        // 问答面板已迁出图谱页(big-loop #2 信息架构):独立 /qa 全幅聊天页
+        await page.goto('/qa');
         await page.waitForSelector('[data-testid="chat-panel"]', { state: 'visible', timeout: 10000 });
     });
 
@@ -470,16 +478,25 @@ test.describe('UAT-F06: PortGPT 智能问答', () => {
         const submitBtn = page.getByTestId('chat-submit');
         await page.getByTestId('chat-input').fill('测试问题');
         await submitBtn.click();
-        // After stream completes, button should be re-enabled
+        // 流式期间按钮禁用;流式结束后再输入文字,按钮应恢复可用
+        // (空输入禁用是独立契约,见 F06-T07,两者不冲突)
+        await expect(submitBtn).toBeDisabled();
+        await page.getByTestId('chat-input').fill('追问');
         await expect(submitBtn).not.toBeDisabled({ timeout: 20000 });
     });
 
-    test('F06-T06: 实体命中时图谱高亮提示出现', async ({ page }) => {
+    test('F06-T06: 回答内引用标记可悬停查看来源(citation tooltip)', async ({ page }) => {
+        // 旧契约"实体命中→图谱高亮横幅"依赖图谱内嵌问答(架构已废);
+        // 现架构下 source 事件的等价用户价值 = 回答中的可交互引用标记。
         await page.getByTestId('chat-input').fill('岸桥架构由什么组成？');
         await page.getByTestId('chat-submit').click();
-        // When entities are returned, the graph highlight banner appears
-        const highlightBanner = page.locator('text=/Q&A 命中节点|命中/');
-        await expect(highlightBanner).toBeVisible({ timeout: 15000 });
+        const aiBubble = page.locator('[data-testid="chat-bubble"][data-role="assistant"]').last();
+        const trigger = aiBubble.getByTestId('citation-trigger').first();
+        await expect(trigger).toBeVisible({ timeout: 15000 });
+        await trigger.hover();
+        await expect(page.getByRole('tooltip')).toBeVisible();
+        // Radix 可能同时渲染进场/退场两份 portal 内容,取首个可见
+        await expect(page.getByTestId('citation-link-doc_001').first()).toBeVisible();
     });
 
     test('F06-T07: 输入为空时发送按钮处于禁用状态', async ({ page }) => {
@@ -507,6 +524,9 @@ test.describe('UAT-F07: 端到端完整业务流程', () => {
             ingested_at: new Date().toISOString(),
         };
 
+        // 先注册通用 mock,再注册本用例覆盖(Playwright 后注册的路由优先)
+        await mockAllApis(page);
+
         // Step 1: Mock upload returns new doc
         await page.route('**/api/v1/upload', (r) =>
             r.fulfill({ json: { doc_id: newDoc.id, title: newDoc.title, status: 'raw' } })
@@ -522,7 +542,6 @@ test.describe('UAT-F07: 端到端完整业务流程', () => {
                 },
             })
         );
-        await mockAllApis(page);
 
         // STEP 1: Upload
         await page.goto('/upload');

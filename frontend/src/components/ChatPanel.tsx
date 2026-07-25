@@ -1,9 +1,11 @@
 'use client';
 import React, { useCallback, useRef, useState } from 'react';
+import { BrainCircuit, ArrowUp, MessageSquareText, Square } from 'lucide-react';
 import ChatBubble from './ChatBubble';
 import ThoughtTrace from './ThoughtTrace';
-import type { CitationMeta, QAEvent } from '@/lib/qa-stream';
+import type { CitationMeta } from '@/lib/qa-stream';
 import { streamQA } from '@/lib/qa-stream';
+import { cn } from '@/lib/utils';
 
 interface Message {
     id: string;
@@ -28,11 +30,23 @@ export default function ChatPanel({ onHighlight }: ChatPanelProps) {
     const [citations, setCitations] = useState<CitationMeta[]>([]);
     const [isStreaming, setIsStreaming] = useState(false);
     const [inputValue, setInputValue] = useState('');
-    const messagesEndRef = useRef<HTMLDivElement>(null);
+    const listRef = useRef<HTMLDivElement>(null);
+    const stickToBottomRef = useRef(true);
+    const abortRef = useRef<AbortController | null>(null);
 
-    const scrollToBottom = () => {
-        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    };
+    /** 仅当用户停留在底部附近时才跟随滚动(避免逐 token 抖动、允许回看) */
+    const scrollToBottom = useCallback(() => {
+        const el = listRef.current;
+        if (el && stickToBottomRef.current) {
+            el.scrollTop = el.scrollHeight;
+        }
+    }, []);
+
+    const handleListScroll = useCallback(() => {
+        const el = listRef.current;
+        if (!el) return;
+        stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    }, []);
 
     const handleSubmit = useCallback(async () => {
         const query = inputValue.trim();
@@ -55,6 +69,7 @@ export default function ChatPanel({ onHighlight }: ChatPanelProps) {
         setThoughts([]);
         setCitations([]);
         setIsStreaming(true);
+        stickToBottomRef.current = true;
 
         // 添加空的 assistant 消息占位
         const assistantId = `assistant-${Date.now()}`;
@@ -64,10 +79,13 @@ export default function ChatPanel({ onHighlight }: ChatPanelProps) {
             content: '',
         };
         setMessages(prev => [...prev, assistantMsg]);
-        scrollToBottom();
+        requestAnimationFrame(scrollToBottom);
+
+        const controller = new AbortController();
+        abortRef.current = controller;
 
         try {
-            for await (const event of streamQA(query, history)) {
+            for await (const event of streamQA(query, history, undefined, controller.signal)) {
                 switch (event.type) {
                     case 'thought':
                         setThoughts(prev => [...prev, {
@@ -100,89 +118,67 @@ export default function ChatPanel({ onHighlight }: ChatPanelProps) {
                 }
             }
         } catch (err) {
+            const isAbort = err instanceof Error && err.name === 'AbortError';
             setMessages(prev => prev.map(m =>
                 m.id === assistantId
-                    ? { ...m, content: `⚠️ 流式请求失败: ${err}` }
+                    ? {
+                        ...m,
+                        content: isAbort
+                            ? m.content + (m.content ? '\n\n' : '') + '⏹ *已停止生成*'
+                            : `⚠️ 流式请求失败: ${err}`,
+                    }
                     : m
             ));
         } finally {
             setIsStreaming(false);
+            abortRef.current = null;
         }
-    }, [inputValue, isStreaming, onHighlight]);
+    }, [inputValue, isStreaming, messages, onHighlight, scrollToBottom]);
+
+    const canSend = Boolean(inputValue.trim()) && !isStreaming;
 
     return (
         <div
             data-testid="chat-panel"
-            style={{
-                display: 'flex',
-                flexDirection: 'column',
-                height: '100%',
-                minHeight: '400px',
-            }}
+            className="flex h-full min-h-[400px] flex-col"
         >
-            {/* ── 标题栏 ── */}
-            <div style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: '8px',
-                padding: '12px 16px',
-                borderBottom: '1px solid rgba(255,255,255,0.06)',
-                flexShrink: 0,
-            }}>
-                <span style={{ fontSize: 16 }}>🧠</span>
-                <span style={{
-                    fontSize: '13px',
-                    fontWeight: 600,
-                    color: 'var(--text-primary)',
-                    letterSpacing: '0.02em',
-                }}>
-                    PortGPT — 智能问答
+            {/* ── 标题栏(统一品牌:智能知识库) ── */}
+            <div className="flex shrink-0 items-center gap-2.5 border-b border-line px-4 py-3">
+                <span className="flex h-7 w-7 items-center justify-center rounded-md bg-accent-soft text-accent">
+                    <BrainCircuit size={15} strokeWidth={2} />
                 </span>
+                <div className="flex flex-col">
+                    <span className="text-[13px] font-semibold tracking-tight text-ink">
+                        智能知识库 · 问答
+                    </span>
+                    <span className="text-[10px] text-ink-3">三层渐进检索 · 引用可溯源</span>
+                </div>
                 {isStreaming && (
-                    <span style={{
-                        marginLeft: 'auto',
-                        fontSize: '11px',
-                        color: '#34d399',
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: '4px',
-                    }}>
-                        <span style={{
-                            display: 'inline-block',
-                            width: 6,
-                            height: 6,
-                            borderRadius: '50%',
-                            background: '#34d399',
-                            animation: 'pulse 1.2s ease-in-out infinite',
-                        }} />
+                    <span className="ml-auto flex items-center gap-1.5 text-[11px] font-medium text-success-ink">
+                        <span className="pulse-soft inline-block h-1.5 w-1.5 rounded-full bg-success" />
                         推理中
                     </span>
                 )}
             </div>
 
-            {/* ── 消息列表 ── */}
-            <div style={{
-                flex: 1,
-                overflowY: 'auto',
-                padding: '16px',
-                scrollbarWidth: 'thin',
-                scrollbarColor: 'rgba(255,255,255,0.08) transparent',
-            }}>
+            {/* ── 消息列表(aria-live:流式回答对读屏可见) ── */}
+            <div
+                ref={listRef}
+                onScroll={handleListScroll}
+                aria-live="polite"
+                className="min-h-0 flex-1 overflow-y-auto px-4 py-4"
+            >
                 {messages.length === 0 && (
-                    <div style={{
-                        display: 'flex',
-                        flexDirection: 'column',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        height: '200px',
-                        gap: '12px',
-                        color: 'var(--text-muted)',
-                    }}>
-                        <span style={{ fontSize: 40 }}>⚡</span>
-                        <p style={{ fontSize: '13px', textAlign: 'center', lineHeight: 1.6 }}>
-                            输入问题，系统将展示完整推理轨迹<br />
-                            并提供带引用溯源的精准回答
-                        </p>
+                    <div className="flex h-full min-h-[200px] flex-col items-center justify-center gap-3 text-center">
+                        <span className="flex h-12 w-12 items-center justify-center rounded-full bg-subtle text-ink-3">
+                            <MessageSquareText size={22} strokeWidth={1.75} />
+                        </span>
+                        <div>
+                            <p className="text-sm font-medium text-ink">向知识库提问</p>
+                            <p className="mt-1 text-[13px] leading-6 text-ink-3">
+                                展示完整推理轨迹,并提供带引用溯源的精准回答
+                            </p>
+                        </div>
                     </div>
                 )}
 
@@ -202,25 +198,16 @@ export default function ChatPanel({ onHighlight }: ChatPanelProps) {
                         />
                     </React.Fragment>
                 ))}
-                <div ref={messagesEndRef} />
             </div>
 
             {/* ── 输入区 ── */}
-            <div style={{
-                borderTop: '1px solid rgba(255,255,255,0.06)',
-                padding: '12px 16px',
-                flexShrink: 0,
-            }}>
-                <div style={{
-                    display: 'flex',
-                    gap: '10px',
-                    alignItems: 'flex-end',
-                    background: 'rgba(255,255,255,0.03)',
-                    border: '1px solid rgba(255,255,255,0.08)',
-                    borderRadius: '14px',
-                    padding: '10px 14px',
-                    transition: 'border-color 0.2s',
-                }}>
+            <div className="shrink-0 border-t border-line px-4 py-3">
+                <div
+                    className={cn(
+                        'flex items-end gap-2.5 rounded-xl border bg-surface px-3.5 py-2.5 transition-shadow',
+                        'border-line-strong focus-within:border-accent focus-within:shadow-[0_0_0_3px_rgba(37,99,235,0.12)]',
+                    )}
+                >
                     <textarea
                         data-testid="chat-input"
                         value={inputValue}
@@ -231,63 +218,42 @@ export default function ChatPanel({ onHighlight }: ChatPanelProps) {
                                 handleSubmit();
                             }
                         }}
-                        placeholder="输入问题，例如：岸桥远控系统的延迟要求是什么？（Enter 发送）"
+                        placeholder="输入问题,例如:岸桥远控系统的延迟要求是什么?(Enter 发送)"
                         disabled={isStreaming}
                         rows={1}
-                        style={{
-                            flex: 1,
-                            background: 'transparent',
-                            border: 'none',
-                            outline: 'none',
-                            fontSize: '14px',
-                            color: 'var(--text-primary)',
-                            fontFamily: 'inherit',
-                            resize: 'none',
-                            lineHeight: '1.5',
-                            maxHeight: '120px',
-                            overflowY: 'auto',
-                        }}
+                        className="max-h-[120px] flex-1 resize-none border-none bg-transparent text-sm leading-6 text-ink outline-none placeholder:text-ink-3 disabled:opacity-60"
                     />
+                    {isStreaming && (
+                        <button
+                            type="button"
+                            data-testid="chat-stop"
+                            onClick={() => abortRef.current?.abort()}
+                            aria-label="停止生成"
+                            title="停止生成"
+                            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-danger/30 bg-surface text-danger transition-colors hover:bg-danger-soft"
+                        >
+                            <Square size={13} strokeWidth={2.5} />
+                        </button>
+                    )}
                     <button
                         data-testid="chat-submit"
                         onClick={handleSubmit}
-                        disabled={!inputValue.trim() || isStreaming}
-                        style={{
-                            width: 36,
-                            height: 36,
-                            borderRadius: '10px',
-                            border: 'none',
-                            background: inputValue.trim() && !isStreaming
-                                ? 'linear-gradient(135deg, #3b82f6, #8b5cf6)'
-                                : 'rgba(255,255,255,0.06)',
-                            color: inputValue.trim() && !isStreaming ? '#fff' : 'rgba(255,255,255,0.25)',
-                            cursor: inputValue.trim() && !isStreaming ? 'pointer' : 'default',
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'center',
-                            flexShrink: 0,
-                            transition: 'all 0.2s',
-                            fontSize: 16,
-                        }}
+                        disabled={!canSend}
+                        aria-label="发送"
+                        className={cn(
+                            'flex h-9 w-9 shrink-0 items-center justify-center rounded-lg transition-colors',
+                            canSend
+                                ? 'bg-accent text-white hover:bg-accent-hover'
+                                : 'cursor-default bg-subtle text-ink-3',
+                        )}
                     >
-                        {isStreaming ? '⏳' : '↑'}
+                        <ArrowUp size={17} strokeWidth={2.25} />
                     </button>
                 </div>
-                <p style={{
-                    fontSize: '10px',
-                    color: 'var(--text-muted)',
-                    margin: '6px 4px 0',
-                }}>
-                    Shift+Enter 换行 · 引用标记 [1][2] 可悬停查看来源文档
+                <p className="mx-1 mb-0 mt-1.5 text-[10px] text-ink-3">
+                    Shift+Enter 换行 · 引用标记可悬停查看来源文档
                 </p>
             </div>
-
-            <style>{`
-                @keyframes pulse {
-                    0%, 100% { opacity: 1; transform: scale(1); }
-                    50% { opacity: 0.5; transform: scale(0.8); }
-                }
-            `}</style>
         </div>
     );
 }

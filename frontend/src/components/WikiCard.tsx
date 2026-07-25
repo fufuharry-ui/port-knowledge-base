@@ -1,6 +1,10 @@
 'use client';
-import React from 'react';
+import React, { useState } from 'react';
+import { RefreshCw, Trash2 } from 'lucide-react';
 import type { DocMeta } from '@/lib/api';
+import { Card } from '@/components/ui/Card';
+import { Badge, STATUS_BADGE_VARIANT, STATUS_BADGE_LABEL } from '@/components/ui/Badge';
+import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 
 interface WikiCardProps {
     doc: DocMeta;
@@ -9,146 +13,109 @@ interface WikiCardProps {
     onRecompile?: (docId: string) => void;
 }
 
-const STATUS_BADGE: Record<string, { label: string; cls: string }> = {
-    compiled: { label: '✓ compiled', cls: 'badge-compiled' },
-    raw: { label: '○ raw', cls: 'badge-raw' },
-    compiling: { label: '↻ compiling', cls: 'badge-compiling' },
-    error: { label: '✗ error', cls: 'badge-error' },
-};
-
 export default function WikiCard({ doc, onExpand, onDelete, onRecompile }: WikiCardProps) {
     const status = doc.status ?? 'raw';
-    const badge = STATUS_BADGE[status] ?? STATUS_BADGE.raw;
     const isCompiling = status === 'compiling';
     const isError = status === 'error';
+    // Loop #10 + big-loop#2:重编译对 error(重试)与 compiled(刷新)开放
+    const showRecompile = (isError || status === 'compiled') && Boolean(onRecompile);
+    // 删除确认:自定义 ConfirmDialog(替代 window.confirm,见 Phase 3)
+    const [confirmOpen, setConfirmOpen] = useState(false);
 
     const stop = (e: React.MouseEvent) => e.stopPropagation();
 
     return (
-        <div
+        <Card
+            variant="interactive"
             data-testid="wiki-card"
             role="button"
             tabIndex={0}
             onClick={() => onExpand?.(doc.id)}
             onKeyDown={(e) => e.key === 'Enter' && onExpand?.(doc.id)}
-            className="glass-card"
-            style={{
-                display: 'flex', flexDirection: 'column', gap: '10px',
-                padding: '18px', cursor: 'pointer',
-                transition: 'transform 0.18s, box-shadow 0.18s',
-                outline: 'none', position: 'relative',
-            }}
-            onMouseEnter={e => {
-                (e.currentTarget as HTMLElement).style.transform = 'translateY(-2px)';
-                (e.currentTarget as HTMLElement).style.boxShadow = '0 8px 32px rgba(0,0,0,0.4)';
-            }}
-            onMouseLeave={e => {
-                (e.currentTarget as HTMLElement).style.transform = '';
-                (e.currentTarget as HTMLElement).style.boxShadow = '';
-            }}
+            aria-label={`打开文档 ${doc.title ?? doc.id}`}
+            className="flex flex-col gap-2.5 p-4"
         >
-            {/* Status badge */}
-            <span
+            {/* 状态徽标(设计化 Badge,替代 ASCII 状态符) */}
+            <Badge
+                variant={STATUS_BADGE_VARIANT[status as keyof typeof STATUS_BADGE_VARIANT] ?? 'raw'}
                 data-testid="status-badge"
-                className={badge.cls}
-                style={{
-                    display: 'inline-flex', alignItems: 'center', gap: '5px',
-                    fontSize: '11px', fontWeight: 500,
-                    padding: '2px 9px', borderRadius: '9999px', width: 'fit-content'
-                }}
             >
                 {isCompiling && (
                     <span
                         data-testid="compiling-spinner"
-                        className="spin"
-                        style={{
-                            display: 'inline-block', width: '8px', height: '8px',
-                            border: '1.5px solid currentColor', borderTopColor: 'transparent',
-                            borderRadius: '50%',
-                        }}
+                        className="spin inline-block h-2 w-2 rounded-full border border-current border-t-transparent"
                     />
                 )}
-                {badge.label}
-            </span>
+                {STATUS_BADGE_LABEL[status as keyof typeof STATUS_BADGE_LABEL] ?? status}
+            </Badge>
 
-            {/* Title */}
-            <h3 style={{
-                fontSize: '14px', fontWeight: 600,
-                color: 'var(--text-primary)', margin: 0,
-                display: '-webkit-box', WebkitLineClamp: 2,
-                WebkitBoxOrient: 'vertical', overflow: 'hidden',
-                lineHeight: 1.4,
-            }}>
+            {/* 标题 */}
+            <h3 className="line-clamp-2 text-[15px] font-semibold leading-snug text-ink">
                 {doc.title ?? doc.id}
             </h3>
 
-            {/* Abstract */}
+            {/* 摘要 */}
             {doc.abstract_short && (
-                <p style={{
-                    fontSize: '12px', color: 'var(--text-secondary)',
-                    margin: 0, lineHeight: 1.6,
-                    display: '-webkit-box', WebkitLineClamp: 3,
-                    WebkitBoxOrient: 'vertical', overflow: 'hidden',
-                }}>
-                    {doc.abstract_short}
-                </p>
+                <p className="line-clamp-3 text-[13px] leading-6 text-ink-2">{doc.abstract_short}</p>
             )}
 
-            {/* Footer */}
-            <div style={{
-                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                marginTop: 'auto', paddingTop: '10px',
-                borderTop: '1px solid var(--border-subtle)',
-            }}>
-                <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
-                    {doc.char_count && (
-                        <span data-testid="char-count" style={{ fontSize: '10px', color: 'var(--text-muted)', fontFamily: 'monospace' }}>
-                            {doc.char_count.toLocaleString('zh-CN')} 字
+            {/* 页脚:元信息 + 管理操作 */}
+            <div className="mt-auto flex items-center justify-between gap-2 border-t border-line pt-3">
+                <div className="flex items-center gap-3 text-[11px] text-ink-3">
+                    {Boolean(doc.char_count) && (
+                        <span data-testid="char-count" className="font-mono">
+                            {doc.char_count!.toLocaleString('zh-CN')} 字
                         </span>
                     )}
                     {doc.ingested_at && (
-                        <span style={{ fontSize: '10px', color: 'var(--text-muted)' }}>
-                            {new Date(doc.ingested_at).toLocaleDateString('zh-CN')}
-                        </span>
+                        <span>{new Date(doc.ingested_at).toLocaleDateString('zh-CN')}</span>
                     )}
                 </div>
-                {/* 管理操作(Loop #10):hover 显出,stopPropagation 防误触展开 */}
                 {(onDelete || onRecompile) && (
-                    <div data-testid="card-actions" className="card-actions" style={{
-                        display: 'flex', gap: '6px', opacity: 0.6,
-                    }}>
-                        {isError && onRecompile && (
+                    <div data-testid="card-actions" className="flex items-center gap-1">
+                        {showRecompile && (
                             <button
+                                type="button"
                                 data-testid="recompile-btn"
-                                onClick={e => { stop(e); onRecompile(doc.id); }}
-                                title="重编译(error 重试)"
-                                style={actionBtnStyle}
-                            >↻</button>
+                                onClick={(e) => { stop(e); onRecompile?.(doc.id); }}
+                                title={isError ? '重编译(error 重试)' : '重编译(刷新摘要)'}
+                                aria-label="重编译"
+                                className="flex h-7 w-7 items-center justify-center rounded-md text-ink-3 transition-colors hover:bg-hover hover:text-accent"
+                            >
+                                <RefreshCw size={14} />
+                            </button>
                         )}
                         {onDelete && (
                             <button
+                                type="button"
                                 data-testid="delete-btn"
-                                onClick={e => {
+                                onClick={(e) => {
                                     stop(e);
-                                    if (window.confirm(`确认删除《${doc.title ?? doc.id}》?此操作不可撤销,将移除其全部产物与引用。`)) {
-                                        onDelete(doc.id);
-                                    }
+                                    setConfirmOpen(true);
                                 }}
                                 title="删除文档"
-                                style={{ ...actionBtnStyle, color: 'var(--accent-red)' }}
-                            >🗑</button>
+                                aria-label="删除文档"
+                                className="flex h-7 w-7 items-center justify-center rounded-md text-ink-3 transition-colors hover:bg-danger-soft hover:text-danger"
+                            >
+                                <Trash2 size={14} />
+                            </button>
                         )}
                     </div>
                 )}
             </div>
-        </div>
+
+            {/* 删除确认对话框(portal 挂载,点击不冒泡到卡片) */}
+            {onDelete && (
+                <ConfirmDialog
+                    open={confirmOpen}
+                    onOpenChange={setConfirmOpen}
+                    title="删除文档"
+                    description={`确认删除《${doc.title ?? doc.id}》?此操作不可撤销,将移除其全部产物与引用。`}
+                    confirmLabel="确认删除"
+                    danger
+                    onConfirm={() => onDelete(doc.id)}
+                />
+            )}
+        </Card>
     );
 }
-
-const actionBtnStyle: React.CSSProperties = {
-    padding: '2px 8px', fontSize: '12px', lineHeight: 1,
-    borderRadius: '6px', cursor: 'pointer',
-    border: '1px solid rgba(255,255,255,0.10)',
-    background: 'rgba(255,255,255,0.04)',
-    color: 'var(--text-muted)',
-};

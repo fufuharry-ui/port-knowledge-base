@@ -31,17 +31,24 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          event_name="${{ github.event_name }}"
+          zero_sha="0000000000000000000000000000000000000000"
+          head="${{ github.sha }}"
+
+          if [[ "${event_name}" == "pull_request" ]]; then
             base="${{ github.event.pull_request.base.sha }}"
             head="${{ github.event.pull_request.head.sha }}"
-          elif [[ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
+          elif [[ "${event_name}" == "push" && "${{ github.event.before }}" != "${zero_sha}" ]]; then
             base="${{ github.event.before }}"
-            head="${{ github.sha }}"
           else
-            base="$(git rev-parse HEAD^)"
-            head="${{ github.sha }}"
+            if git rev-parse "${head}^" >/dev/null 2>&1; then
+              base="$(git rev-parse "${head}^")"
+            else
+              base="$(git hash-object -t tree /dev/null)"
+            fi
           fi
 
+          echo "Checking whitespace from ${base} to ${head}"
           git diff --check "${base}..${head}"
 
       - name: Reject tracked secrets and generated artifacts
@@ -49,8 +56,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          if git ls-files --error-unmatch .env >/dev/null 2>&1; then
-            echo "::error::.env must not be tracked"
+          tracked_env_files="$(
+            git ls-files |
+              grep -E '(^|/)\.env($|\.)' |
+              grep -vE '(^|/)\.env\.example$' ||
+              true
+          )"
+
+          if [[ -n "${tracked_env_files}" ]]; then
+            echo "::error::Tracked environment-secret files are forbidden:"
+            echo "${tracked_env_files}"
             exit 1
           fi
 

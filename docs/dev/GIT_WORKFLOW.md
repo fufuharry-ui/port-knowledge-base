@@ -60,7 +60,27 @@ gh auth status
 gh pr create
 gh pr view
 gh pr checks --watch
-gh pr merge --merge --match-head-commit
 ```
+
+受保护合并必须使用`--match-head-commit`守护。合并前必须重新读取PR的`headRefOid`，并把该SHA作为参数紧跟在`--match-head-commit`之后：
+
+```powershell
+$headSha = gh pr view <PR_NUMBER> `
+  --repo fufuharry-ui/port-knowledge-base `
+  --json headRefOid `
+  --jq .headRefOid
+
+gh pr merge <PR_NUMBER> `
+  --repo fufuharry-ui/port-knowledge-base `
+  --merge `
+  --match-head-commit $headSha
+```
+
+约束：
+
+- 必须在合并前重新读取`headRefOid`，不得复用旧SHA；
+- `--match-head-commit`必须紧跟实际SHA参数，不能作为布尔开关使用；
+- 读取到的Head与预期不一致时停止合并并重新审查；
+- 禁止使用`--admin`绕过分支保护。
 
 不得在文档中写入token或个人凭据。

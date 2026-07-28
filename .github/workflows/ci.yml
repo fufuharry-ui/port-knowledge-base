@@ -1,0 +1,135 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - dev
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repository-integrity:
+    name: repository-integrity
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check changed-file whitespace
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          event_name="${{ github.event_name }}"
+          zero_sha="0000000000000000000000000000000000000000"
+          head="${{ github.sha }}"
+
+          if [[ "${event_name}" == "pull_request" ]]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          elif [[ "${event_name}" == "push" && "${{ github.event.before }}" != "${zero_sha}" ]]; then
+            base="${{ github.event.before }}"
+          else
+            if git rev-parse "${head}^" >/dev/null 2>&1; then
+              base="$(git rev-parse "${head}^")"
+            else
+              base="$(git hash-object -t tree /dev/null)"
+            fi
+          fi
+
+          echo "Checking whitespace from ${base} to ${head}"
+          git diff --check "${base}..${head}"
+
+      - name: Reject tracked secrets and generated artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tracked_env_files="$(
+            git ls-files |
+              grep -E '(^|/)\.env($|\.)' |
+              grep -vE '(^|/)\.env\.example$' ||
+              true
+          )"
+
+          if [[ -n "${tracked_env_files}" ]]; then
+            echo "::error::Tracked environment-secret files are forbidden:"
+            echo "${tracked_env_files}"
+            exit 1
+          fi
+
+          forbidden='(^|/)(node_modules|\.next|\.pytest_cache|__pycache__|test-results|\.uat)(/|$)'
+
+          matches="$(git ls-files | grep -E "${forbidden}" || true)"
+
+          if [[ -n "${matches}" ]]; then
+            echo "::error::Generated artifacts are tracked:"
+            echo "${matches}"
+            exit 1
+          fi
+
+  python-core:
+    name: python-core
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Compile Python sources
+        run: python -m compileall -q api app scripts tests
+
+      - name: Run deterministic core tests
+        run: >
+          python -m pytest
+          tests/test_ingest.py
+          tests/test_compile.py
+          tests/test_relate.py
+          tests/test_ontology.py
+          tests/test_consistency.py
+          tests/test_doc_admin.py
+          -q
+
+  frontend-unit-build:
+    name: frontend-unit-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Jest
+        run: npm test -- --runInBand
+
+      - name: Build Next.js
+        run: npm run build

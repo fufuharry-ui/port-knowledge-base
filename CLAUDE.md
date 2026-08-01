@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-> Version: 1.1 | Updated: 2026-07-27
+> Version: 1.2 | Updated: 2026-08-01
 
 本文件定义 Claude Code 在本仓库中的开发权限、工作流程、架构边界和验证要求。
 
@@ -528,8 +528,16 @@ Git写操作必须由用户在当前任务中明确授权。
 建议角色分工：
 
 * Kimi K3：实施、测试和Bug修复；
-* GLM-5.2：架构分析、风险审查和PR Review；
-* 用户：任务批准、意见取舍和最终验收。
+* Codex GitHub Review：独立PR审查，检查当前Head的正确性、安全性、测试隔离和范围一致性；
+* 用户：任务批准、重要审查意见取舍和最终验收。
+
+Codex审查流程约定：
+
+* 使用PR评论 `@codex review` 触发审查；
+* Codex意见必须先验证，再决定修复或技术性回复，不得盲目执行；
+* 修改Head后必须重新执行required checks，并对新Head重新触发Codex审查；
+* Codex无问题结论必须对应当前Head，且Codex不能替代CI；
+* 不再将GLM作为默认审查模型。
 
 以下任一变化必须新开Claude Code会话：
 
@@ -723,7 +731,7 @@ git diff --check
 8. 多轮问答引用可能使用全局状态；
 9. 后台编译任务缺少可靠状态和错误记录；
 10. 测试指南、路线图和当前代码可能存在漂移；
-11. 初始GitHub Actions门禁已建立，当前覆盖仓库完整性、确定性Python核心测试和前端单测/构建；完整后端与真正离线检索门禁待E001/E002扩展。
+11. GitHub Actions门禁已建立：`repository-integrity`、`python-core`、`frontend-unit-build` 三个required checks；E001已在 `python-core` 中增加 `pip check` 和无密钥startup smoke；当前 `python-core` 仍只运行99项确定性核心测试，不代表完整pytest绿色；真正离线检索及Embedding可选降级门禁待E002。
 
 ---
 

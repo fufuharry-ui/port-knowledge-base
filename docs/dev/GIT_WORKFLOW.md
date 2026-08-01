@@ -15,9 +15,29 @@
 - 一个worktree；
 - 一个PR；
 - Kimi实施；
-- GLM独立复审；
+- Codex GitHub Review独立审查；
 - Claude Code执行合并；
 - 合并后清理任务worktree和本地分支。
+
+标准流程：
+
+1. Kimi实施；
+2. 本地验证；
+3. 创建PR（base=dev）；
+4. required checks全部绿色；
+5. PR评论 `@codex review` 触发Codex审查；
+6. 验证并处理Codex意见（不得盲目执行，先验证再修复或技术性回复）；
+7. 若Head变化：新Head重新跑required checks并重新触发Codex审查；
+8. 所有review thread解决；
+9. 使用 `--match-head-commit` 守护合并。
+
+Codex意见分级处理：
+
+- P0/P1以及经核实有效的正确性、安全性P2：阻断合并，必须修复；
+- P3/LOW：经技术判断可登记后继续；
+- Codex"无问题"结论必须对应当前Head；
+- Codex不替代required checks；
+- 不再要求GLM审查。
 
 ## Branch Naming
 

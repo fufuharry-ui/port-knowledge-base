@@ -27,13 +27,13 @@
 4. required checks全部绿色；
 5. PR评论 `@codex review` 触发Codex审查；
 6. 验证并处理Codex意见（不得盲目执行，先验证再修复或技术性回复）；
-7. 若Head变化或base分支（`dev`）前进：对新状态重新跑required checks并重新触发Codex审查；Codex结论必须对应合并时的当前Head与当前base；
+7. 若Head变化或base分支（`dev`）前进：不得直接合并。base前进时，经用户授权后将最新`origin/dev`合并进任务分支产生新Head（触发`pull_request` synchronize事件，required checks针对新Head+新base重新执行；仅重跑旧check run无效，其事件负载仍指向旧base）；随后对新Head重新触发Codex审查。Codex结论必须对应合并时的当前Head与当前base；
 8. 所有review thread解决；
 9. 使用 `--match-head-commit` 守护合并。
 
 Codex意见分级处理：
 
-- P0/P1以及经核实有效的正确性、安全性、测试隔离P2：阻断合并，必须修复；
+- P0/P1以及经核实有效的正确性、安全性、测试隔离、范围一致性P2：阻断合并，必须修复；
 - P3/LOW：经技术判断可登记后继续；
 - Codex"无问题"结论必须对应当前Head；
 - Codex不替代required checks；

@@ -3,8 +3,13 @@
 ## Status
 
 - Task: E001
+- State: **COMPLETE_AND_MERGED**
+- PR: [#3](https://github.com/fufuharry-ui/port-knowledge-base/pull/3) `chore: establish E001 dependency and startup baseline`
+- Reviewed Head: `da74075a6037694272ffde6ee5706ec17fe1ef6d`
+- Merge commit: `0f50c8e15c23e0ab7e5b8dc09904860d21fc6208`
+- Merged at: 2026-08-01T10:55:41Z (base=`dev`)
 - Base: `origin/dev` @ `8c183a03ba2172193bb82d6bf07a9256663d14af`
-- Feature branch: `chore/e001-dependency-startup-baseline`
+- Feature branch: `chore/e001-dependency-startup-baseline`（合并后已删除）
 - Risk: infrastructure
 - Production code changes: none
 - Design: `docs/superpowers/specs/2026-07-28-e001-dependency-startup-design.md`（方案A）
@@ -77,7 +82,23 @@
 
 ### CI（GitHub Actions，Python 3.11）
 
-待 PR 创建后以 `python-core` job 实际运行结果为准（层 1 权威门禁）。
+PR #3 实际运行结果（workflow run [30695557643](https://github.com/fufuharry-ui/port-knowledge-base/actions/runs/30695557643)，Head `da74075a6037694272ffde6ee5706ec17fe1ef6d`）：
+
+| Check | Status | 时间 | Job |
+|---|---|---|---|
+| `repository-integrity` | SUCCESS | 2026-08-01T10:21:43Z → 10:21:50Z | [91357729184](https://github.com/fufuharry-ui/port-knowledge-base/actions/runs/30695557643/job/91357729184) |
+| `python-core` | SUCCESS | 2026-08-01T10:21:49Z → 10:22:16Z | [91357729188](https://github.com/fufuharry-ui/port-knowledge-base/actions/runs/30695557643/job/91357729188) |
+| `frontend-unit-build` | SUCCESS | 2026-08-01T10:21:42Z → 10:22:29Z | [91357729199](https://github.com/fufuharry-ui/port-knowledge-base/actions/runs/30695557643/job/91357729199) |
+
+`python-core` 实际执行了 install、`pip check`、compileall、startup smoke 与 6 文件核心套件，一次通过。
+
+### Codex Review
+
+- 触发方式：PR 评论 `@codex review`；
+- 审查 commit：`da74075a60`（即合并前最终 Head）；
+- 结论（chatgpt-codex-connector，2026-08-01T10:24:58Z）：**"Didn't find any major issues."**；
+- 无 P0–P3 发现；
+- 无未解决 review thread。
 
 ## Full Pytest Audit（只审计，不要求绿色）
 

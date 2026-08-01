@@ -15,9 +15,29 @@
 - 一个worktree；
 - 一个PR；
 - Kimi实施；
-- GLM独立复审；
+- Codex GitHub Review独立审查；
 - Claude Code执行合并；
 - 合并后清理任务worktree和本地分支。
+
+标准流程：
+
+1. Kimi实施；
+2. 本地验证；
+3. 创建PR（base=dev）；
+4. required checks全部绿色；
+5. PR评论 `@codex review` 触发Codex审查；
+6. 验证并处理Codex意见（不得盲目执行，先验证再修复或技术性回复）；
+7. 若Head变化或base分支（`dev`）前进：不得直接合并。base前进时，经用户授权后将最新`origin/dev`合并进任务分支产生新Head（触发`pull_request` synchronize事件，required checks针对新Head+新base重新执行；仅重跑旧check run无效，其事件负载仍指向旧base）；随后对新Head重新触发Codex审查。Codex结论必须对应合并时的当前Head与当前base；
+8. 所有review thread解决；
+9. 使用 `--match-head-commit` 守护合并。
+
+Codex意见分级处理：
+
+- P0/P1以及经核实有效的正确性、安全性、测试隔离、范围一致性P2：阻断合并，必须修复；
+- P3/LOW：经技术判断可登记后继续；
+- Codex"无问题"结论必须对应当前Head；
+- Codex不替代required checks；
+- 不再要求GLM审查。
 
 ## Branch Naming
 
@@ -32,24 +52,24 @@
 - 禁止直接push `dev`；
 - 禁止force push；
 - 必须通过required checks；
-- 中高风险任务必须取得独立复审APPROVE；
+- 中高风险任务必须完成Codex独立审查且审查意见全部处理完毕（Codex以review comment形式给出结论，不产生APPROVE状态，因此不再以APPROVE作为门禁；是否采纳意见由用户最终裁定）；
 - merge method使用merge commit；
 - 不使用rebase merge；
 - squash仅由用户针对特定PR明确授权。
 
 ## Initial Required Checks
 
-初始required checks为三个：
+required checks为三个：
 
 - **repository-integrity**：检查变更文件的空白错误（`git diff --check`），拒绝被跟踪的`.env`和生成产物（`node_modules`、`.next`、`.pytest_cache`、`__pycache__`、`test-results`、`.uat`等）；
-- **python-core**：在干净环境中安装`requirements.txt`，编译全部Python源码，并运行确定性核心测试子集（`test_ingest`、`test_compile`、`test_relate`、`test_ontology`、`test_consistency`、`test_doc_admin`）；
+- **python-core**：在干净环境中安装`requirements.txt`并执行`pip check`，编译全部Python源码，运行无密钥startup smoke（`tests/test_startup_smoke.py`），并运行确定性核心测试子集（`test_ingest`、`test_compile`、`test_relate`、`test_ontology`、`test_consistency`、`test_doc_admin`，当前99项）；
 - **frontend-unit-build**：`npm ci`、Jest单元测试、Next.js生产构建。
 
 同时明确：
 
-- 初始`python-core`不是完整后端验证；
-- 不得把它描述为全量pytest；
-- E001/E002完成后扩大门禁。
+- `python-core`不是完整后端验证；
+- 不得把它描述为全量pytest（E001完整pytest审计为237通过/7失败，失败项已分类登记）；
+- E001已完成依赖声明、`pip check`与startup smoke门禁扩展；真正离线检索及Embedding可选降级门禁待E002。
 
 ## GitHub CLI
 

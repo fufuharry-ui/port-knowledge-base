@@ -59,17 +59,17 @@ Codex意见分级处理：
 
 ## Initial Required Checks
 
-初始required checks为三个：
+required checks为三个：
 
 - **repository-integrity**：检查变更文件的空白错误（`git diff --check`），拒绝被跟踪的`.env`和生成产物（`node_modules`、`.next`、`.pytest_cache`、`__pycache__`、`test-results`、`.uat`等）；
-- **python-core**：在干净环境中安装`requirements.txt`，编译全部Python源码，并运行确定性核心测试子集（`test_ingest`、`test_compile`、`test_relate`、`test_ontology`、`test_consistency`、`test_doc_admin`）；
+- **python-core**：在干净环境中安装`requirements.txt`并执行`pip check`，编译全部Python源码，运行无密钥startup smoke（`tests/test_startup_smoke.py`），并运行确定性核心测试子集（`test_ingest`、`test_compile`、`test_relate`、`test_ontology`、`test_consistency`、`test_doc_admin`，当前99项）；
 - **frontend-unit-build**：`npm ci`、Jest单元测试、Next.js生产构建。
 
 同时明确：
 
-- 初始`python-core`不是完整后端验证；
-- 不得把它描述为全量pytest；
-- E001/E002完成后扩大门禁。
+- `python-core`不是完整后端验证；
+- 不得把它描述为全量pytest（E001完整pytest审计为237通过/7失败，失败项已分类登记）；
+- E001已完成依赖声明、`pip check`与startup smoke门禁扩展；真正离线检索及Embedding可选降级门禁待E002。
 
 ## GitHub CLI
 

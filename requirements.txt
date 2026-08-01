@@ -19,5 +19,11 @@ fastapi>=0.111.0          # Web 框架
 uvicorn[standard]>=0.29.0 # ASGI 服务器
 python-multipart>=0.0.9   # 文件上传（multipart/form-data）
 jieba>=0.42.1             # 中文分词（替换 Layer 1 空格切词）
+pydantic>=2.7.0           # 数据模型（api/main.py 与 app/schemas.py 直接 import）
+sse-starlette>=2.1.0      # SSE 响应（api/main.py 顶层 import）
+requests>=2.31.0          # HTTP 客户端（scripts/embedding_client.py 顶层 import）
 httpx>=0.27.0             # 异步 HTTP 客户端（TestClient 依赖）
+
+# ─── 测试依赖 ───────────────────────────────────────────
+pytest>=8.2.0             # 测试框架（tests/ 直接 import）
 pytest-asyncio>=0.23.0    # 异步测试支持

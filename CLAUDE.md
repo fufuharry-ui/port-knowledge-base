@@ -714,9 +714,9 @@ git diff --check
 以下风险必须通过独立任务处理，不得在无授权时顺手修复：
 
 1. `main`、`dev`、`master` 的Git历史基线异常；
-2. 依赖文件与真实运行依赖可能不一致；
+2. ~~依赖文件与真实运行依赖可能不一致~~（E001已处理：`requirements.txt` 已显式覆盖全部真实直接运行与测试依赖，干净环境 install + `pip check` 在本地 Python 3.12 与 CI Python 3.11 均通过）；
 3. Embedding尚未实现可靠可选降级；
-4. pytest离线边界需要重新验证；
+4. ~~pytest离线边界需要重新验证~~（E001已完成无密钥干净环境完整审计：237通过/7失败；6项为Embedding缺失类归入E002，1项为`test_consistency_post_triggers_check`对LLM Key的隐式依赖，登记为后续测试隔离债务；详见 `docs/dev/tasks/E001-dependency-startup-baseline.md`）；
 5. `api/main.py` 与 `app/` 两套后端分叉；
 6. 共享YAML存在并发覆盖和半成品风险；
 7. 文档ID生成存在编号空洞和并发风险；

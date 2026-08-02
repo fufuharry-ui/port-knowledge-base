@@ -7,11 +7,27 @@ import type { CitationMeta } from '@/lib/qa-stream';
 import { streamQA } from '@/lib/qa-stream';
 import { cn } from '@/lib/utils';
 
-interface Message {
+type AssistantStatus =
+    | 'streaming'
+    | 'completed'
+    | 'stopped'
+    | 'error';
+
+interface UserMessage {
     id: string;
-    role: 'user' | 'assistant';
+    role: 'user';
     content: string;
 }
+
+interface AssistantMessage {
+    id: string;
+    role: 'assistant';
+    content: string;
+    citations: CitationMeta[];
+    status: AssistantStatus;
+}
+
+type Message = UserMessage | AssistantMessage;
 
 interface ThoughtStep {
     step: number;
@@ -27,7 +43,6 @@ interface ChatPanelProps {
 export default function ChatPanel({ onHighlight }: ChatPanelProps) {
     const [messages, setMessages] = useState<Message[]>([]);
     const [thoughts, setThoughts] = useState<ThoughtStep[]>([]);
-    const [citations, setCitations] = useState<CitationMeta[]>([]);
     const [isStreaming, setIsStreaming] = useState(false);
     const [inputValue, setInputValue] = useState('');
     const listRef = useRef<HTMLDivElement>(null);
@@ -48,6 +63,24 @@ export default function ChatPanel({ onHighlight }: ChatPanelProps) {
         stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
     }, []);
 
+    /** 按 id 更新 assistant 消息;非 assistant 或 id 不匹配时原样返回 */
+    const updateAssistant = useCallback((
+        id: string,
+        updater: (m: AssistantMessage) => AssistantMessage,
+    ) => {
+        setMessages(prev => prev.map(m =>
+            m.id === id && m.role === 'assistant' ? updater(m) : m,
+        ));
+    }, []);
+
+    /** 仅当消息仍处于 streaming 时才应用更新——终态消息的迟到写入一律丢弃 */
+    const updateStreamingAssistant = useCallback((
+        id: string,
+        updater: (m: AssistantMessage) => AssistantMessage,
+    ) => {
+        updateAssistant(id, m => (m.status === 'streaming' ? updater(m) : m));
+    }, [updateAssistant]);
+
     const handleSubmit = useCallback(async () => {
         const query = inputValue.trim();
         if (!query || isStreaming) return;
@@ -67,7 +100,6 @@ export default function ChatPanel({ onHighlight }: ChatPanelProps) {
         setMessages(prev => [...prev, userMsg]);
         setInputValue('');
         setThoughts([]);
-        setCitations([]);
         setIsStreaming(true);
         stickToBottomRef.current = true;
 
@@ -77,6 +109,8 @@ export default function ChatPanel({ onHighlight }: ChatPanelProps) {
             id: assistantId,
             role: 'assistant',
             content: '',
+            citations: [],
+            status: 'streaming',
         };
         setMessages(prev => [...prev, assistantMsg]);
         requestAnimationFrame(scrollToBottom);
@@ -96,7 +130,10 @@ export default function ChatPanel({ onHighlight }: ChatPanelProps) {
                         break;
 
                     case 'source':
-                        setCitations(event.citations);
+                        updateStreamingAssistant(assistantId, m => ({
+                            ...m,
+                            citations: event.citations,
+                        }));
                         break;
 
                     case 'entity':
@@ -104,15 +141,18 @@ export default function ChatPanel({ onHighlight }: ChatPanelProps) {
                         break;
 
                     case 'delta':
-                        setMessages(prev => prev.map(m =>
-                            m.id === assistantId
-                                ? { ...m, content: m.content + event.text }
-                                : m
-                        ));
+                        updateStreamingAssistant(assistantId, m => ({
+                            ...m,
+                            content: m.content + event.text,
+                        }));
                         scrollToBottom();
                         break;
 
                     case 'done':
+                        updateStreamingAssistant(assistantId, m => ({
+                            ...m,
+                            status: 'completed',
+                        }));
                         setIsStreaming(false);
                         break;
                 }
@@ -133,7 +173,7 @@ export default function ChatPanel({ onHighlight }: ChatPanelProps) {
             setIsStreaming(false);
             abortRef.current = null;
         }
-    }, [inputValue, isStreaming, messages, onHighlight, scrollToBottom]);
+    }, [inputValue, isStreaming, messages, onHighlight, scrollToBottom, updateStreamingAssistant]);
 
     const canSend = Boolean(inputValue.trim()) && !isStreaming;
 
@@ -194,7 +234,7 @@ export default function ChatPanel({ onHighlight }: ChatPanelProps) {
                         <ChatBubble
                             role={msg.role}
                             content={msg.content}
-                            citations={msg.role === 'assistant' ? citations : []}
+                            citations={msg.role === 'assistant' ? msg.citations : []}
                         />
                     </React.Fragment>
                 ))}

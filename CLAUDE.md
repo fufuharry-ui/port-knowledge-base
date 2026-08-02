@@ -414,7 +414,7 @@ API返回“已接受处理”不得描述为“已成功完成”。
 5. 新请求不会覆盖旧消息状态；
 6. 引用跳转仍指向对应文档。
 
-当前 `frontend/src/components/ChatPanel.tsx` 可能存在全局citations覆盖历史回答的已知缺陷，尚未修复。
+~~当前 `frontend/src/components/ChatPanel.tsx` 可能存在全局citations覆盖历史回答的已知缺陷，尚未修复。~~（E003已处理：引用、正文和生成状态迁移为assistant消息级状态，ActiveRequest请求身份守卫覆盖停止竞态与旧请求清理；历史thoughts仍不持久化，仍为当前轮临时状态；详见 `docs/dev/tasks/E003-message-scoped-citations.md`）
 
 ---
 
@@ -727,7 +727,7 @@ git diff --check
 5. `api/main.py` 与 `app/` 两套后端分叉；
 6. 共享YAML存在并发覆盖和半成品风险；
 7. 文档ID生成存在编号空洞和并发风险；
-8. 多轮问答引用可能使用全局状态；
+8. ~~多轮问答引用可能使用全局状态~~（E003已处理：引用、正文和生成状态迁移为assistant消息级状态，ActiveRequest请求身份守卫覆盖停止竞态与旧请求清理；历史thoughts仍不持久化；详见 `docs/dev/tasks/E003-message-scoped-citations.md`）；
 9. 后台编译任务缺少可靠状态和错误记录；
 10. 测试指南、路线图和当前代码可能存在漂移；
 11. GitHub Actions门禁已建立：`repository-integrity`、`python-core`、`frontend-unit-build` 三个required checks；E001已在 `python-core` 中增加 `pip check` 和无密钥startup smoke；E002已在 `python-core` 的 startup smoke 之后增加真正离线检索门禁（无密钥+黑洞代理运行 `test_embedding_fallback`、`test_search`、`test_hybrid_search`、`test_api_qa` 四文件）；T001已在 `python-core` 的99项确定性核心测试之后新增 `Run full backend test suite`（无密钥+黑洞代理运行完整 `pytest tests/ -q`）作为最终后端门禁，startup smoke、离线检索、99项核心测试保留为分层诊断步骤；完整pytest绿色不得解释为前端E2E或真实栈UAT已完成。

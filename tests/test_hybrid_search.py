@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import patch
+from unittest.mock import MagicMock
 from scripts.search import BM25Engine, VectorEngine, reciprocal_rank_fusion
 
 def test_bm25_exact_match():
@@ -10,22 +10,26 @@ def test_bm25_exact_match():
     ]
     engine = BM25Engine(docs)
     scores = engine.search("岸桥远控")
-    
+
     # 期望 d1 分数最高
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     assert ranked[0][0] == "d1"
 
-@patch("scripts.embedding_client.EmbeddingClient.get_embedding")
-def test_vector_semantic_search(mock_get_embedding):
+def test_vector_semantic_search():
+    # E002: 经 client 注入确定性假客户端,不构造真实 EmbeddingClient,
+    # 不设置真实 Key,不访问网络
     docs = [
         {"id": "d1", "text": "通信要求很高", "embedding": [1.0, 0.0, 0.0]},
         {"id": "d2", "text": "苹果很好吃", "embedding": [0.0, 1.0, 0.0]}
     ]
-    mock_get_embedding.return_value = [0.9, 0.1, 0.0]
-    
-    engine = VectorEngine(docs)
+    fake_client = MagicMock()
+    fake_client.get_embedding.return_value = [0.9, 0.1, 0.0]
+
+    engine = VectorEngine(docs, client=fake_client)
     scores = engine.search("网络延迟")
     assert scores.get("d1", 0) > scores.get("d2", 0)
+    # 文档自带 embedding,仅需一次查询向量调用
+    fake_client.get_embedding.assert_called_once_with("网络延迟")
 
 def test_rrf_fusion():
     bm25_scores = {"d1": 10.5, "d2": 5.2, "d3": 1.1}

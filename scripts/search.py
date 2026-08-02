@@ -11,6 +11,7 @@ scripts/search.py — 渐进式三层检索脚本
 """
 
 import json
+import logging
 import os
 import re
 import sys
@@ -28,6 +29,8 @@ INDEX_FILE = WIKI_DIR / "index.yaml"
 # (见 tests/conftest.py patch_search_paths)。
 GLOBAL_ONTOLOGY_FILE = BASE_DIR / "meta" / "ontology" / "global_ontology.yaml"
 TZ_CST = timezone(timedelta(hours=8))
+
+logger = logging.getLogger(__name__)
 
 
 # ─── LLM 客户端 ──────────────────────────────────────────────────────────────
@@ -162,10 +165,14 @@ def bm25_score(query_tokens: list[str], doc_terms: list[str], doc_abstract: str)
 
 
 class VectorEngine:
-    def __init__(self, docs: list[dict]):
+    def __init__(self, docs: list[dict], client=None):
         self.docs = docs
-        from scripts.embedding_client import EmbeddingClient
-        self.client = EmbeddingClient()
+        if client is None:
+            # E002: 默认保持严格 — EmbeddingClient 无 Key 时构造抛 RuntimeError,
+            # 由编排层(layer1_filter)决定降级;注入 client 时直接使用(可测试性)。
+            from scripts.embedding_client import EmbeddingClient
+            client = EmbeddingClient()
+        self.client = client
         
     def search(self, query: str) -> dict[str, float]:
         import math
@@ -221,6 +228,10 @@ def layer1_filter(query: str, index: dict, top_k: int = 20,
     Big-Loop #1 新增(本体查询扩展):若传入 ontology(含 ontology_tree),
     则把查询命中的本体术语的上位/兄弟词注入 BM25 加权,捞回"字面词 miss、
     本体相关"的文档。ontology=None 时行为与旧版完全一致(向后兼容)。
+
+    E002: Embedding 是可选增强。VectorEngine 初始化或调用失败(未配置 Key、
+    请求异常等)时记录 warning 并降级为 BM25-only 检索,不向调用方抛出
+    Embedding 异常;Embedding 可用时混合检索(BM25+向量 RRF/向量召回)不变。
     """
     docs = index.get("documents", [])
     if not docs:
@@ -247,12 +258,31 @@ def layer1_filter(query: str, index: dict, top_k: int = 20,
             pass
 
     bm25 = BM25Engine(docs)
-    vector = VectorEngine(docs)
 
-    # BM25 用扩展后的查询;向量仍用原始查询(语义不稀释)
+    # BM25 用扩展后的查询;向量仍用原始查询(语义不稀释)。
+    # BM25 是基础检索,不在任何 try 内 — 其异常照常向调用方抛出。
     bm25_scores = bm25.search(expanded_query)
-    vector_scores = vector.search(query)
-    
+
+    # E002: Embedding 为可选增强。只捕获 Embedding 路径(构造+调用)异常;
+    # warning 只含异常类型名,不含 Key/Authorization/请求响应内容。
+    try:
+        vector_scores = VectorEngine(docs).search(query)
+    except Exception as exc:
+        logger.warning(
+            "Embedding 不可用,Layer 1 降级为 BM25 关键词检索 (%s)",
+            type(exc).__name__,
+        )
+        vector_scores = {}
+
+    # Embedding 不可用:直接按 BM25 原始分数降序,遵守 top_k;
+    # BM25 无命中返回空列表(不用空向量制造伪命中,不返回所有文档)。
+    if not vector_scores:
+        if not bm25_scores:
+            return []
+        id_to_doc = {d["id"]: d for d in docs}
+        ranked = sorted(bm25_scores.items(), key=lambda x: x[1], reverse=True)
+        return [id_to_doc[doc_id] for doc_id, _ in ranked[:top_k]]
+
     # Only include docs that have at least a BM25 hit, or are in vector results
     # (prevent all-zero embedding vectors from inflating unrelated docs)
     candidate_ids = set(bm25_scores.keys()) | set(vector_scores.keys())

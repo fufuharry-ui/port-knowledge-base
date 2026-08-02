@@ -320,3 +320,322 @@ describe('多轮问答消息级引用', () => {
         expect(linksA[0]).toHaveAttribute('href', '/wiki/doc_A');
     });
 });
+
+describe('停止语义与迟到事件守卫', () => {
+    test('T2.1 收到source后停止:保留正文和引用,追加一次停止提示', async () => {
+        const user = userEvent.setup();
+        render(<ChatPanel />);
+        const s1 = queueStream();
+        await askQuestion(user, '问题');
+        await s1.emit({ type: 'source', citations: DOC_A });
+        await s1.emit({ type: 'delta', text: '部分正文[1]。' });
+        await screen.findByText(/部分正文/);
+
+        await user.click(screen.getByTestId('chat-stop'));
+        await act(async () => { await s1.fail(abortError()); });
+
+        const [bubble] = assistantBubbles();
+        await waitFor(() => expect(bubble.textContent).toMatch(/⏹\s*\*?已停止生成\*?/));
+        expect(bubble.textContent).toContain('部分正文');
+        expect(within(bubble).getByTestId('citation-trigger')).toHaveTextContent('[1]');
+        // 停止提示只出现一次
+        expect(bubble.textContent!.match(/已停止生成/g)).toHaveLength(1);
+        expect(screen.getByTestId('chat-input')).toBeEnabled();
+    });
+
+    test('T2.2 未收到source前停止:引用保持空,正文追加停止提示', async () => {
+        const user = userEvent.setup();
+        render(<ChatPanel />);
+        const s1 = queueStream();
+        await askQuestion(user, '问题');
+        await s1.emit({ type: 'delta', text: '部分正文' });
+        await screen.findByText(/部分正文/);
+
+        await user.click(screen.getByTestId('chat-stop'));
+        await act(async () => { await s1.fail(abortError()); });
+
+        const [bubble] = assistantBubbles();
+        await waitFor(() => expect(bubble.textContent).toMatch(/已停止生成/));
+        expect(within(bubble).queryByTestId('citation-trigger')).not.toBeInTheDocument();
+    });
+
+    test('T-R1 点击停止立即建立同步守卫:全部五类迟到事件被消费但全部忽略', async () => {
+        const user = userEvent.setup();
+        const onHighlight = jest.fn();
+        render(<ChatPanel onHighlight={onHighlight} />);
+        const s1 = queueStream();
+        await askQuestion(user, '问题');
+        await s1.emit({ type: 'source', citations: DOC_A });
+        await s1.emit({ type: 'delta', text: '部分正文[1]。' });
+        await screen.findByText(/部分正文/);
+
+        // 点击停止;生成器尚未抛 AbortError
+        await user.click(screen.getByTestId('chat-stop'));
+        // 逐条投递全部五类迟到事件;emitAndWaitForNextPull 等待组件再次调用 next(),
+        // 证明每个事件都确实进入 for-await 循环体并被守卫忽略(而非未到达组件的假绿)
+        await s1.emitAndWaitForNextPull({ type: 'thought', step: 99, message: '迟到思考' });
+        await s1.emitAndWaitForNextPull({ type: 'source', citations: DOC_B });
+        await s1.emitAndWaitForNextPull({ type: 'entity', ids: ['doc_B'] });
+        await s1.emitAndWaitForNextPull({ type: 'delta', text: '迟到正文' });
+        await s1.emitAndWaitForNextPull({ type: 'done' });
+        // 现在才让生成器抛 AbortError
+        await act(async () => { await s1.fail(abortError()); });
+
+        const [bubble] = assistantBubbles();
+        // 引用仍是 A([1] 仍映射 doc_A;迟到 source 不得替换)
+        expect(within(bubble).getByTestId('citation-trigger')).toHaveTextContent('[1]');
+        await user.hover(within(bubble).getByTestId('citation-trigger'));
+        const links = await screen.findAllByTestId('citation-link-doc_A', undefined, { timeout: 3000 });
+        expect(links[0]).toHaveAttribute('href', '/wiki/doc_A');
+        // 正文不追加迟到 delta
+        expect(bubble.textContent).not.toContain('迟到正文');
+        // onHighlight 不响应迟到 entity
+        expect(onHighlight).not.toHaveBeenCalled();
+        // ThoughtTrace 不增加迟到 thought
+        expect(screen.queryByTestId('thought-step-99')).not.toBeInTheDocument();
+        // 状态不变为 completed:停止提示存在且唯一
+        expect(bubble.textContent!.match(/已停止生成/g)).toHaveLength(1);
+        // UI 已恢复且不被 late done 再次改变
+        expect(screen.getByTestId('chat-input')).toBeEnabled();
+    });
+
+    test('T2.6 当前请求非显式AbortError:幂等兜底停止一次', async () => {
+        const user = userEvent.setup();
+        render(<ChatPanel />);
+        const s1 = queueStream();
+        await askQuestion(user, '问题');
+        await s1.emit({ type: 'delta', text: '部分正文' });
+        await screen.findByText(/部分正文/);
+
+        // 不点击停止按钮,直接让流抛 AbortError(模拟 reader 自发中止)
+        await act(async () => { await s1.fail(abortError()); });
+
+        const [bubble] = assistantBubbles();
+        await waitFor(() => expect(bubble.textContent).toMatch(/已停止生成/));
+        // 兜底只执行一次
+        expect(bubble.textContent!.match(/已停止生成/g)).toHaveLength(1);
+        expect(bubble.textContent).toContain('部分正文');
+        expect(screen.getByTestId('chat-input')).toBeEnabled();
+    });
+
+    test('T2.8 HTTP错误事件契约(delta+done):错误文本正常完成,输入恢复', async () => {
+        // 本测试验证 ChatPanel 对 streamQA 的 HTTP 错误事件契约保持兼容;
+        // 不声称覆盖 fetch 或 qa-stream 内部 HTTP 分支(那是 qa-stream 的职责)。
+        const user = userEvent.setup();
+        render(<ChatPanel />);
+        const s1 = queueStream();
+        await askQuestion(user, '问题');
+        // 模拟 streamQA 对 HTTP 非 2xx 的组件侧契约:delta 错误文本 + done
+        await s1.emit({ type: 'delta', text: '⚠️ 请求失败 (500)' });
+        await s1.emit({ type: 'done' });
+
+        await screen.findByText(/⚠️ 请求失败 \(500\)/);
+        const [bubble] = assistantBubbles();
+        // 不进入 catch 的错误文本语义
+        expect(bubble.textContent).not.toContain('⚠️ 流式请求失败');
+        // 消息按正常 done 完成:输入恢复、停止按钮消失
+        await waitFor(() => expect(screen.getByTestId('chat-input')).toBeEnabled());
+        expect(screen.queryByTestId('chat-stop')).not.toBeInTheDocument();
+        // 下一轮可正常发送
+        const s2 = queueStream();
+        await askQuestion(user, '下一轮');
+        await s2.emit({ type: 'delta', text: '正常回答' });
+        await screen.findByText(/正常回答/);
+        await s2.emit({ type: 'done' });
+        await waitFor(() => expect(screen.getByTestId('chat-input')).toBeEnabled());
+    });
+
+    test('T2.9 当前请求的entity事件调用onHighlight', async () => {
+        const user = userEvent.setup();
+        const onHighlight = jest.fn();
+        render(<ChatPanel onHighlight={onHighlight} />);
+        const s1 = queueStream();
+        await askQuestion(user, '问题');
+        await s1.emit({ type: 'entity', ids: ['doc_A', 'doc_B'] });
+        await waitFor(() => expect(onHighlight).toHaveBeenCalledTimes(1));
+        expect(onHighlight).toHaveBeenCalledWith(['doc_A', 'doc_B']);
+        await s1.emit({ type: 'done' });
+        await waitFor(() => expect(screen.getByTestId('chat-input')).toBeEnabled());
+    });
+
+    test('T2.10 流式交互门禁:进行中禁用输入,结束后恢复', async () => {
+        const user = userEvent.setup();
+        render(<ChatPanel />);
+        const s1 = queueStream();
+        await askQuestion(user, '问题');
+        await s1.emit({ type: 'delta', text: '流式正文' });
+        await screen.findByText(/流式正文/);
+
+        // 流式进行中
+        expect(screen.getByTestId('chat-input')).toBeDisabled();
+        expect(screen.getByTestId('chat-submit')).toBeDisabled();
+        expect(screen.getByTestId('chat-stop')).toBeInTheDocument();
+        expect(screen.getByText('推理中')).toBeInTheDocument();
+
+        // 正常 done 后
+        await s1.emit({ type: 'done' });
+        await waitFor(() => expect(screen.getByTestId('chat-input')).toBeEnabled());
+        expect(screen.getByTestId('chat-submit')).toBeDisabled(); // 空输入仍禁用(独立契约)
+        expect(screen.queryByTestId('chat-stop')).not.toBeInTheDocument();
+        expect(screen.queryByText('推理中')).not.toBeInTheDocument();
+
+        // 输入新文本后发送按钮启用
+        await user.type(screen.getByTestId('chat-input'), '新问题');
+        expect(screen.getByTestId('chat-submit')).toBeEnabled();
+    });
+});
+
+describe('请求身份竞态', () => {
+    test('T-R2 旧请求的finally不得清理新请求', async () => {
+        const user = userEvent.setup();
+        render(<ChatPanel />);
+        // 第一轮
+        const s1 = queueStream();
+        await askQuestion(user, '第一轮');
+        await s1.emit({ type: 'delta', text: '第一轮正文' });
+        await screen.findByText(/第一轮正文/);
+        // 点击停止 → UI 应立即允许下一轮(不等 AbortError)
+        await user.click(screen.getByTestId('chat-stop'));
+        await waitFor(() => expect(screen.getByTestId('chat-input')).toBeEnabled());
+        // 第一轮生成器暂不结束(catch/finally 未完成),启动第二轮
+        const s2 = queueStream();
+        await askQuestion(user, '第二轮');
+        await s2.emit({ type: 'delta', text: '第二轮正文' });
+        await screen.findByText(/第二轮正文/);
+        expect(screen.getByTestId('chat-stop')).toBeInTheDocument();
+        // 现在让第一轮生成器结束:旧 catch/finally 执行
+        await act(async () => { await s1.fail(abortError()); });
+        // 第二轮仍保持 streaming,停止按钮仍可用
+        expect(screen.getByTestId('chat-stop')).toBeInTheDocument();
+        expect(screen.getByTestId('chat-input')).toBeDisabled();
+        expect(screen.getByText('推理中')).toBeInTheDocument();
+        // 第一轮消息保持停止终态,不被旧路径改写
+        const bubbles = assistantBubbles();
+        expect(bubbles[0].textContent).toContain('已停止生成');
+        // 点击第二轮停止,确认停止的是第二轮 controller
+        await user.click(screen.getByTestId('chat-stop'));
+        expect(s2.signal?.aborted).toBe(true);
+        await act(async () => { await s2.fail(abortError()); });
+        await waitFor(() => expect(screen.getByTestId('chat-input')).toBeEnabled());
+    });
+
+    test('T-R3 旧请求的非Abort异常不得污染新请求,也不得改写已停止消息', async () => {
+        const user = userEvent.setup();
+        render(<ChatPanel />);
+        const s1 = queueStream();
+        await askQuestion(user, '第一轮');
+        await s1.emit({ type: 'delta', text: '第一轮正文' });
+        await screen.findByText(/第一轮正文/);
+        await user.click(screen.getByTestId('chat-stop'));
+        await waitFor(() => expect(screen.getByTestId('chat-input')).toBeEnabled());
+        // 第二轮进行中
+        const s2 = queueStream();
+        await askQuestion(user, '第二轮');
+        await s2.emit({ type: 'delta', text: '第二轮正文' });
+        await screen.findByText(/第二轮正文/);
+        // 第一轮随后抛非 Abort 错误
+        await act(async () => { await s1.fail(new Error('network boom')); });
+        // 第二轮不受影响
+        expect(screen.getByText('推理中')).toBeInTheDocument();
+        expect(screen.getByTestId('chat-stop')).toBeInTheDocument();
+        const bubbles = assistantBubbles();
+        expect(bubbles[1].textContent).toContain('第二轮正文');
+        expect(bubbles[1].textContent).not.toContain('⚠️ 流式请求失败');
+        // 已停止的第一轮也不被旧异常改写
+        expect(bubbles[0].textContent).toContain('已停止生成');
+        expect(bubbles[0].textContent).not.toContain('⚠️ 流式请求失败');
+        // 收尾:正常停止第二轮
+        await user.click(screen.getByTestId('chat-stop'));
+        await act(async () => { await s2.fail(abortError()); });
+        await waitFor(() => expect(screen.getByTestId('chat-input')).toBeEnabled());
+    });
+
+    test('T-R4 正常done统一收口:输入恢复,下一轮可启动,无双重清理', async () => {
+        const user = userEvent.setup();
+        render(<ChatPanel />);
+        const s1 = queueStream();
+        await askQuestion(user, '第一轮');
+        await s1.emit({ type: 'delta', text: '正文' });
+        await s1.emit({ type: 'done' });
+        await waitFor(() => expect(screen.getByTestId('chat-input')).toBeEnabled());
+        expect(screen.queryByText('推理中')).not.toBeInTheDocument();
+        // 下一轮可启动并正常 streaming
+        const s2 = queueStream();
+        await askQuestion(user, '第二轮');
+        await s2.emit({ type: 'delta', text: '第二轮正文' });
+        await screen.findByText(/第二轮正文/);
+        expect(screen.getByTestId('chat-stop')).toBeInTheDocument();
+        expect(screen.getByText('推理中')).toBeInTheDocument();
+        await s2.emit({ type: 'done' });
+        await waitFor(() => expect(screen.getByTestId('chat-input')).toBeEnabled());
+    });
+
+    test('T2.5 当前请求的普通错误:整体替换为错误文本(现状产品行为)', async () => {
+        const user = userEvent.setup();
+        render(<ChatPanel />);
+        const s1 = queueStream();
+        await askQuestion(user, '问题');
+        await s1.emit({ type: 'source', citations: DOC_A });
+        await s1.emit({ type: 'delta', text: '部分正文[1]。' });
+        await screen.findByText(/部分正文/);
+        await act(async () => { await s1.fail(new Error('boom')); });
+        const [bubble] = assistantBubbles();
+        await waitFor(() => expect(bubble.textContent).toMatch(/⚠️ 流式请求失败/));
+        expect(bubble.textContent).not.toContain('部分正文'); // 整体替换,不追加
+        expect(screen.getByTestId('chat-input')).toBeEnabled();
+    });
+
+    test('T2.7 stopped正文进入下一轮history,且history只含role/content', async () => {
+        const user = userEvent.setup();
+        render(<ChatPanel />);
+        const s1 = queueStream();
+        await askQuestion(user, '第一轮问题');
+        await s1.emit({ type: 'delta', text: '部分正文' });
+        await screen.findByText(/部分正文/);
+        await user.click(screen.getByTestId('chat-stop'));
+        await act(async () => { await s1.fail(abortError()); });
+        await waitFor(() => expect(screen.getByTestId('chat-input')).toBeEnabled());
+
+        const s2 = queueStream();
+        await askQuestion(user, '第二轮问题');
+        await s2.emit({ type: 'delta', text: '第二轮正文' });
+        await screen.findByText(/第二轮正文/);
+
+        const history = mockedStreamQA.mock.calls[1][1];
+        expect(history).toEqual([
+            { role: 'user', content: '第一轮问题' },
+            { role: 'assistant', content: '部分正文\n\n⏹ *已停止生成*' },
+        ]);
+        // history 项只含 role/content;不含 citations/status/assistantId/thoughts
+        for (const turn of history!) {
+            expect(Object.keys(turn).sort()).toEqual(['content', 'role']);
+        }
+        await s2.emit({ type: 'done' });
+        await waitFor(() => expect(screen.getByTestId('chat-input')).toBeEnabled());
+    });
+
+    test('T2.11 第二轮错误不得覆盖第一轮引用', async () => {
+        const user = userEvent.setup();
+        render(<ChatPanel />);
+        // 第一轮正常完成,引用 doc_A
+        const s1 = queueStream();
+        await askQuestion(user, '第一轮');
+        await s1.emit({ type: 'source', citations: DOC_A });
+        await s1.emit({ type: 'delta', text: '第一轮正文[1]。' });
+        await s1.emit({ type: 'done' });
+        await screen.findByText(/第一轮正文/);
+        await waitFor(() => expect(screen.getByTestId('chat-input')).toBeEnabled());
+        // 第二轮普通错误
+        const s2 = queueStream();
+        await askQuestion(user, '第二轮');
+        await s2.emit({ type: 'delta', text: '第二轮部分正文' });
+        await screen.findByText(/第二轮部分正文/);
+        await act(async () => { await s2.fail(new Error('boom')); });
+        await waitFor(() => expect(screen.getByTestId('chat-input')).toBeEnabled());
+        // 第一轮的 [1] 仍映射 doc_A
+        const bubbles = assistantBubbles();
+        await user.hover(within(bubbles[0]).getByTestId('citation-trigger'));
+        const links = await screen.findAllByTestId('citation-link-doc_A', undefined, { timeout: 3000 });
+        expect(links[0]).toHaveAttribute('href', '/wiki/doc_A');
+    });
+});

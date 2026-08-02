@@ -29,6 +29,12 @@ interface AssistantMessage {
 
 type Message = UserMessage | AssistantMessage;
 
+interface ActiveRequest {
+    assistantId: string;
+    controller: AbortController;
+    stopped: boolean;
+}
+
 interface ThoughtStep {
     step: number;
     message: string;
@@ -47,7 +53,7 @@ export default function ChatPanel({ onHighlight }: ChatPanelProps) {
     const [inputValue, setInputValue] = useState('');
     const listRef = useRef<HTMLDivElement>(null);
     const stickToBottomRef = useRef(true);
-    const abortRef = useRef<AbortController | null>(null);
+    const activeRequestRef = useRef<ActiveRequest | null>(null);
 
     /** 仅当用户停留在底部附近时才跟随滚动(避免逐 token 抖动、允许回看) */
     const scrollToBottom = useCallback(() => {
@@ -80,6 +86,35 @@ export default function ChatPanel({ onHighlight }: ChatPanelProps) {
     ) => {
         updateAssistant(id, m => (m.status === 'streaming' ? updater(m) : m));
     }, [updateAssistant]);
+
+    /** 最强守卫:对象身份 + 同步停止标志(ref 内同步可读,不等待 React 状态提交) */
+    const isWritableRequest = useCallback(
+        (request: ActiveRequest): boolean =>
+            activeRequestRef.current === request &&
+            !request.stopped,
+        [],
+    );
+
+    const handleStop = useCallback(() => {
+        const request = activeRequestRef.current;
+        if (!request || request.stopped) return; // 重复点击幂等:停止提示最多一次
+        // 1. 同步建立竞态守卫(必须先于 abort,不等待 React 状态提交)
+        request.stopped = true;
+        // 2. 消息终态:保留已有正文与引用,追加一次停止提示
+        //    (经 updateStreamingAssistant:已完成的消息不会被改回 stopped)
+        updateStreamingAssistant(request.assistantId, message => ({
+            ...message,
+            content:
+                message.content +
+                (message.content ? '\n\n' : '') +
+                '⏹ *已停止生成*',
+            status: 'stopped',
+        }));
+        // 3. 立即恢复输入界面
+        setIsStreaming(false);
+        // 4. 最后中止底层流
+        request.controller.abort();
+    }, [updateStreamingAssistant]);
 
     const handleSubmit = useCallback(async () => {
         const query = inputValue.trim();
@@ -116,10 +151,13 @@ export default function ChatPanel({ onHighlight }: ChatPanelProps) {
         requestAnimationFrame(scrollToBottom);
 
         const controller = new AbortController();
-        abortRef.current = controller;
+        const request: ActiveRequest = { assistantId, controller, stopped: false };
+        activeRequestRef.current = request;
 
         try {
             for await (const event of streamQA(query, history, undefined, controller.signal)) {
+                // 停止或被新请求替换后,全部事件(含 thought/entity)一律忽略
+                if (!isWritableRequest(request)) continue;
                 switch (event.type) {
                     case 'thought':
                         setThoughts(prev => [...prev, {
@@ -149,31 +187,56 @@ export default function ChatPanel({ onHighlight }: ChatPanelProps) {
                         break;
 
                     case 'done':
+                        // 只标记消息终态;isStreaming 与 ref 清理由 finally 统一执行
                         updateStreamingAssistant(assistantId, m => ({
                             ...m,
                             status: 'completed',
                         }));
-                        setIsStreaming(false);
                         break;
                 }
+                if (event.type === 'done') break; // 记录已收到 done:退出事件循环,交给 finally 收口
             }
         } catch (err) {
             const isAbort = err instanceof Error && err.name === 'AbortError';
-            setMessages(prev => prev.map(m =>
-                m.id === assistantId
-                    ? {
-                        ...m,
-                        content: isAbort
-                            ? m.content + (m.content ? '\n\n' : '') + '⏹ *已停止生成*'
-                            : `⚠️ 流式请求失败: ${err}`,
-                    }
-                    : m
-            ));
+            if (isAbort) {
+                // 用户显式停止:request.stopped 已为 true,仅吞掉,不追加第二次停止提示;
+                // 旧请求 AbortError:对象身份不匹配,完全忽略,不改旧/新消息、isStreaming 或 ref;
+                // 当前请求非显式 AbortError(如 reader 自发中止):执行一次幂等兜底停止。
+                if (
+                    activeRequestRef.current === request &&
+                    !request.stopped
+                ) {
+                    request.stopped = true;
+
+                    updateStreamingAssistant(request.assistantId, message => ({
+                        ...message,
+                        content:
+                            message.content +
+                            (message.content ? '\n\n' : '') +
+                            '⏹ *已停止生成*',
+                        status: 'stopped',
+                    }));
+
+                    setIsStreaming(false);
+                }
+            } else if (activeRequestRef.current === request && !request.stopped) {
+                // 仅当前未停止请求的失败允许标记 error
+                // (整体替换正文为错误文本的现状产品行为不变;...m 展开保留已收到 citations)
+                updateStreamingAssistant(assistantId, m => ({
+                    ...m,
+                    content: `⚠️ 流式请求失败: ${err}`,
+                    status: 'error',
+                }));
+            }
+            // 旧请求异常:忽略,不得影响新请求的消息、isStreaming 或控制器
         } finally {
-            setIsStreaming(false);
-            abortRef.current = null;
+            // 身份安全清理:只清理自己这一轮的请求状态
+            if (activeRequestRef.current === request) {
+                activeRequestRef.current = null;
+                setIsStreaming(false);
+            }
         }
-    }, [inputValue, isStreaming, messages, onHighlight, scrollToBottom, updateStreamingAssistant]);
+    }, [inputValue, isStreaming, messages, onHighlight, scrollToBottom, updateStreamingAssistant, isWritableRequest]);
 
     const canSend = Boolean(inputValue.trim()) && !isStreaming;
 
@@ -267,7 +330,7 @@ export default function ChatPanel({ onHighlight }: ChatPanelProps) {
                         <button
                             type="button"
                             data-testid="chat-stop"
-                            onClick={() => abortRef.current?.abort()}
+                            onClick={handleStop}
                             aria-label="停止生成"
                             title="停止生成"
                             className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-danger/30 bg-surface text-danger transition-colors hover:bg-danger-soft"

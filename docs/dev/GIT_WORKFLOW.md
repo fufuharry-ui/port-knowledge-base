@@ -62,14 +62,15 @@ Codex意见分级处理：
 required checks为三个：
 
 - **repository-integrity**：检查变更文件的空白错误（`git diff --check`），拒绝被跟踪的`.env`和生成产物（`node_modules`、`.next`、`.pytest_cache`、`__pycache__`、`test-results`、`.uat`等）；
-- **python-core**：在干净环境中安装`requirements.txt`并执行`pip check`，编译全部Python源码，运行无密钥startup smoke（`tests/test_startup_smoke.py`），运行真正离线检索测试组（无密钥、黑洞代理环境：`tests/test_embedding_fallback.py`、`tests/test_search.py`、`tests/test_hybrid_search.py`、`tests/test_api_qa.py`），并运行确定性核心测试子集（`test_ingest`、`test_compile`、`test_relate`、`test_ontology`、`test_consistency`、`test_doc_admin`，当前99项）；
+- **python-core**：在干净环境中安装`requirements.txt`并执行`pip check`，编译全部Python源码，运行无密钥startup smoke（`tests/test_startup_smoke.py`），运行真正离线检索测试组（无密钥、黑洞代理环境：`tests/test_embedding_fallback.py`、`tests/test_search.py`、`tests/test_hybrid_search.py`、`tests/test_api_qa.py`），运行确定性核心测试子集（`test_ingest`、`test_compile`、`test_relate`、`test_ontology`、`test_consistency`、`test_doc_admin`，当前99项），并以完整后端测试套件（无密钥、黑洞代理环境：`python -m pytest tests/ -q`）作为最终后端门禁；
 - **frontend-unit-build**：`npm ci`、Jest单元测试、Next.js生产构建。
 
 同时明确：
 
-- `python-core`不是完整后端验证；
-- 不得把它描述为全量pytest（E001完整pytest审计为237通过/7失败，失败项已分类登记；E002后完整pytest为254通过/1失败，唯一失败为E001登记的`test_consistency_post_triggers_check` LLM mock隔离债务）；
-- E001已完成依赖声明、`pip check`与startup smoke门禁扩展；E002已完成真正离线检索及Embedding可选降级门禁（`python-core`新增`Run offline retrieval tests`步骤）。
+- 前置分层步骤（startup smoke、offline retrieval、99项核心）用于快速定位失败，完整 `pytest tests/ -q` 是 `python-core` 的最终后端验证；
+- 完整pytest绿色不得被解释为前端E2E或真实栈UAT已完成；
+- 完整pytest状态演变：E001审计为237通过/7失败（失败项已分类登记）；E002后为254通过/1失败（唯一失败为E001登记的`test_consistency_post_triggers_check` LLM mock隔离债务）；T001修复该测试隔离债务后为255通过/0失败，完整pytest自此成为`python-core`最终门禁；
+- E001已完成依赖声明、`pip check`与startup smoke门禁扩展；E002已完成真正离线检索及Embedding可选降级门禁（`python-core`新增`Run offline retrieval tests`步骤）；T001已完成完整后端pytest最终门禁（`python-core`新增`Run full backend test suite`步骤）。
 
 ## GitHub CLI
 

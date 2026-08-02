@@ -133,6 +133,18 @@ jobs:
           tests/test_doc_admin.py
           -q
 
+      - name: Run full backend test suite
+        env:
+          OPENAI_API_KEY: ""
+          EMBEDDING_API_KEY: ""
+          OPENAI_BASE_URL: ""
+          EMBEDDING_BASE_URL: ""
+          HTTP_PROXY: "http://127.0.0.1:9"
+          HTTPS_PROXY: "http://127.0.0.1:9"
+          NO_PROXY: "localhost,127.0.0.1"
+          PYTHONUTF8: "1"
+        run: python -m pytest tests/ -q
+
   frontend-unit-build:
     name: frontend-unit-build
     runs-on: ubuntu-latest

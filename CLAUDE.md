@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-> Version: 1.2 | Updated: 2026-08-01
+> Version: 1.3 | Updated: 2026-08-02
 
 本文件定义 Claude Code 在本仓库中的开发权限、工作流程、架构边界和验证要求。
 
@@ -723,14 +723,14 @@ git diff --check
 1. `main`、`dev`、`master` 的Git历史基线异常；
 2. ~~依赖文件与真实运行依赖可能不一致~~（E001已处理：`requirements.txt` 已显式覆盖全部真实直接运行与测试依赖，干净环境 install + `pip check` 在本地 Python 3.12 与 CI Python 3.11 均通过）；
 3. ~~Embedding尚未实现可靠可选降级~~（E002已处理：降级由 `layer1_filter` 编排层负责，BM25 为基础检索、Embedding 为可选增强；`EmbeddingClient` 直接使用仍保持严格；离线检索合同测试与 CI 离线检索门禁已建立，详见 `docs/dev/tasks/E002-embedding-optional-fallback.md`）；
-4. ~~pytest离线边界需要重新验证~~（E001已完成无密钥干净环境完整审计：237通过/7失败；6项为Embedding缺失类归入E002，1项为`test_consistency_post_triggers_check`对LLM Key的隐式依赖，登记为后续测试隔离债务；详见 `docs/dev/tasks/E001-dependency-startup-baseline.md`）；
+4. ~~pytest离线边界需要重新验证~~（E001已完成无密钥干净环境完整审计：237通过/7失败；6项为Embedding缺失类归入E002，1项为`test_consistency_post_triggers_check`对LLM Key的隐式依赖，登记为后续测试隔离债务；该债务已由T001处理：`test_consistency_post_triggers_check`与`test_consistency_post_degrades_on_error`均显式mock `get_llm_client`并固定`RELATE_MODEL`，无密钥、无`.env`、黑洞代理环境下完整pytest 255项全绿，生产代码零变更；详见 `docs/dev/tasks/E001-dependency-startup-baseline.md` 与 `docs/dev/tasks/T001-full-pytest-closure.md`）；
 5. `api/main.py` 与 `app/` 两套后端分叉；
 6. 共享YAML存在并发覆盖和半成品风险；
 7. 文档ID生成存在编号空洞和并发风险；
 8. 多轮问答引用可能使用全局状态；
 9. 后台编译任务缺少可靠状态和错误记录；
 10. 测试指南、路线图和当前代码可能存在漂移；
-11. GitHub Actions门禁已建立：`repository-integrity`、`python-core`、`frontend-unit-build` 三个required checks；E001已在 `python-core` 中增加 `pip check` 和无密钥startup smoke；E002已在 `python-core` 的 startup smoke 之后增加真正离线检索门禁（无密钥+黑洞代理运行 `test_embedding_fallback`、`test_search`、`test_hybrid_search`、`test_api_qa` 四文件）；`python-core` 仍不代表完整pytest绿色——完整pytest在无密钥环境下仍可能保留 1 项独立LLM mock隔离债务（`test_consistency_post_triggers_check`，E001登记，待后续测试隔离任务）。
+11. GitHub Actions门禁已建立：`repository-integrity`、`python-core`、`frontend-unit-build` 三个required checks；E001已在 `python-core` 中增加 `pip check` 和无密钥startup smoke；E002已在 `python-core` 的 startup smoke 之后增加真正离线检索门禁（无密钥+黑洞代理运行 `test_embedding_fallback`、`test_search`、`test_hybrid_search`、`test_api_qa` 四文件）；T001已在 `python-core` 的99项确定性核心测试之后新增 `Run full backend test suite`（无密钥+黑洞代理运行完整 `pytest tests/ -q`）作为最终后端门禁，startup smoke、离线检索、99项核心测试保留为分层诊断步骤；完整pytest绿色不得解释为前端E2E或真实栈UAT已完成。
 
 ---
 

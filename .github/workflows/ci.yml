@@ -104,6 +104,24 @@ jobs:
       - name: Run startup smoke tests
         run: python -m pytest tests/test_startup_smoke.py -q
 
+      - name: Run offline retrieval tests
+        env:
+          OPENAI_API_KEY: ""
+          EMBEDDING_API_KEY: ""
+          OPENAI_BASE_URL: ""
+          EMBEDDING_BASE_URL: ""
+          HTTP_PROXY: "http://127.0.0.1:9"
+          HTTPS_PROXY: "http://127.0.0.1:9"
+          NO_PROXY: "localhost,127.0.0.1"
+          PYTHONUTF8: "1"
+        run: >
+          python -m pytest
+          tests/test_embedding_fallback.py
+          tests/test_search.py
+          tests/test_hybrid_search.py
+          tests/test_api_qa.py
+          -q
+
       - name: Run deterministic core tests
         run: >
           python -m pytest

@@ -192,25 +192,24 @@ frontend/node_modules/next/dist/docs/
 
 Embedding只能作为可选检索增强能力。
 
-目标契约是：
+目标契约（E002 已实现并验证）：
 
 ```text
 Embedding配置有效且调用成功
 → 关键词与向量混合检索
 
-Embedding未配置或调用失败
-→ 自动退化为BM25或关键词检索
+Embedding未配置、初始化失败或调用失败
+→ 自动退化为BM25关键词检索
 → 基础检索不得因此整体失败
 ```
 
-当前已知事实：
+E002 验证事实（详见 `docs/dev/tasks/E002-embedding-optional-fallback.md`）：
 
-* `scripts/search.py` 的 `layer1_filter` 当前会构造 `VectorEngine`；
-* `scripts/embedding_client.py` 在缺少 `EMBEDDING_API_KEY` 时可能抛出异常；
-* 自动降级契约尚未完成可靠验证；
-* 这是待由独立工程任务修复的已知缺陷。
-
-不得把目标契约描述成当前已经实现并验证的事实。
+* 降级由 `scripts/search.py` 的 `layer1_filter` 编排层负责：先完成 BM25，再尝试 Embedding 路径；Embedding 初始化或调用异常被捕获并记录不含密钥的 warning，随后按 BM25 原始分数降序返回 top_k；BM25 无命中返回空列表；
+* `VectorEngine(docs, client=None)` 支持可选客户端注入；不传 client 时行为与原有一致；
+* `scripts/embedding_client.py` 保持严格：直接实例化 `EmbeddingClient` 且无 `EMBEDDING_API_KEY` 时仍在构造函数抛出 `RuntimeError`，不得把它改成全局静默 no-op 客户端；
+* Embedding 可用时混合检索（RRF 融合、向量-only 召回阈值、top_k）行为不变；
+* 离线检索合同由 `tests/test_embedding_fallback.py` 与 CI `python-core` 的离线检索步骤守护。
 
 ---
 
@@ -723,7 +722,7 @@ git diff --check
 
 1. `main`、`dev`、`master` 的Git历史基线异常；
 2. ~~依赖文件与真实运行依赖可能不一致~~（E001已处理：`requirements.txt` 已显式覆盖全部真实直接运行与测试依赖，干净环境 install + `pip check` 在本地 Python 3.12 与 CI Python 3.11 均通过）；
-3. Embedding尚未实现可靠可选降级；
+3. ~~Embedding尚未实现可靠可选降级~~（E002已处理：降级由 `layer1_filter` 编排层负责，BM25 为基础检索、Embedding 为可选增强；`EmbeddingClient` 直接使用仍保持严格；离线检索合同测试与 CI 离线检索门禁已建立，详见 `docs/dev/tasks/E002-embedding-optional-fallback.md`）；
 4. ~~pytest离线边界需要重新验证~~（E001已完成无密钥干净环境完整审计：237通过/7失败；6项为Embedding缺失类归入E002，1项为`test_consistency_post_triggers_check`对LLM Key的隐式依赖，登记为后续测试隔离债务；详见 `docs/dev/tasks/E001-dependency-startup-baseline.md`）；
 5. `api/main.py` 与 `app/` 两套后端分叉；
 6. 共享YAML存在并发覆盖和半成品风险；
@@ -731,7 +730,7 @@ git diff --check
 8. 多轮问答引用可能使用全局状态；
 9. 后台编译任务缺少可靠状态和错误记录；
 10. 测试指南、路线图和当前代码可能存在漂移；
-11. GitHub Actions门禁已建立：`repository-integrity`、`python-core`、`frontend-unit-build` 三个required checks；E001已在 `python-core` 中增加 `pip check` 和无密钥startup smoke；当前 `python-core` 仍只运行99项确定性核心测试，不代表完整pytest绿色；真正离线检索及Embedding可选降级门禁待E002。
+11. GitHub Actions门禁已建立：`repository-integrity`、`python-core`、`frontend-unit-build` 三个required checks；E001已在 `python-core` 中增加 `pip check` 和无密钥startup smoke；E002已在 `python-core` 的 startup smoke 之后增加真正离线检索门禁（无密钥+黑洞代理运行 `test_embedding_fallback`、`test_search`、`test_hybrid_search`、`test_api_qa` 四文件）；`python-core` 仍不代表完整pytest绿色——完整pytest在无密钥环境下仍可能保留 1 项独立LLM mock隔离债务（`test_consistency_post_triggers_check`，E001登记，待后续测试隔离任务）。
 
 ---
 

@@ -320,9 +320,19 @@ def test_recompile_doc_endpoint(mock_recompile, _mock_compile):
     assert mock_recompile.called
 
 
+@patch("api.main.get_llm_client")
 @patch("api.main.run_consistency_check")
-def test_consistency_post_triggers_check(mock_run):
-    """C-5: POST /api/v1/consistency 触发稽核并返回报告。"""
+def test_consistency_post_triggers_check(mock_run, mock_get_client, monkeypatch):
+    """C-5: POST /api/v1/consistency 触发稽核并返回报告。
+
+    T001 测试隔离修复:端点顺序为 get_llm_client() → 确定 model →
+    run_consistency_check(client, model)。必须同时 mock 客户端创建与一致性检查,
+    否则无 OPENAI_API_KEY 时 get_llm_client 先抛 RuntimeError,mock 的检查函数
+    从未执行,端点按设计降级返回 status=error(假失败)。
+    """
+    fake_client = MagicMock(name="consistency_llm_client")
+    mock_get_client.return_value = fake_client
+    monkeypatch.setenv("RELATE_MODEL", "test-relate-model")
     mock_run.return_value = {
         "total": 1,
         "candidates_checked": 5,
@@ -338,18 +348,30 @@ def test_consistency_post_triggers_check(mock_run):
     data = response.json()
     assert data["status"] == "success"
     assert data["total"] == 1
-    assert mock_run.called
     assert data["contradictions"][0]["conflict_point"] == "延迟要求"
+    mock_get_client.assert_called_once_with()
+    mock_run.assert_called_once_with(fake_client, "test-relate-model")
 
 
+@patch("api.main.get_llm_client")
 @patch("api.main.run_consistency_check", side_effect=Exception("LLM down"))
-def test_consistency_post_degrades_on_error(mock_run):
-    """LLM 不可用 → POST 返回 error 状态(降级,不 500)。"""
+def test_consistency_post_degrades_on_error(mock_run, mock_get_client, monkeypatch):
+    """一致性检查过程抛异常 → POST 返回 error 状态(降级,不 500)。
+
+    T001 测试隔离修复:必须先让 get_llm_client 成功,error 才确定性地来自
+    run_consistency_check 本身,而不是无 Key 导致的客户端创建提前失败(假阳性)。
+    """
+    fake_client = MagicMock(name="consistency_llm_client")
+    mock_get_client.return_value = fake_client
+    monkeypatch.setenv("RELATE_MODEL", "test-relate-model")
+
     response = client.post("/api/v1/consistency")
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "error"
     assert data["total"] == 0
+    mock_get_client.assert_called_once_with()
+    mock_run.assert_called_once_with(fake_client, "test-relate-model")
 
 
 # ─── 落地增强: /api/v1/health 健康检查 ───────────────────────────────────────

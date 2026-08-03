@@ -89,11 +89,14 @@ function createControlledQAStream(): ControlledQAStream {
                 };
             },
         },
-        emit(event: QAEvent) {
-            const p = pending.shift();
-            if (p) p.resolve({ value: event, done: false });
-            else queue.push(event);
-            return Promise.resolve();
+        async emit(event: QAEvent) {
+            // 投递必须发生在 act 边界内:resolve pending next() 会驱动
+            // for-await 循环体中的 setState(source/delta/done)及后续 finally
+            await act(async () => {
+                const p = pending.shift();
+                if (p) p.resolve({ value: event, done: false });
+                else queue.push(event);
+            });
         },
         async emitAndWaitForNextPull(event: QAEvent) {
             const base = pullCount;

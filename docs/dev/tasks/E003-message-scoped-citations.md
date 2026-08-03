@@ -126,3 +126,44 @@ T2.1 source 后停止保留正文和引用；T2.2 source 前停止引用为空�
 - 历史 thoughts 仍未持久化（Non-goal 未变，thoughts 保持当前轮临时状态）；
 - PR / required checks / Codex / merge / 分支与 worktree 清理均未执行（实施 commit 未 push）；
 - 最终 PR 和完成报告为这些后续事实的权威来源。
+
+## 9. External Local Review — Test Isolation Follow-up
+
+### 外部复审发现
+
+本地独立复审（review bundle 阶段，2026-08-03）结论：生产业务逻辑无 P0/P1/阻断问题；isolated 运行 ChatPanel 目标测试 18/18 通过，但稳定产生 **70 条 React `act()` 警告**；full Jest 组合运行时警告为 0，存在测试组合与时序依赖。判定为 test-isolation P2，要求修复后再进入 PR。
+
+### 根因
+
+`ControlledQAStream.emit()` 在 act 边界外直接 `resolve` pending 的 `iterator.next()`：for-await 循环体中的 setState（source/delta/done 经 `updateStreamingAssistant`）及 done 收口后 finally 的 `setIsStreaming` 发生在 act 外的 microtask 链上。警告堆栈帧分布（70 条）：delta :182 ×26、done :191 ×16、finally :236 ×16、source :171 ×12，无测试文件帧。`fail()` 与 `afterEach close()` 调用点此前已由 act 包裹，非警告来源。
+
+### RED 门禁
+
+`$TEMP\port-kb-e003-act-warning-gate.ps1 -Label before-fix`（独立进程捕获完整 stdout/stderr）：Jest 自身 exit 0（18/18），`act_warning_count=70`、`console_error_count=70`，门禁退出码 **3**——失败原因纯为 act 警告，非测试失败。
+
+### 修复
+
+`emit` 的投递改为在 `await act(async () => {...})` 内执行（仅 `frontend/tests/unit/ChatPanel.test.tsx` helper 一处修改）。未修改 ChatPanel 生产代码；未弱化、删除或 skip 任何测试；未 mock console.error；保持 pending/queue/pullCount/waitForPullCount/fail/close/afterEach 语义与 T-R1 消费确认逻辑不变。
+
+### 修复后验证（全部新鲜运行）
+
+- warning gate `minimal-fix`：18/18 passed，act=0，console.error=0，门禁 exit 0；
+- warning gate `isolated-run-1`：18/18，0 警告，exit 0；
+- warning gate `isolated-run-2`：18/18，0 警告，exit 0；
+- two-file run（ChatBubble+ChatPanel，`--runTestsByPath --runInBand`）：25/25，0 警告，exit 0；
+- 后续完整验证（全部 Jest、ESLint、build、离线 pytest、manifest）：见本节下方"Follow-up 完整验证"（提交前新鲜执行）。
+
+### Follow-up 完整验证
+
+- 全部 Jest：16 suites / **118 tests passed**，0 act 警告，0 console.error，exit 0；
+- ESLint（touched files）：exit 0；
+- Next build：exit 0；
+- 离线完整 pytest（无 Key、黑洞代理、环境已恢复）：**255 passed / 0 failed / 0 errors / 7 warnings / 72.56s / exit 0**；
+- before/after manifest（本轮新建 `port-kb-e003-warning-fix-data-*.json`，76 文件）：**MANIFEST_MATCH**；
+- Git 范围：本轮变更仅测试文件与本任务文档；`git diff -- frontend/src/components/ChatPanel.tsx` 无输出。
+
+### Follow-up commit
+
+本提交（以 Git 日志为准）：`test: isolate ChatPanel stream updates`。
+
+PR / CI / Codex / merge 在本文档更新时仍未执行；最终 PR 和完成报告为后续事实的权威来源。

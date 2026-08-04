@@ -105,4 +105,19 @@ describe('UploadZone', () => {
         fireEvent.dragEnter(dropzone);
         expect(dropzone.className).toMatch(/drag-over|dragover|border-blue|active/i);
     });
+
+    test('shows a friendly upload failure without raw technical detail', async () => {
+        const onUpload = jest.fn().mockRejectedValue(
+            new Error('RuntimeError OPENAI_API_KEY=sk-secret API error 500'),
+        );
+        render(<UploadZone onUpload={onUpload} />);
+        const file = new File(['# Test'], 'failed.md', { type: 'text/markdown' });
+
+        fireEvent.drop(screen.getByTestId('dropzone'), {
+            dataTransfer: { files: [file] },
+        });
+
+        expect(await screen.findByText('上传失败，请稍后重试')).toBeInTheDocument();
+        expect(screen.queryByText(/OPENAI_API_KEY|sk-secret|API error 500/)).toBeNull();
+    });
 });

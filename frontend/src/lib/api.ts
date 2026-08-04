@@ -8,6 +8,64 @@ export const API_BASE =
 
 // ─── 类型定义 ─────────────────────────────────────────────────────────────────
 
+/** 后端编译/回滚失败的稳定机器错误码(见 detail.code) */
+export type CompileErrorCode =
+    | 'compile_in_progress'
+    | 'llm_configuration'
+    | 'service_unavailable'
+    | 'timeout'
+    | 'document_processing'
+    | 'compile_failed'
+    | 'rollback_failed';
+
+/** 错误码 → 固定中文用户文案(不暴露后端原始 detail) */
+const COMPILE_ERROR_MESSAGES: Record<CompileErrorCode, string> = {
+    compile_in_progress: '该文档正在编译，请稍后再试',
+    llm_configuration: '模型服务暂不可用，请联系管理员检查配置',
+    service_unavailable: '编译服务暂不可用，请稍后重试',
+    timeout: '编译服务响应超时，请稍后重试',
+    document_processing: '文档编译未完成，请检查文件内容后重试',
+    compile_failed: '编译失败，请稍后重试或联系管理员',
+    rollback_failed: '编译失败，旧版本恢复异常，请联系管理员',
+};
+
+/** 已知错误码映射为固定文案;未知/缺失错误码回退到通用编译失败文案 */
+export function getCompileErrorMessage(code?: string): string {
+    return COMPILE_ERROR_MESSAGES[code as CompileErrorCode]
+        ?? COMPILE_ERROR_MESSAGES.compile_failed;
+}
+
+/** 结构化 API 错误:仅携带安全文案、HTTP 状态和稳定机器码 */
+export class ApiError extends Error {
+    constructor(
+        message: string,
+        public readonly status: number,
+        public readonly code?: string,
+    ) {
+        super(message);
+        this.name = 'ApiError';
+    }
+}
+
+/** 无 detail.code 时按状态码给出安全通用文案 */
+function statusMessage(status: number): string {
+    if (status === 404) return '未找到对应文档';
+    if (status === 422) return '文件无法处理，请检查格式和内容后重试';
+    if (status >= 500) return '服务暂不可用，请稍后重试';
+    return '请求未完成，请稍后重试';
+}
+
+/**
+ * 把任意捕获值映射为可展示给用户的文案:
+ * ApiError 已含安全文案直接透传;网络层 TypeError 映射为固定网络文案;
+ * 其余任意 Error 一律回退,不暴露原始 message(可能含密钥/堆栈)。
+ */
+export function getUserFacingErrorMessage(error: unknown, fallback: string): string {
+    if (error instanceof ApiError) return error.message;
+    if (error instanceof TypeError) return '网络连接异常，请检查连接后重试';
+    return fallback;
+}
+
 export interface DocMeta {
     id: string;
     title?: string;
@@ -18,6 +76,8 @@ export interface DocMeta {
     source_type?: string;
     abstract_short?: string;
     ontology_terms?: string[];
+    /** 编译/回滚失败的稳定机器错误码;展示文案由 getCompileErrorMessage 派生 */
+    error_code?: CompileErrorCode;
 }
 
 export interface WikiIndexData {
@@ -113,10 +173,39 @@ export interface ConsistencyReport {
 // ─── 内部工具 ─────────────────────────────────────────────────────────────────
 
 async function handleResponse<T>(res: Response): Promise<T> {
-    if (!res.ok) {
-        throw new Error(`API error ${res.status}: ${res.statusText}`);
+    let payload: unknown;
+    if (typeof res.text === 'function') {
+        // 真实 Response:单次消费 body,JSON 解析失败按无 payload 处理
+        const text = await res.text();
+        if (text) {
+            try {
+                payload = JSON.parse(text);
+            } catch {
+                payload = undefined;
+            }
+        }
+    } else if (typeof (res as { json?: unknown }).json === 'function') {
+        // 兼容仅提供 json() 的轻量测试桩(真实 Response 总有 text())
+        try {
+            payload = await (res as unknown as { json: () => Promise<unknown> }).json();
+        } catch {
+            payload = undefined;
+        }
     }
-    return res.json();
+    if (!res.ok) {
+        const detail = payload && typeof payload === 'object'
+            ? (payload as { detail?: unknown }).detail
+            : undefined;
+        const code = detail && typeof detail === 'object'
+            ? (detail as { code?: unknown }).code
+            : undefined;
+        const stableCode = typeof code === 'string' ? code : undefined;
+        const message = stableCode
+            ? getCompileErrorMessage(stableCode)
+            : statusMessage(res.status);
+        throw new ApiError(message, res.status, stableCode);
+    }
+    return payload as T;
 }
 
 // ─── API 方法 ─────────────────────────────────────────────────────────────────

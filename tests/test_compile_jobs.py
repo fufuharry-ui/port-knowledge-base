@@ -40,3 +40,21 @@ def test_sanitize_compile_error_redacts_secrets_and_flattens_lines():
 def test_sanitize_compile_error_limits_to_500_characters():
     safe = sanitize_compile_error("x" * 900)
     assert len(safe) == 500
+
+
+def test_sanitize_compile_error_redacts_full_authorization_value():
+    safe = sanitize_compile_error("Authorization: Basic dXNlcjpwYXNz")
+    assert "dXNlcjpwYXNz" not in safe
+    assert "<redacted>" in safe
+
+
+def test_sanitize_compile_error_redacts_env_var_style_secret():
+    safe = sanitize_compile_error("OPENAI_API_KEY=plainsecretvalue")
+    assert "plainsecretvalue" not in safe
+    assert "<redacted>" in safe
+
+
+def test_sanitize_compile_error_bearer_token_still_fully_redacted():
+    safe = sanitize_compile_error("Bearer token-abc")
+    assert "token-abc" not in safe
+    assert "<redacted>" in safe

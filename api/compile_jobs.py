@@ -19,7 +19,7 @@ _SECRET_PATTERNS = (
     (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer <redacted>"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{6,}\b"), "sk-<redacted>"),
     (
-        re.compile(r"(?i)\b(api[_-]?key|token|secret|password)\s*[:=]\s*([^\s,;]+)"),
+        re.compile(r"(?i)(?<![A-Za-z0-9])(api[_-]?key|token|secret|password)\s*[:=]\s*([^\s,;]+)"),
         r"\1=<redacted>",
     ),
     (
@@ -27,7 +27,7 @@ _SECRET_PATTERNS = (
         r"\1<redacted>",
     ),
     (
-        re.compile(r"(?i)(authorization\s*[:=]\s*)([^\s,;]+)"),
+        re.compile(r"(?i)(authorization\s*[:=]\s*)([^\r\n]+)"),
         r"\1<redacted>",
     ),
 )
@@ -53,9 +53,9 @@ def classify_compile_error(text: str) -> CompileErrorCode:
     )):
         return "timeout"
     if any(token in value for token in (
-        "connection refused", "connection error", "service unavailable", "503",
-        "502", "bad gateway", "name resolution", "network is unreachable", "服务不可用",
-    )):
+        "connection refused", "connection error", "service unavailable",
+        "bad gateway", "name resolution", "network is unreachable", "服务不可用",
+    )) or re.search(r"\b50[23]\b", value):
         return "service_unavailable"
     if any(token in value for token in (
         "找不到原始文本", "document content", "decode", "parse", "内容为空",

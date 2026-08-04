@@ -30,8 +30,9 @@ def isolate_api_originals(tmp_path, monkeypatch):
     originals.mkdir()
     monkeypatch.setattr(api_mod, "ORIGINALS_DIR", originals)
     monkeypatch.setattr(api_mod, "RAW_DIR", tmp_path / "raw")
-    # BASE_DIR: compile_ingested_task 用 BASE_DIR 作 cwd + 找 scripts/compile.py。
-    # 指向 tmp_path 后 compile_script 不存在 → 早返回,绝不 spawn 指向真实仓库的子进程。
+    # BASE_DIR: _schedule_compile 以 BASE_DIR 调用 prepare_doc_compile/run_compile_task,
+    # run_compile_task 用其作 cwd + 找 scripts/compile.py。
+    # 指向 tmp_path 后 compile_script 不存在 → 终态 error(隔离),绝不 spawn 指向真实仓库的子进程。
     monkeypatch.setattr(api_mod, "BASE_DIR", tmp_path)
     monkeypatch.setattr(ingest_mod, "BASE_DIR", tmp_path)
     monkeypatch.setattr(ingest_mod, "RAW_DIR", tmp_path / "raw")
@@ -43,17 +44,32 @@ def isolate_api_originals(tmp_path, monkeypatch):
     return originals
 
 
-@patch("api.main.compile_ingested_task")
+@patch("api.main.run_compile_task")
 @patch("api.main.ingest_file")
-def test_ingest_endpoint(mock_ingest, mock_compile, isolate_api_originals):
+def test_ingest_endpoint(mock_ingest, mock_run, isolate_api_originals):
     """UAT Big-Loop Task 6:/ingest 返回权威 doc_id(来自 ingest_file,而非上传时预生成),
-    含 skipped 字段,并调度 compile_ingested_task(doc_id)。
+    含 skipped 字段,并经统一入口 _schedule_compile 调度 run_compile_task(doc_id, BASE_DIR)。
     参数顺序:@patch mock 在前,fixture 在后(pytest 9.x arg_names[N:] 语义)。
     """
-    mock_ingest.return_value = {
-        "id": "doc_test_001", "title": "test", "status": "raw",
-        "file_hash": "sha256:test", "source_type": "txt",
-    }
+    import api.main as api_mod
+
+    doc_id = "doc_test_001"
+
+    def fake_ingest(_stored):
+        api_mod.RAW_DIR.mkdir(parents=True, exist_ok=True)
+        (api_mod.RAW_DIR / f"{doc_id}.meta.yaml").write_text(
+            yaml.safe_dump({
+                "id": doc_id, "title": "test", "status": "raw",
+                "file_hash": "sha256:test", "source_type": "txt",
+            }),
+            encoding="utf-8",
+        )
+        return {
+            "id": doc_id, "title": "test", "status": "raw",
+            "file_hash": "sha256:test", "source_type": "txt",
+        }
+
+    mock_ingest.side_effect = fake_ingest
     response = client.post(
         "/api/v1/ingest",
         files={"file": ("test.txt", b"Mock document content", "text/plain")}
@@ -64,8 +80,8 @@ def test_ingest_endpoint(mock_ingest, mock_compile, isolate_api_originals):
     assert data["doc_id"] == "doc_test_001"
     assert data["skipped"] is False
     assert (isolate_api_originals / "test.txt").exists()
-    assert mock_ingest.called
-    assert mock_compile.called_once_with("doc_test_001") if hasattr(mock_compile, "called_once_with") else mock_compile.called
+    mock_ingest.assert_called_once()
+    mock_run.assert_called_once_with(doc_id, api_mod.BASE_DIR)
 
 @patch("api.main.search")
 @patch("api.main.get_llm_client")
@@ -309,17 +325,6 @@ def test_delete_nonexistent_doc_returns_404(mock_remove):
     assert response.status_code == 404
 
 
-@patch("scripts.compile.compile_doc")
-@patch("scripts.doc_admin.recompile_doc")
-def test_recompile_doc_endpoint(mock_recompile, _mock_compile):
-    """POST /api/v1/docs/{id}/recompile 重置状态 + 后台触发编译。"""
-    mock_recompile.return_value = {"doc_id": "doc_X", "reset": True}
-    response = client.post("/api/v1/docs/doc_X/recompile")
-    assert response.status_code == 200
-    assert response.json()["status"] == "recompiling"
-    assert mock_recompile.called
-
-
 @patch("api.main.get_llm_client")
 @patch("api.main.run_consistency_check")
 def test_consistency_post_triggers_check(mock_run, mock_get_client, monkeypatch):
@@ -457,16 +462,31 @@ def test_catalog_includes_raw_meta_before_compile(tmp_path, monkeypatch):
     assert docs[0]["status"] == "raw"
 
 
-@patch("api.main.compile_ingested_task")
+@patch("api.main.run_compile_task")
 @patch("api.main.ingest_file")
-def test_upload_returns_authoritative_ingested_id(mock_ingest, mock_compile, isolate_api_originals):
+def test_upload_returns_authoritative_ingested_id(mock_ingest, mock_run, isolate_api_originals):
     """CAP-INGEST:/upload 必须返回 ingest_file() 的权威 doc_id(而非上传时预生成),
-    含 skipped=false,并调度 compile_ingested_task(权威 doc_id)。
+    含 skipped=false,并经统一入口调度 run_compile_task(权威 doc_id, BASE_DIR)。
     """
-    mock_ingest.return_value = {
-        "id": "doc_20260719_007", "title": "truthful", "status": "raw",
-        "file_hash": "sha256:new",
-    }
+    import api.main as api_mod
+
+    doc_id = "doc_20260719_007"
+
+    def fake_ingest(_stored):
+        api_mod.RAW_DIR.mkdir(parents=True, exist_ok=True)
+        (api_mod.RAW_DIR / f"{doc_id}.meta.yaml").write_text(
+            yaml.safe_dump({
+                "id": doc_id, "title": "truthful", "status": "raw",
+                "file_hash": "sha256:new",
+            }),
+            encoding="utf-8",
+        )
+        return {
+            "id": doc_id, "title": "truthful", "status": "raw",
+            "file_hash": "sha256:new",
+        }
+
+    mock_ingest.side_effect = fake_ingest
     response = client.post(
         "/api/v1/upload",
         files={"file": ("truthful.md", b"# Truthful", "text/markdown")},
@@ -475,12 +495,12 @@ def test_upload_returns_authoritative_ingested_id(mock_ingest, mock_compile, iso
     assert response.json()["doc_id"] == "doc_20260719_007"
     assert response.json()["skipped"] is False
     mock_ingest.assert_called_once()
-    mock_compile.assert_called_once_with("doc_20260719_007")
+    mock_run.assert_called_once_with(doc_id, api_mod.BASE_DIR)
 
 
-@patch("api.main.compile_ingested_task")
+@patch("api.main.run_compile_task")
 def test_duplicate_upload_returns_existing_id_without_compile(
-    mock_compile, isolate_api_originals, monkeypatch
+    mock_run, isolate_api_originals, monkeypatch
 ):
     """CAP-INGEST:重复哈希必须返回既有 doc_id + skipped=true,且不调度编译(无幽灵任务)。
     """
@@ -497,7 +517,7 @@ def test_duplicate_upload_returns_existing_id_without_compile(
     assert response.status_code == 200
     assert response.json()["skipped"] is True
     assert response.json()["doc_id"] == "doc_existing"
-    mock_compile.assert_not_called()
+    mock_run.assert_not_called()
 
 
 def test_upload_rejects_unsupported_extension_without_writing(isolate_api_originals):
@@ -518,3 +538,144 @@ def test_upload_strips_path_components(isolate_api_originals):
     )
     assert response.status_code in (200, 422)
     assert not (isolate_api_originals.parent / "safe.md").exists()
+
+
+# ─── E004 Task 5:统一编译调度契约(_schedule_compile)──────────────────────────
+
+@patch("api.main.run_compile_task")
+@patch("api.main.ingest_file")
+def test_upload_marks_compiling_before_background_task(
+    mock_ingest, mock_run, isolate_api_originals
+):
+    """E004:上传必须在调度后台任务之前把 meta 原子置为 compiling。
+
+    旧路径 compile_ingested_task 只 spawn 子进程、不准备状态,导致 catalog
+    在编译期间停留 raw、重复上传/重编译无法被 409 拦截。
+    """
+    import api.main as api_mod
+
+    doc_id = "doc_20260805_030"
+
+    def fake_ingest(_stored):
+        api_mod.RAW_DIR.mkdir(parents=True, exist_ok=True)
+        (api_mod.RAW_DIR / f"{doc_id}.meta.yaml").write_text(
+            yaml.safe_dump({"id": doc_id, "status": "raw"}),
+            encoding="utf-8",
+        )
+        return {"id": doc_id, "status": "raw"}
+
+    mock_ingest.side_effect = fake_ingest
+    response = client.post(
+        "/api/v1/upload",
+        files={"file": ("task.md", b"# task", "text/markdown")},
+    )
+
+    assert response.status_code == 200
+    meta = yaml.safe_load(
+        (api_mod.RAW_DIR / f"{doc_id}.meta.yaml").read_text(encoding="utf-8")
+    )
+    assert meta["status"] == "compiling"
+    mock_run.assert_called_once_with(doc_id, api_mod.BASE_DIR)
+
+
+def test_recompile_returns_409_when_document_is_compiling(tmp_path, monkeypatch):
+    """E004:文档已在 compiling 时,重编译必须 409 且 detail 只含稳定错误码。"""
+    import api.main as api_mod
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    doc_id = "doc_20260805_031"
+    (raw / f"{doc_id}.meta.yaml").write_text(
+        yaml.safe_dump({"id": doc_id, "status": "compiling"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(api_mod, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(api_mod, "RAW_DIR", raw)
+
+    response = client.post(f"/api/v1/docs/{doc_id}/recompile")
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": {"code": "compile_in_progress"}}
+
+
+def test_catalog_projects_error_code(tmp_path, monkeypatch):
+    """E004:管理 catalog 必须投影 error_code(error 文档在前端可分类展示)。"""
+    import api.main as api_mod
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    doc_id = "doc_20260805_032"
+    (raw / f"{doc_id}.meta.yaml").write_text(
+        yaml.safe_dump({
+            "id": doc_id,
+            "status": "error",
+            "error_code": "timeout",
+            "error_message": "sanitized backend detail",
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(api_mod, "RAW_DIR", raw)
+    monkeypatch.setattr(api_mod, "INDEX_FILE", tmp_path / "missing-index.yaml")
+
+    response = client.get("/api/v1/wiki/index")
+
+    assert response.status_code == 200
+    assert response.json()["documents"][0]["error_code"] == "timeout"
+
+
+def test_schedule_compile_allows_only_one_concurrent_request(tmp_path, monkeypatch):
+    """E004 并发守卫:同一 doc 的两个并发调度,恰一个成功,另一个得 409。
+
+    直接调用 _schedule_compile(不经 TestClient),Starlette 不会执行排队的
+    后台任务;锁必须覆盖 读/判 → 置 compiling → add_task 整个临界区。
+    """
+    import threading
+    from fastapi import BackgroundTasks, HTTPException
+    import api.main as api_mod
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    doc_id = "doc_20260805_033"
+    (raw / f"{doc_id}.meta.yaml").write_text(
+        yaml.safe_dump({"id": doc_id, "status": "compiled"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(api_mod, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(api_mod, "RAW_DIR", raw)
+
+    barrier = threading.Barrier(2)
+    backgrounds = [BackgroundTasks(), BackgroundTasks()]
+    outcomes = []
+    outcome_lock = threading.Lock()
+
+    def worker(background_tasks):
+        barrier.wait(timeout=2)
+        try:
+            api_mod._schedule_compile(background_tasks, doc_id)
+            result = "scheduled"
+        except HTTPException as exc:
+            result = (exc.status_code, exc.detail)
+        with outcome_lock:
+            outcomes.append(result)
+
+    threads = [
+        threading.Thread(target=worker, args=(background_tasks,))
+        for background_tasks in backgrounds
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert sorted(
+        outcomes,
+        key=lambda item: 0 if item == "scheduled" else 1,
+    ) == [
+        "scheduled",
+        (409, {"code": "compile_in_progress"}),
+    ]
+    assert sum(len(background.tasks) for background in backgrounds) == 1
+    meta = yaml.safe_load(
+        (raw / f"{doc_id}.meta.yaml").read_text(encoding="utf-8")
+    )
+    assert meta["status"] == "compiling"

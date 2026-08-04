@@ -1,9 +1,8 @@
 import json
 import os
 import shutil
-import subprocess
-import sys
 import tempfile
+import threading
 from pathlib import Path
 from typing import AsyncIterable
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
@@ -13,6 +12,8 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 import yaml
 
+from api.compile_jobs import run_compile_task
+from scripts.doc_admin import prepare_doc_compile
 from scripts.ingest import PARSERS, get_file_hash, ingest_file
 from scripts.search import (
     search, get_llm_client, layer1_filter, layer2_score, layer3_answer,
@@ -73,6 +74,9 @@ META_DIR = BASE_DIR / "meta"
 ORIGINALS_DIR = BASE_DIR / "originals"
 ORIGINALS_DIR.mkdir(exist_ok=True)
 
+# 编译调度串行点:_schedule_compile 的 读/判 → 置 compiling → add_task 临界区。
+COMPILE_SCHEDULE_LOCK = threading.Lock()
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _load_index() -> dict:
@@ -126,7 +130,7 @@ def _load_document_catalog() -> list[dict]:
             continue
         doc = by_id.setdefault(doc_id, {"id": doc_id, "abstract_short": "", "ontology_terms": []})
         for key in ("title", "status", "source_type", "file_hash", "char_count",
-                    "language", "ingested_at", "error_message"):
+                    "language", "ingested_at", "error_code", "error_message"):
             if key in meta:
                 doc[key] = meta[key]
 
@@ -188,28 +192,24 @@ def _stage_upload(file: UploadFile) -> tuple[Path | None, dict | None]:
     return destination, None
 
 
-def compile_ingested_task(doc_id: str) -> None:
-    """后台编译"指定"doc_id。
+def _schedule_compile(background_tasks: BackgroundTasks, doc_id: str) -> None:
+    """统一编译调度入口(/upload、/ingest、/docs/{id}/recompile 共用)。
 
-    三个 Windows/核心引擎事实,均在 wrapper 层规避(不改 compile.py):
-    1) 用 sys.executable(anaconda),不用 PATH 上的 "python"(WindowsApps 桩)。
-    2) 用 `python -m scripts.compile` 而非 `python scripts/compile.py`:脚本模式下
-       cwd 不在 sys.path,compile.py 内 `from scripts.ontology import ...` 会
-       ModuleNotFoundError;-m 模式把 cwd 加入 sys.path,包内导入才可用。
-    3) PYTHONUTF8=1:compile.py 的 print 含 emoji(✅📌),Windows GBK 控制台会
-       UnicodeEncodeError;UTF-8 模式下正常。
-    继承父进程 env(含 OPENAI_API_KEY 等从 .env 加载的密钥)。
+    COMPILE_SCHEDULE_LOCK 覆盖 读/判 → prepare_doc_compile 原子置 compiling →
+    add_task 的短临界区:并发请求中恰一个能进入编译,其余得 409。
+    detail 只含稳定错误码,不泄露内部技术细节。
     """
-    compile_script = BASE_DIR / "scripts" / "compile.py"
-    if not compile_script.exists():
-        return
-    env = {**os.environ, "PYTHONUTF8": "1"}
-    subprocess.run(
-        [sys.executable, "-m", "scripts.compile", doc_id],
-        cwd=str(BASE_DIR),
-        env=env,
-        check=False,
-    )
+    with COMPILE_SCHEDULE_LOCK:
+        result = prepare_doc_compile(doc_id, base_dir=BASE_DIR)
+        if result.get("prepared"):
+            background_tasks.add_task(run_compile_task, doc_id, BASE_DIR)
+            return
+        if result.get("reason") == "compile_in_progress":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "compile_in_progress"},
+            )
+        raise HTTPException(status_code=404, detail="Document metadata not found")
 
 
 def _accept_upload(background_tasks: BackgroundTasks, file: UploadFile) -> dict:
@@ -234,7 +234,7 @@ def _accept_upload(background_tasks: BackgroundTasks, file: UploadFile) -> dict:
         raise HTTPException(status_code=422, detail="文件无法解析或内容为空")
 
     doc_id = meta["id"]
-    background_tasks.add_task(compile_ingested_task, doc_id)
+    _schedule_compile(background_tasks, doc_id)
     return {
         "status": "processing",
         "skipped": False,
@@ -427,23 +427,12 @@ async def delete_doc(doc_id: str):
 
 @app.post("/api/v1/docs/{doc_id}/recompile")
 async def recompile_doc_endpoint(doc_id: str, background_tasks: BackgroundTasks):
-    """重置文档状态为 raw 并触发重编译(error 文档重试用)。"""
-    from scripts.doc_admin import recompile_doc
-    result = recompile_doc(doc_id)
-    if not result.get("reset"):
-        raise HTTPException(status_code=404, detail=f"Document '{doc_id}' meta not found")
-    # 后台触发编译(复用 compile.compile_doc)
-    def _compile_task():
-        try:
-            import scripts.compile as cmod
-            cmod._load_env()
-            client = cmod.get_llm_client()
-            cmod.compile_doc(doc_id, client,
-                             os.environ.get("COMPILE_MODEL", "gpt-4o"),
-                             os.environ.get("ONTOLOGY_MODEL", "gpt-4o-mini"))
-        except Exception:
-            pass
-    background_tasks.add_task(_compile_task)
+    """重编译既有文档(error 文档重试用)。
+
+    与上传共用 _schedule_compile:prepare_doc_compile 原子置 compiling 并清旧错误;
+    compiling 中 → 409;meta 缺失 → 404。响应形状保持不变。
+    """
+    _schedule_compile(background_tasks, doc_id)
     return {"status": "recompiling", "doc_id": doc_id}
 
 # ─── POST /api/v1/upload (alias for ingest) ──────────────────────────────────

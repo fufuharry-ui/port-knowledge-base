@@ -1,11 +1,22 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
+import subprocess
+import sys
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Literal
+
+from scripts.doc_admin import read_doc_meta, write_doc_compile_result
+
+logger = logging.getLogger(__name__)
+
+COMPILE_EXECUTION_LOCK = threading.Lock()
 
 CompileErrorCode = Literal[
     "llm_configuration",
@@ -150,3 +161,107 @@ def restore_artifact_snapshot(snapshot: ArtifactSnapshot) -> list[str]:
         except Exception:
             failures.append(entry.relative_path)
     return failures
+
+
+def _diagnostic_text(result: subprocess.CompletedProcess, meta: dict | None) -> str:
+    parts = []
+    if meta and meta.get("error_message"):
+        parts.append(str(meta["error_message"]))
+    if result.stderr:
+        parts.append(result.stderr[-MAX_CAPTURE_CHARS:])
+    if result.stdout:
+        parts.append(result.stdout[-MAX_CAPTURE_CHARS:])
+    parts.append(f"returncode={result.returncode}")
+    return "\n".join(parts)
+
+
+def _persist_terminal_error(
+    doc_id: str,
+    base: Path,
+    code: CompileErrorCode,
+    message: str,
+) -> None:
+    written = write_doc_compile_result(
+        doc_id,
+        "error",
+        error_code=code,
+        error_message=sanitize_compile_error(message),
+        base_dir=base,
+    )
+    if not written:
+        logger.error(
+            "compile job terminal metadata missing for %s; code=%s",
+            doc_id,
+            code,
+        )
+
+
+def run_compile_task(doc_id: str, base_dir: Path | None = None) -> None:
+    base = Path(base_dir) if base_dir is not None else Path(__file__).resolve().parent.parent
+    with COMPILE_EXECUTION_LOCK:
+        try:
+            with TemporaryDirectory(prefix=f"port-kb-{doc_id}-") as temp_name:
+                try:
+                    snapshot = create_artifact_snapshot(base, doc_id, Path(temp_name))
+                except Exception as exc:
+                    _persist_terminal_error(
+                        doc_id,
+                        base,
+                        "compile_failed",
+                        f"snapshot creation failed: {type(exc).__name__}: {exc}",
+                    )
+                    return
+
+                failure_code: CompileErrorCode | None = None
+                failure_message = ""
+                try:
+                    compile_script = base / "scripts" / "compile.py"
+                    if not compile_script.exists():
+                        raise FileNotFoundError("compile script missing")
+                    env = {**os.environ, "PYTHONUTF8": "1"}
+                    result = subprocess.run(
+                        [sys.executable, "-m", "scripts.compile", doc_id],
+                        cwd=str(base),
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        check=False,
+                    )
+                    meta = read_doc_meta(doc_id, base)
+                    if result.returncode == 0 and meta and meta.get("status") == "compiled":
+                        if not write_doc_compile_result(doc_id, "compiled", base_dir=base):
+                            logger.error(
+                                "compiled terminal metadata missing for %s",
+                                doc_id,
+                            )
+                        return
+                    diagnostic = _diagnostic_text(result, meta)
+                    failure_code = classify_compile_error(diagnostic)
+                    failure_message = sanitize_compile_error(diagnostic)
+                except Exception as exc:
+                    failure_code = classify_compile_error(str(exc))
+                    failure_message = sanitize_compile_error(
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
+                rollback_failures = restore_artifact_snapshot(snapshot)
+                if rollback_failures:
+                    failure_code = "rollback_failed"
+                    failure_message = sanitize_compile_error(
+                        f"{failure_message}; rollback failed: {', '.join(rollback_failures)}"
+                    )
+                _persist_terminal_error(
+                    doc_id,
+                    base,
+                    failure_code or "compile_failed",
+                    failure_message or "编译失败",
+                )
+        except Exception as exc:
+            _persist_terminal_error(
+                doc_id,
+                base,
+                classify_compile_error(str(exc)),
+                f"compile task infrastructure failed: {type(exc).__name__}: {exc}",
+            )

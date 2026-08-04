@@ -33,6 +33,13 @@ export default function WikiPage() {
     const initializedRef = useRef(false);
     const pollInFlightRef = useRef(false);
 
+    // E004-FIX-01:本地变更纪元 + 请求序号守卫。
+    // 重编译等本地变更乐观写入前同步推进纪元;每个目录请求发出时捕获纪元并分配序号;
+    // 响应仅在「纪元未变且序号不落后于已应用序号」时才允许落地,过期响应一律丢弃。
+    const mutationEpochRef = useRef(0);
+    const requestSequenceRef = useRef(0);
+    const latestAppliedSequenceRef = useRef(0);
+
     // 单一快照应用入口:先算状态迁移并弹 Toast,再更新 state(Updater 内无副作用)
     const applySnapshot = useCallback((data: WikiIndexData, notify: boolean) => {
         if (notify && initializedRef.current) {
@@ -49,16 +56,23 @@ export default function WikiPage() {
         setTotal(data.total_docs);
     }, [pushToast]);
 
-    const refreshDocs = useCallback(async (notify: boolean) => {
+    // 受保护的目录加载:初始加载与轮询共用;返回响应是否真正被应用
+    const loadSnapshot = useCallback(async (notify: boolean): Promise<boolean> => {
+        const requestEpoch = mutationEpochRef.current;
+        const requestSequence = ++requestSequenceRef.current;
         const data = await fetchWikiIndex();
+        if (requestEpoch !== mutationEpochRef.current) return false;
+        if (requestSequence < latestAppliedSequenceRef.current) return false;
         applySnapshot(data, notify);
+        latestAppliedSequenceRef.current = requestSequence;
+        return true;
     }, [applySnapshot]);
 
     useEffect(() => {
-        refreshDocs(false)
+        loadSnapshot(false)
             .catch(e => setError(getUserFacingErrorMessage(e, '知识库加载失败，请稍后重试')))
             .finally(() => setLoading(false));
-    }, [refreshDocs]);
+    }, [loadSnapshot]);
 
     // E004: 任一文档编译中时,每 3s 条件轮询;全部进入终态自动停止;飞行中去重
     const hasPending = docs.some(d => d.status === 'raw' || d.status === 'compiling');
@@ -68,7 +82,7 @@ export default function WikiPage() {
             if (pollInFlightRef.current) return;
             pollInFlightRef.current = true;
             try {
-                await refreshDocs(true);
+                await loadSnapshot(true);
             } catch {
                 // 瞬时轮询失败不覆盖上一份可用目录
             } finally {
@@ -76,7 +90,7 @@ export default function WikiPage() {
             }
         }, 3000);
         return () => window.clearInterval(timer);
-    }, [hasPending, refreshDocs]);
+    }, [hasPending, loadSnapshot]);
 
     const compiled = docs.filter(d => d.status === 'compiled').length;
     const pendingCount = docs.filter(d => d.status === 'raw' || d.status === 'compiling').length;
@@ -157,6 +171,8 @@ export default function WikiPage() {
                                 onDelete={async id => {
                                     try {
                                         await deleteDoc(id);
+                                        // 本地变更:推进纪元使此前发出的目录响应失效,再乐观移除
+                                        mutationEpochRef.current += 1;
                                         statusByIdRef.current.delete(id);
                                         setDocs(ds => ds.filter(d => d.id !== id));
                                         setTotal(t => Math.max(0, t - 1));
@@ -168,7 +184,9 @@ export default function WikiPage() {
                                 onRecompile={async id => {
                                     try {
                                         await recompileDoc(id);
-                                        // 同步更新状态跟踪与界面:下一轮轮询把 compiling→error 视作新一轮失败
+                                        // 本地变更纪元 +1 与乐观编译中写在同一同步块内(中间无 await):
+                                        // 此前发出的轮询/加载响应落地时纪元不匹配,一律丢弃
+                                        mutationEpochRef.current += 1;
                                         statusByIdRef.current.set(id, 'compiling');
                                         setDocs(current => current.map(doc => (
                                             doc.id === id

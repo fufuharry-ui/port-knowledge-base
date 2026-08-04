@@ -1,6 +1,13 @@
+from unittest.mock import patch
+
 import pytest
 
-from api.compile_jobs import classify_compile_error, sanitize_compile_error
+from api.compile_jobs import (
+    create_artifact_snapshot,
+    classify_compile_error,
+    restore_artifact_snapshot,
+    sanitize_compile_error,
+)
 
 
 @pytest.mark.parametrize(
@@ -58,3 +65,57 @@ def test_sanitize_compile_error_bearer_token_still_fully_redacted():
     safe = sanitize_compile_error("Bearer token-abc")
     assert "token-abc" not in safe
     assert "<redacted>" in safe
+
+
+def test_restore_artifact_snapshot_restores_existing_and_deletes_new(tmp_path):
+    base = tmp_path / "repo"
+    snapshot_dir = tmp_path / "snapshot"
+    doc_id = "doc_20260805_010"
+    index = base / "wiki" / "index.yaml"
+    summary = base / "wiki" / f"{doc_id}.summary.yaml"
+    index.parent.mkdir(parents=True)
+    index.write_bytes(b"old-index\r\n")
+
+    snapshot = create_artifact_snapshot(base, doc_id, snapshot_dir)
+
+    index.write_bytes(b"new-index\n")
+    summary.write_bytes(b"new-summary\n")
+    failures = restore_artifact_snapshot(snapshot)
+
+    assert failures == []
+    assert index.read_bytes() == b"old-index\r\n"
+    assert not summary.exists()
+
+
+def test_artifact_snapshot_contains_all_seven_paths(tmp_path):
+    base = tmp_path / "repo"
+    snapshot = create_artifact_snapshot(
+        base,
+        "doc_20260805_011",
+        tmp_path / "snapshot",
+    )
+    relative = {entry.relative_path for entry in snapshot.entries}
+    assert relative == {
+        "wiki/doc_20260805_011.summary.yaml",
+        "wiki/index.yaml",
+        "meta/ontology/doc_20260805_011.ontology.yaml",
+        "meta/ontology/global_ontology.yaml",
+        "meta/relations/doc_20260805_011.relations.yaml",
+        "meta/relations/knowledge_graph.yaml",
+        "meta/ontology/entity_relations.yaml",
+    }
+
+
+def test_restore_artifact_snapshot_reports_relative_failure_paths(tmp_path):
+    base = tmp_path / "repo"
+    doc_id = "doc_20260805_012"
+    target = base / "wiki" / "index.yaml"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"old")
+    snapshot = create_artifact_snapshot(base, doc_id, tmp_path / "snapshot")
+
+    with patch("api.compile_jobs._atomic_write_bytes", side_effect=OSError("denied")):
+        failures = restore_artifact_snapshot(snapshot)
+
+    assert failures == ["wiki/index.yaml"]
+    assert str(base) not in failures[0]

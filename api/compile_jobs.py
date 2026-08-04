@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
 import re
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 CompileErrorCode = Literal[
@@ -62,3 +66,87 @@ def classify_compile_error(text: str) -> CompileErrorCode:
     )):
         return "document_processing"
     return "compile_failed"
+
+
+@dataclass(frozen=True)
+class SnapshotEntry:
+    target: Path
+    relative_path: str
+    existed: bool
+    backup: Path | None
+
+
+@dataclass(frozen=True)
+class ArtifactSnapshot:
+    entries: tuple[SnapshotEntry, ...]
+
+
+def artifact_paths(base_dir: Path, doc_id: str) -> tuple[Path, ...]:
+    return (
+        base_dir / "wiki" / f"{doc_id}.summary.yaml",
+        base_dir / "wiki" / "index.yaml",
+        base_dir / "meta" / "ontology" / f"{doc_id}.ontology.yaml",
+        base_dir / "meta" / "ontology" / "global_ontology.yaml",
+        base_dir / "meta" / "relations" / f"{doc_id}.relations.yaml",
+        base_dir / "meta" / "relations" / "knowledge_graph.yaml",
+        base_dir / "meta" / "ontology" / "entity_relations.yaml",
+    )
+
+
+def create_artifact_snapshot(
+    base_dir: Path,
+    doc_id: str,
+    snapshot_dir: Path,
+) -> ArtifactSnapshot:
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    entries = []
+    for index, target in enumerate(artifact_paths(base_dir, doc_id)):
+        relative_path = target.relative_to(base_dir).as_posix()
+        if target.exists():
+            backup = snapshot_dir / f"{index:02d}.bin"
+            backup.write_bytes(target.read_bytes())
+            entries.append(SnapshotEntry(
+                target=target,
+                relative_path=relative_path,
+                existed=True,
+                backup=backup,
+            ))
+        else:
+            entries.append(SnapshotEntry(
+                target=target,
+                relative_path=relative_path,
+                existed=False,
+                backup=None,
+            ))
+    return ArtifactSnapshot(entries=tuple(entries))
+
+
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def restore_artifact_snapshot(snapshot: ArtifactSnapshot) -> list[str]:
+    failures = []
+    for entry in snapshot.entries:
+        try:
+            if entry.existed:
+                if entry.backup is None:
+                    raise RuntimeError("snapshot backup missing")
+                _atomic_write_bytes(entry.target, entry.backup.read_bytes())
+            else:
+                entry.target.unlink(missing_ok=True)
+        except Exception:
+            failures.append(entry.relative_path)
+    return failures

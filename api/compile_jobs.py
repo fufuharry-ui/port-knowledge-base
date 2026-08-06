@@ -1,27 +1,75 @@
+"""E005 Task 5: 持久化编译执行器与硬超时编排。
+
+对应设计文档第 11 节(重编译事务准备)、第 13 节(执行器与进程身份)、
+第 14 节(硬超时与进程树终止)、第 15 节(唯一提交点与成功验证)和
+第 16 节(幂等回滚编排)。
+
+职责边界:
+
+- prepare_recompile_transaction 只做纯准备(读取并保存原 meta +
+  create_prepared_transaction 发布 PREPARED);不绑定 meta、不迁移
+  SCHEDULED、不登记后台任务——这些是 API 调度层的职责;
+- run_compile_task 以 job_id 为输入,在执行锁内按
+  SCHEDULED → RUNNING → COMMITTED / ROLLBACKING → ROLLED_BACK 推进;
+- Manifest 原子进入 COMMITTED 是唯一成功提交点;提交点前的任何失败、
+  语义验证失败或硬超时一律回滚;
+- 超时顺序固定: Manifest=ROLLBACKING(reason=timeout)→ 终止进程树
+  → 等待宽限 → 强制终止 → 确认退出 → 回滚;无法确认退出时失败关闭,
+  readiness 进入 recovery_required,绝不回滚、绝不写文档终态;
+- 后台任务绝不抛出: 未知 job 只记录日志;任何无法证明一致性的基础设施
+  失败进入 recovery_required 并返回。
+
+Manifest failure 字段与 raw meta 错误信息一律先经 sanitize_compile_error
+脱敏;绝不写入原始 stderr/stdout 或密钥。
+"""
 from __future__ import annotations
 
 import logging
 import os
 import re
-import subprocess
-import sys
-import tempfile
 import threading
-from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from tempfile import TemporaryDirectory
-from typing import Literal
+from typing import Literal, Mapping
 
-from api.compile_transactions import artifact_paths
+import yaml
+
+from api.compile_transactions import (
+    ERROR_CODE_INTERRUPTED,
+    ManifestIntegrityError,
+    ProcessRecord,
+    TransactionKind,
+    TransactionState,
+    artifact_paths,
+    cleanup_terminal_transactions,
+    create_prepared_transaction,
+    load_manifest,
+    recover_transaction,
+    transition_manifest,
+)
+from api.process_tree import (
+    STATUS_COMPLETED,
+    STATUS_TIMED_OUT,
+    ProcessResult,
+    SpawnedProcess,
+    spawn_compile_process,
+    terminate_process_tree,
+    wait_for_process,
+)
+from api.runtime_guard import (
+    CompileRuntimeConfig,
+    ServiceReadiness,
+    load_compile_runtime_config,
+)
 from scripts.doc_admin import read_doc_meta, write_doc_compile_result
 
 __all__ = [
     "artifact_paths",
-    "create_artifact_snapshot",
-    "restore_artifact_snapshot",
+    "classify_compile_error",
+    "prepare_recompile_transaction",
+    "restore_transaction_artifacts",
     "run_compile_task",
     "sanitize_compile_error",
-    "classify_compile_error",
 ]
 
 logger = logging.getLogger(__name__)
@@ -39,6 +87,8 @@ CompileErrorCode = Literal[
 
 MAX_ERROR_MESSAGE = 500
 MAX_CAPTURE_CHARS = 8192
+
+_SAFE_JOB_ID = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
 
 # E004-FIX-02:带引号键值(JSON/Python dict/header/env)统一由 callable 脱敏,
 # 覆盖单/双引号键、单/双/无引号值、:与=、键值间任意空格;
@@ -103,83 +153,138 @@ def classify_compile_error(text: str) -> CompileErrorCode:
     return "compile_failed"
 
 
-@dataclass(frozen=True)
-class SnapshotEntry:
-    target: Path
-    relative_path: str
-    existed: bool
-    backup: Path | None
-
-
-@dataclass(frozen=True)
-class ArtifactSnapshot:
-    entries: tuple[SnapshotEntry, ...]
-
-
 # artifact_paths 由 api.compile_transactions 提供并在此再导出,
 # 保持 E004 既有导入路径 from api.compile_jobs import artifact_paths 兼容。
 
 
-def create_artifact_snapshot(
-    base_dir: Path,
+# ---------------------------------------------------------------------------
+# 重编译事务纯准备(设计 §11 至 PREPARED 发布)
+# ---------------------------------------------------------------------------
+
+
+def prepare_recompile_transaction(
     doc_id: str,
-    snapshot_dir: Path,
-) -> ArtifactSnapshot:
-    snapshot_dir.mkdir(parents=True, exist_ok=True)
-    entries = []
-    for index, target in enumerate(artifact_paths(base_dir, doc_id)):
-        relative_path = target.relative_to(base_dir).as_posix()
-        if target.exists():
-            backup = snapshot_dir / f"{index:02d}.bin"
-            backup.write_bytes(target.read_bytes())
-            entries.append(SnapshotEntry(
-                target=target,
-                relative_path=relative_path,
-                existed=True,
-                backup=backup,
-            ))
-        else:
-            entries.append(SnapshotEntry(
-                target=target,
-                relative_path=relative_path,
-                existed=False,
-                backup=None,
-            ))
-    return ArtifactSnapshot(entries=tuple(entries))
+    base_dir: Path,
+    config: CompileRuntimeConfig,
+):
+    """读取并保存原 meta,发布 PREPARED 重编译事务。
 
-
-def _atomic_write_bytes(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    只做纯准备: 不绑定 meta、不迁移 SCHEDULED、不登记后台任务。
+    任何失败都抛出给调用方,meta 保持字节不变,staging 由
+    create_prepared_transaction 负责清理。
+    """
+    base = Path(base_dir)
+    previous_meta = read_doc_meta(doc_id, base)
+    return create_prepared_transaction(
+        base_dir=base,
+        config=config,
+        doc_id=doc_id,
+        kind=TransactionKind.RECOMPILE,
+        previous_meta=previous_meta,
     )
-    temp_path = Path(temp_name)
+
+
+# ---------------------------------------------------------------------------
+# 恢复编排边界(独立命名以便替换与测试;委托 Task 4 恢复库)
+# ---------------------------------------------------------------------------
+
+
+def restore_transaction_artifacts(
+    base_dir: Path,
+    config: CompileRuntimeConfig,
+    job_dir: Path,
+    *,
+    reason_code: str,
+    reason_message: str,
+):
+    """委托恢复库执行幂等回滚(设计 §16)。
+
+    调用前 Manifest 必须已进入 ROLLBACKING 并保存原始失败原因;
+    recover_transaction 保留原始原因,绝不覆盖。
+    """
+    return recover_transaction(
+        base_dir,
+        config,
+        job_dir,
+        reason_code=reason_code,
+        reason_message=reason_message,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 成功语义验证(设计 §15)
+# ---------------------------------------------------------------------------
+
+
+def _load_yaml_mapping(path: Path) -> dict | None:
     try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, path)
-    finally:
-        temp_path.unlink(missing_ok=True)
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
-def restore_artifact_snapshot(snapshot: ArtifactSnapshot) -> list[str]:
-    failures = []
-    for entry in snapshot.entries:
-        try:
-            if entry.existed:
-                if entry.backup is None:
-                    raise RuntimeError("snapshot backup missing")
-                _atomic_write_bytes(entry.target, entry.backup.read_bytes())
-            else:
-                entry.target.unlink(missing_ok=True)
-        except Exception:
-            failures.append(entry.relative_path)
+def _read_doc_meta_safe(base: Path, doc_id: str) -> dict | None:
+    try:
+        meta = read_doc_meta(doc_id, base)
+    except (OSError, yaml.YAMLError) as exc:
+        logger.warning("doc meta unreadable during compile validation: %s", exc)
+        return None
+    return meta if isinstance(meta, dict) else None
+
+
+def _validate_compile_outputs(base: Path, doc_id: str) -> list[str]:
+    """设计 §15 必需产物语义验证;返回失败列表,空列表表示合法。"""
+    failures: list[str] = []
+
+    for path, label in (
+        (base / "wiki" / f"{doc_id}.summary.yaml", "summary"),
+        (base / "meta" / "ontology" / f"{doc_id}.ontology.yaml", "ontology"),
+    ):
+        data = _load_yaml_mapping(path)
+        if data is None:
+            failures.append(f"{label} missing or unparsable")
+        elif data.get("doc_id") != doc_id:
+            failures.append(f"{label} doc_id mismatch")
+
+    index = _load_yaml_mapping(base / "wiki" / "index.yaml")
+    documents = index.get("documents") if index else None
+    if not isinstance(documents, list) or sum(
+        1
+        for entry in documents
+        if isinstance(entry, Mapping) and entry.get("id") == doc_id
+    ) != 1:
+        failures.append("wiki/index.yaml must contain exactly one entry for doc")
+
+    if _load_yaml_mapping(base / "raw" / f"{doc_id}.meta.yaml") is None:
+        failures.append("doc meta missing or unparsable")
+
+    relations_path = base / "meta" / "relations" / f"{doc_id}.relations.yaml"
+    if relations_path.exists():
+        data = _load_yaml_mapping(relations_path)
+        if data is None or data.get("doc_id") != doc_id:
+            failures.append("doc relations missing or doc_id mismatch")
+
+    for global_path in (
+        base / "meta" / "ontology" / "global_ontology.yaml",
+        base / "meta" / "relations" / "knowledge_graph.yaml",
+        base / "meta" / "ontology" / "entity_relations.yaml",
+    ):
+        if global_path.exists() and _load_yaml_mapping(global_path) is None:
+            failures.append(f"{global_path.name} top-level structure invalid")
     return failures
 
 
-def _diagnostic_text(result: subprocess.CompletedProcess, meta: dict | None) -> str:
+# ---------------------------------------------------------------------------
+# 执行器内部辅助
+# ---------------------------------------------------------------------------
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _diagnostic_text(result: ProcessResult, meta: dict | None) -> str:
     parts = []
     if meta and meta.get("error_message"):
         parts.append(str(meta["error_message"]))
@@ -191,93 +296,350 @@ def _diagnostic_text(result: subprocess.CompletedProcess, meta: dict | None) -> 
     return "\n".join(parts)
 
 
-def _persist_terminal_error(
-    doc_id: str,
-    base: Path,
-    code: CompileErrorCode,
-    message: str,
-) -> None:
-    written = write_doc_compile_result(
-        doc_id,
-        "error",
-        error_code=code,
-        error_message=sanitize_compile_error(message),
-        base_dir=base,
+def _process_record(identity) -> ProcessRecord:
+    return ProcessRecord(
+        pid=identity.pid,
+        create_time=identity.create_time,
+        executable=identity.executable,
+        cwd=identity.cwd,
+        command_fingerprint=identity.command_fingerprint,
+        process_group_id=identity.process_group_id,
+        platform=identity.platform,
     )
-    if not written:
-        logger.error(
-            "compile job terminal metadata missing for %s; code=%s",
-            doc_id,
-            code,
+
+
+def _reap_popen(spawned: SpawnedProcess, grace_seconds: int) -> None:
+    """进程树终止后回收 Popen,避免句柄/僵尸累积(不得抛出)。"""
+    popen = spawned.popen
+    try:
+        popen.communicate(timeout=grace_seconds)
+        return
+    except Exception as exc:
+        logger.warning(
+            "reap via communicate failed for pid=%s: %s", popen.pid, exc
+        )
+    try:
+        popen.wait(timeout=grace_seconds)
+    except Exception as exc:
+        logger.warning("reap via wait failed for pid=%s: %s", popen.pid, exc)
+
+
+def _verify_and_cleanup_terminal(
+    base: Path, config: CompileRuntimeConfig, readiness: ServiceReadiness
+) -> None:
+    """终态验证并清理(设计 §18);验证失败失败关闭,进入 recovery_required。"""
+    report = cleanup_terminal_transactions(base, config)
+    if report.blockers:
+        readiness.mark_recovery_required(
+            sanitize_compile_error("; ".join(report.blockers))
         )
 
 
-def run_compile_task(doc_id: str, base_dir: Path | None = None) -> None:
+def _rollback_running_job(
+    base: Path,
+    config: CompileRuntimeConfig,
+    readiness: ServiceReadiness,
+    manifest,
+    expected_state: TransactionState,
+    code: str,
+    sanitized_message: str,
+) -> None:
+    """迁移到 ROLLBACKING(保留原始原因)→ 幂等回滚 → 终态验证清理。
+
+    回滚被阻断时失败关闭: readiness 进入 recovery_required,
+    不伪造文档终态,Manifest 保留 ROLLBACKING 证据。
+    """
+    transition_manifest(
+        manifest.job_dir,
+        expected=expected_state,
+        target=TransactionState.ROLLBACKING,
+        failure={"original_code": code, "original_message": sanitized_message},
+    )
+    result = restore_transaction_artifacts(
+        base,
+        config,
+        manifest.job_dir,
+        reason_code=code,
+        reason_message=sanitized_message,
+    )
+    if result is not None and getattr(result, "blocked", False):
+        readiness.mark_recovery_required(
+            sanitize_compile_error(result.reason or "rollback_failed")
+        )
+        return
+    _verify_and_cleanup_terminal(base, config, readiness)
+
+
+def _terminate_timed_out_job(
+    base: Path,
+    config: CompileRuntimeConfig,
+    readiness: ServiceReadiness,
+    manifest,
+    spawned: SpawnedProcess,
+    grace_seconds: int,
+    code: str,
+    sanitized_message: str,
+) -> None:
+    """设计 §14 超时顺序: ROLLBACKING(reason) → 终止树 → 确认退出 → 回滚。"""
+    transition_manifest(
+        manifest.job_dir,
+        expected=TransactionState.RUNNING,
+        target=TransactionState.ROLLBACKING,
+        failure={"original_code": code, "original_message": sanitized_message},
+    )
+    identity = spawned.identity
+    termination = terminate_process_tree(identity, grace_seconds)
+    # 无论终止结果如何都必须回收 Popen,避免句柄/僵尸累积。
+    _reap_popen(spawned, grace_seconds)
+    if not termination.success:
+        readiness.mark_recovery_required(
+            sanitize_compile_error(
+                f"process tree exit unconfirmed: {termination.status}"
+            )
+        )
+        return
+    result = restore_transaction_artifacts(
+        base,
+        config,
+        manifest.job_dir,
+        reason_code=code,
+        reason_message=sanitized_message,
+    )
+    if result is not None and getattr(result, "blocked", False):
+        readiness.mark_recovery_required(
+            sanitize_compile_error(result.reason or "rollback_failed")
+        )
+        return
+    _verify_and_cleanup_terminal(base, config, readiness)
+
+
+def _terminate_spawned_best_effort(
+    spawned: SpawnedProcess, grace_seconds: int
+) -> None:
+    """RUNNING 迁移失败后的 best-effort 清理;任何异常只记录日志。"""
+    try:
+        if spawned.identity is not None:
+            terminate_process_tree(spawned.identity, grace_seconds)
+    except Exception as exc:
+        logger.error("best-effort tree termination failed: %s", exc)
+    _reap_popen(spawned, grace_seconds)
+
+
+def _execute_scheduled_job(
+    base: Path,
+    config: CompileRuntimeConfig,
+    readiness: ServiceReadiness,
+    manifest,
+) -> None:
+    """SCHEDULED → RUNNING → COMMITTED / ROLLBACKING → ROLLED_BACK。"""
+    job_dir = manifest.job_dir
+    doc_id = manifest.doc_id
+    timeout_seconds = manifest.timeout_seconds or config.timeout_seconds
+    grace_seconds = (
+        manifest.termination_grace_seconds or config.termination_grace_seconds
+    )
+    started_at = datetime.now(timezone.utc)
+    deadline = started_at + timedelta(seconds=timeout_seconds)
+
+    env = {**os.environ, "PYTHONUTF8": "1"}
+    try:
+        spawned = spawn_compile_process(base, doc_id, env)
+    except Exception as exc:
+        sanitized = sanitize_compile_error(
+            f"compile process spawn failed: {type(exc).__name__}: {exc}"
+        )
+        _rollback_running_job(
+            base,
+            config,
+            readiness,
+            manifest,
+            TransactionState.SCHEDULED,
+            classify_compile_error(sanitized),
+            sanitized,
+        )
+        return
+
+    if spawned.identity is None:
+        _reap_popen(spawned, grace_seconds)
+        _rollback_running_job(
+            base,
+            config,
+            readiness,
+            manifest,
+            TransactionState.SCHEDULED,
+            "compile_failed",
+            sanitize_compile_error("compile process identity unavailable"),
+        )
+        return
+
+    # 设计 §13: 进程已启动并记录身份后,Manifest 原子进入 RUNNING。
+    try:
+        manifest = transition_manifest(
+            job_dir,
+            expected=TransactionState.SCHEDULED,
+            target=TransactionState.RUNNING,
+            started_at=started_at.isoformat(),
+            deadline=deadline.isoformat(),
+            process=_process_record(spawned.identity),
+        )
+    except Exception as exc:
+        logger.error(
+            "RUNNING transition failed for job %s after spawn: %s",
+            manifest.job_id,
+            exc,
+        )
+        _terminate_spawned_best_effort(spawned, grace_seconds)
+        readiness.mark_recovery_required("running_transition_failed")
+        return
+
+    try:
+        result = wait_for_process(spawned, timeout_seconds)
+    except Exception as exc:
+        logger.error("wait_for_process failed for job %s: %s", manifest.job_id, exc)
+        sanitized = sanitize_compile_error(
+            f"compile wait failed: {type(exc).__name__}: {exc}"
+        )
+        _terminate_timed_out_job(
+            base,
+            config,
+            readiness,
+            manifest,
+            spawned,
+            grace_seconds,
+            classify_compile_error(sanitized),
+            sanitized,
+        )
+        return
+
+    if result.status == STATUS_TIMED_OUT:
+        _terminate_timed_out_job(
+            base,
+            config,
+            readiness,
+            manifest,
+            spawned,
+            grace_seconds,
+            "timeout",
+            sanitize_compile_error(
+                f"compile exceeded hard timeout of {timeout_seconds} seconds"
+            ),
+        )
+        return
+
+    if result.status == STATUS_COMPLETED:
+        meta = _read_doc_meta_safe(base, doc_id)
+        validation_failures = _validate_compile_outputs(base, doc_id)
+        if (
+            meta is not None
+            and meta.get("status") == "compiled"
+            and not validation_failures
+        ):
+            # wrapper 规范化 compiled meta 并清除活动字段(设计 §15)。
+            if not write_doc_compile_result(doc_id, "compiled", base_dir=base):
+                readiness.mark_recovery_required(
+                    "compiled_meta_normalization_failed"
+                )
+                return
+            # Manifest 原子进入 COMMITTED: 唯一成功提交点。
+            transition_manifest(
+                job_dir,
+                expected=TransactionState.RUNNING,
+                target=TransactionState.COMMITTED,
+            )
+            _verify_and_cleanup_terminal(base, config, readiness)
+            return
+        diagnostic = _diagnostic_text(result, meta)
+        if validation_failures:
+            diagnostic += "\nsemantic validation failed: " + "; ".join(
+                validation_failures
+            )
+    else:
+        meta = _read_doc_meta_safe(base, doc_id)
+        diagnostic = _diagnostic_text(result, meta)
+
+    sanitized = sanitize_compile_error(diagnostic)
+    _rollback_running_job(
+        base,
+        config,
+        readiness,
+        manifest,
+        TransactionState.RUNNING,
+        classify_compile_error(sanitized),
+        sanitized,
+    )
+
+
+def _execute_compile_job(
+    job_id: str,
+    base: Path,
+    config: CompileRuntimeConfig,
+    readiness: ServiceReadiness,
+) -> None:
+    if not _SAFE_JOB_ID.match(job_id) or ".." in job_id:
+        logger.warning("compile task rejected unsafe job id %r; ignoring", job_id)
+        return
+    job_dir = Path(config.transaction_dir) / job_id
+    if not job_dir.is_dir():
+        logger.warning("compile task for unknown job %s; ignoring", job_id)
+        return
+    try:
+        manifest = load_manifest(job_dir)
+    except ManifestIntegrityError as exc:
+        logger.error("manifest integrity failure for job %s: %s", job_id, exc)
+        readiness.mark_recovery_required("manifest_integrity")
+        return
+
+    if manifest.state in (TransactionState.COMMITTED, TransactionState.ROLLED_BACK):
+        _verify_and_cleanup_terminal(base, config, readiness)
+        return
+
+    if manifest.state is not TransactionState.SCHEDULED:
+        # SCHEDULED 语义: 不重新排队、不重复执行;其他非终态一律按
+        # 恢复库语义处理(设计 §9、§16、§17)。
+        logger.warning(
+            "compile job %s in state %s; deferring to recovery semantics",
+            job_id,
+            manifest.state.value,
+        )
+        result = recover_transaction(
+            base,
+            config,
+            job_dir,
+            reason_code=ERROR_CODE_INTERRUPTED,
+            reason_message="compile task invoked outside scheduled state",
+        )
+        if result.blocked:
+            readiness.mark_recovery_required(
+                sanitize_compile_error(result.reason or "recovery_blocked")
+            )
+            return
+        _verify_and_cleanup_terminal(base, config, readiness)
+        return
+
+    _execute_scheduled_job(base, config, readiness, manifest)
+
+
+def run_compile_task(
+    job_id: str,
+    base_dir: Path | None = None,
+    config: CompileRuntimeConfig | None = None,
+    readiness: ServiceReadiness | None = None,
+) -> None:
+    """以 job_id 为输入的事务化编译后台任务;绝不抛出。
+
+    - 未知 job: 记录日志并返回,readiness 不变;
+    - 非 SCHEDULED: 按恢复库语义处理,绝不重新执行;
+    - 任何无法证明一致性的基础设施失败: readiness 进入
+      recovery_required,失败关闭。
+    """
     base = Path(base_dir) if base_dir is not None else Path(__file__).resolve().parent.parent
+    config = config if config is not None else load_compile_runtime_config(base)
+    readiness = readiness if readiness is not None else ServiceReadiness()
     with COMPILE_EXECUTION_LOCK:
         try:
-            with TemporaryDirectory(prefix=f"port-kb-{doc_id}-") as temp_name:
-                try:
-                    snapshot = create_artifact_snapshot(base, doc_id, Path(temp_name))
-                except Exception as exc:
-                    _persist_terminal_error(
-                        doc_id,
-                        base,
-                        "compile_failed",
-                        f"snapshot creation failed: {type(exc).__name__}: {exc}",
-                    )
-                    return
-
-                failure_code: CompileErrorCode | None = None
-                failure_message = ""
-                try:
-                    compile_script = base / "scripts" / "compile.py"
-                    if not compile_script.exists():
-                        raise FileNotFoundError("compile script missing")
-                    env = {**os.environ, "PYTHONUTF8": "1"}
-                    result = subprocess.run(
-                        [sys.executable, "-m", "scripts.compile", doc_id],
-                        cwd=str(base),
-                        env=env,
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        check=False,
-                    )
-                    meta = read_doc_meta(doc_id, base)
-                    if result.returncode == 0 and meta and meta.get("status") == "compiled":
-                        if not write_doc_compile_result(doc_id, "compiled", base_dir=base):
-                            logger.error(
-                                "compiled terminal metadata missing for %s",
-                                doc_id,
-                            )
-                        return
-                    diagnostic = _diagnostic_text(result, meta)
-                    failure_code = classify_compile_error(diagnostic)
-                    failure_message = sanitize_compile_error(diagnostic)
-                except Exception as exc:
-                    failure_code = classify_compile_error(str(exc))
-                    failure_message = sanitize_compile_error(
-                        f"{type(exc).__name__}: {exc}"
-                    )
-
-                rollback_failures = restore_artifact_snapshot(snapshot)
-                if rollback_failures:
-                    failure_code = "rollback_failed"
-                    failure_message = sanitize_compile_error(
-                        f"{failure_message}; rollback failed: {', '.join(rollback_failures)}"
-                    )
-                _persist_terminal_error(
-                    doc_id,
-                    base,
-                    failure_code or "compile_failed",
-                    failure_message or "编译失败",
-                )
-        except Exception as exc:
-            _persist_terminal_error(
-                doc_id,
-                base,
-                classify_compile_error(str(exc)),
-                f"compile task infrastructure failed: {type(exc).__name__}: {exc}",
+            _execute_compile_job(str(job_id), base, config, readiness)
+        except Exception:
+            logger.exception(
+                "compile task %s hit an infrastructure failure", job_id
             )
+            readiness.mark_recovery_required("compile_infrastructure_error")

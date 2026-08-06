@@ -757,7 +757,12 @@ def list_active_manifests(config: CompileRuntimeConfig) -> list[CompileManifest]
 # ---------------------------------------------------------------------------
 
 #: raw meta 中的活动 job 绑定字段;终态(meta compiled/error)不得携带。
-META_ACTIVE_JOB_FIELDS = ("compile_job_id", "compile_deadline")
+#: 与 scripts.doc_admin.ACTIVE_JOB_FIELDS 保持一致。
+META_ACTIVE_JOB_FIELDS = (
+    "compile_job_id",
+    "compile_started_at",
+    "compile_deadline",
+)
 
 #: 文档终态错误码: 未提交事务因服务生命周期中断而恢复(设计 §20.1)。
 ERROR_CODE_INTERRUPTED = "interrupted"

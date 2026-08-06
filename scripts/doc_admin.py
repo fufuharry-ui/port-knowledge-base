@@ -23,6 +23,11 @@ WIKI_DIR = BASE_DIR / "wiki"
 INDEX_FILE = WIKI_DIR / "index.yaml"
 META_DIR = BASE_DIR / "meta"
 
+#: raw meta 中的活动编译 job 绑定字段;进入 compiling 时由
+#: bind_doc_compile_job 写入,任何终态写入都必须全部清除。
+#: 与 api.compile_transactions.META_ACTIVE_JOB_FIELDS 保持一致。
+ACTIVE_JOB_FIELDS = ("compile_job_id", "compile_started_at", "compile_deadline")
+
 
 def edges_excluding_doc(edges, doc_id: str):
     """从边列表移除涉及 doc_id 的边(纯函数,删除时清理图用)。
@@ -177,6 +182,45 @@ def prepare_doc_compile(doc_id: str, base_dir: Path | None = None) -> dict:
     return {"doc_id": doc_id, "prepared": True}
 
 
+def bind_doc_compile_job(
+    doc_id: str,
+    job_id: str,
+    started_at: str,
+    deadline: str,
+    *,
+    base_dir: Path | None = None,
+) -> bool:
+    """原子地把文档绑定到编译事务: status=compiling + 三个活动 job 字段。
+
+    同时清除陈旧错误字段。meta 不存在或已处于 compiling 时拒绝,
+    返回 False 且不写入任何内容。
+    """
+    path = _raw_dir(base_dir) / f"{doc_id}.meta.yaml"
+    meta = read_doc_meta(doc_id, base_dir)
+    if meta is None or meta.get("status") == "compiling":
+        return False
+    meta["status"] = "compiling"
+    meta["compile_job_id"] = job_id
+    meta["compile_started_at"] = started_at
+    meta["compile_deadline"] = deadline
+    meta.pop("error_code", None)
+    meta.pop("error_message", None)
+    _atomic_yaml_dump(path, meta)
+    return True
+
+
+def clear_doc_compile_job(doc_id: str, *, base_dir: Path | None = None) -> bool:
+    """原子地剥离全部活动 job 字段;不改变文档状态。meta 不存在返回 False。"""
+    path = _raw_dir(base_dir) / f"{doc_id}.meta.yaml"
+    meta = read_doc_meta(doc_id, base_dir)
+    if meta is None:
+        return False
+    for field in ACTIVE_JOB_FIELDS:
+        meta.pop(field, None)
+    _atomic_yaml_dump(path, meta)
+    return True
+
+
 def write_doc_compile_result(
     doc_id: str,
     status: str,
@@ -188,7 +232,8 @@ def write_doc_compile_result(
     """写入编译终态(compiled/error),原子发布。
 
     error 时记录 error_code/error_message(缺省给通用值);
-    compiled 时清除错误字段。meta 不存在返回 False。
+    compiled 时清除错误字段。两种终态都必须清除全部活动 job 字段。
+    meta 不存在返回 False。
     """
     if status not in {"compiled", "error"}:
         raise ValueError(f"unsupported terminal compile status: {status}")
@@ -203,6 +248,8 @@ def write_doc_compile_result(
     else:
         meta.pop("error_code", None)
         meta.pop("error_message", None)
+    for field in ACTIVE_JOB_FIELDS:
+        meta.pop(field, None)
     _atomic_yaml_dump(path, meta)
     return True
 

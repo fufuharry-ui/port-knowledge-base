@@ -12,7 +12,17 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Literal
 
+from api.compile_transactions import artifact_paths
 from scripts.doc_admin import read_doc_meta, write_doc_compile_result
+
+__all__ = [
+    "artifact_paths",
+    "create_artifact_snapshot",
+    "restore_artifact_snapshot",
+    "run_compile_task",
+    "sanitize_compile_error",
+    "classify_compile_error",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -106,16 +116,8 @@ class ArtifactSnapshot:
     entries: tuple[SnapshotEntry, ...]
 
 
-def artifact_paths(base_dir: Path, doc_id: str) -> tuple[Path, ...]:
-    return (
-        base_dir / "wiki" / f"{doc_id}.summary.yaml",
-        base_dir / "wiki" / "index.yaml",
-        base_dir / "meta" / "ontology" / f"{doc_id}.ontology.yaml",
-        base_dir / "meta" / "ontology" / "global_ontology.yaml",
-        base_dir / "meta" / "relations" / f"{doc_id}.relations.yaml",
-        base_dir / "meta" / "relations" / "knowledge_graph.yaml",
-        base_dir / "meta" / "ontology" / "entity_relations.yaml",
-    )
+# artifact_paths 由 api.compile_transactions 提供并在此再导出,
+# 保持 E004 既有导入路径 from api.compile_jobs import artifact_paths 兼容。
 
 
 def create_artifact_snapshot(

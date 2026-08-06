@@ -1,0 +1,519 @@
+"""E005 Task 2: 编译事务 Manifest 模型与持久快照存储测试。
+
+全部测试仅使用 tmp_path 隔离目录,不访问真实知识库目录,不访问网络,
+不依赖任何模型 API Key。
+"""
+from __future__ import annotations
+
+import pytest
+import yaml
+
+from api.compile_transactions import (
+    ACTIVE_STATES,
+    ALLOWED_TRANSITIONS,
+    CompileManifest,
+    ManifestIntegrityError,
+    ProcessRecord,
+    PublishedIntake,
+    TransactionKind,
+    TransactionState,
+    TransactionStateError,
+    artifact_paths,
+    create_prepared_transaction,
+    list_active_manifests,
+    list_transaction_dirs,
+    load_manifest,
+    transition_manifest,
+)
+from api.durable_fs import sha256_file
+from api.runtime_guard import load_compile_runtime_config
+
+DOC_ID = "doc_20260806_001"
+
+EXPECTED_ARTIFACT_PATHS = {
+    f"wiki/{DOC_ID}.summary.yaml",
+    "wiki/index.yaml",
+    f"meta/ontology/{DOC_ID}.ontology.yaml",
+    "meta/ontology/global_ontology.yaml",
+    f"meta/relations/{DOC_ID}.relations.yaml",
+    "meta/relations/knowledge_graph.yaml",
+    "meta/ontology/entity_relations.yaml",
+}
+
+PREPARED = TransactionState.PREPARED
+SCHEDULED = TransactionState.SCHEDULED
+RUNNING = TransactionState.RUNNING
+COMMITTED = TransactionState.COMMITTED
+ROLLBACKING = TransactionState.ROLLBACKING
+ROLLED_BACK = TransactionState.ROLLED_BACK
+
+
+def runtime_config(base):
+    return load_compile_runtime_config(base, env={})
+
+
+def seed_business_tree(base, doc_id=DOC_ID):
+    for rel in EXPECTED_ARTIFACT_PATHS:
+        path = base / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"payload::{rel}".encode("utf-8"))
+
+
+def prepared_manifest(tmp_path, *, seed=True, previous_meta=None, kind=TransactionKind.RECOMPILE):
+    if seed:
+        seed_business_tree(tmp_path)
+    if previous_meta is None and kind is TransactionKind.RECOMPILE:
+        previous_meta = {"id": DOC_ID, "status": "compiled"}
+    return create_prepared_transaction(
+        base_dir=tmp_path,
+        config=runtime_config(tmp_path),
+        doc_id=DOC_ID,
+        kind=kind,
+        previous_meta=previous_meta,
+    )
+
+
+def read_manifest_yaml(job_dir):
+    return yaml.safe_load((job_dir / "manifest.yaml").read_text(encoding="utf-8"))
+
+
+def rewrite_manifest_yaml(job_dir, data):
+    (job_dir / "manifest.yaml").write_text(
+        yaml.dump(data, allow_unicode=True), encoding="utf-8"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 创建与快照
+# ---------------------------------------------------------------------------
+
+
+def test_create_prepared_transaction_snapshots_exact_seven_paths(tmp_path):
+    manifest = create_prepared_transaction(
+        base_dir=tmp_path,
+        config=runtime_config(tmp_path),
+        doc_id=DOC_ID,
+        kind=TransactionKind.RECOMPILE,
+        previous_meta={"id": DOC_ID, "status": "compiled"},
+    )
+    assert manifest.state is TransactionState.PREPARED
+    assert len(manifest.artifacts) == 7
+    assert {item.path for item in manifest.artifacts} == EXPECTED_ARTIFACT_PATHS
+
+
+def test_snapshots_capture_bytes_size_and_sha256(tmp_path):
+    seed_business_tree(tmp_path)
+    manifest = prepared_manifest(tmp_path)
+    for record in manifest.artifacts:
+        assert record.existed is True
+        assert record.snapshot == f"snapshots/{record.slot:02d}.bin"
+        snapshot_file = manifest.job_dir / record.snapshot
+        original = tmp_path / record.path
+        assert snapshot_file.is_file()
+        assert snapshot_file.read_bytes() == original.read_bytes()
+        assert record.snapshot_size == len(original.read_bytes())
+        assert record.snapshot_sha256 == sha256_file(snapshot_file)
+        assert record.original_sha256 == sha256_file(original)
+
+
+def test_missing_artifacts_recorded_without_snapshot(tmp_path):
+    manifest = prepared_manifest(tmp_path, seed=False)
+    assert len(manifest.artifacts) == 7
+    for record in manifest.artifacts:
+        assert record.existed is False
+        assert record.snapshot is None
+        assert record.snapshot_size is None
+        assert record.snapshot_sha256 is None
+        assert record.original_sha256 is None
+    assert not any((manifest.job_dir / "snapshots").iterdir())
+
+
+def test_formal_directory_published_and_staging_removed(tmp_path):
+    seed_business_tree(tmp_path)
+    config = runtime_config(tmp_path)
+    manifest = prepared_manifest(tmp_path)
+    assert manifest.job_dir == config.transaction_dir / manifest.job_id
+    assert manifest.job_dir.is_dir()
+    assert not (config.transaction_dir / f".staging-{manifest.job_id}").exists()
+    assert (manifest.job_dir / "manifest.yaml").is_file()
+
+
+def test_job_ids_are_unique_and_time_ordered(tmp_path):
+    seed_business_tree(tmp_path)
+    first = prepared_manifest(tmp_path)
+    second = prepared_manifest(tmp_path)
+    assert first.job_id != second.job_id
+    assert first.job_id < second.job_id
+
+
+def test_previous_meta_saved_durably(tmp_path):
+    meta = {"id": DOC_ID, "status": "compiled", "title": "旧文档"}
+    seed_business_tree(tmp_path)
+    manifest = prepared_manifest(tmp_path, previous_meta=meta)
+    saved = yaml.safe_load(
+        (manifest.job_dir / "source-meta-before.yaml").read_text(encoding="utf-8")
+    )
+    assert saved == meta
+    assert manifest.previous_document_status == "compiled"
+
+
+def test_upload_transaction_records_published_intake(tmp_path):
+    seed_business_tree(tmp_path)
+    intake = PublishedIntake(
+        original_path="originals/example.pdf",
+        raw_text_path=f"raw/{DOC_ID}.txt",
+        raw_meta_path=f"raw/{DOC_ID}.meta.yaml",
+        published=True,
+    )
+    manifest = create_prepared_transaction(
+        base_dir=tmp_path,
+        config=runtime_config(tmp_path),
+        doc_id=DOC_ID,
+        kind=TransactionKind.UPLOAD,
+        previous_meta=None,
+        published_intake=intake,
+    )
+    loaded = load_manifest(manifest.job_dir)
+    assert loaded.kind is TransactionKind.UPLOAD
+    assert loaded.published_intake == intake
+    assert loaded.previous_document_status is None
+
+
+def test_manifest_roundtrip_through_load(tmp_path):
+    seed_business_tree(tmp_path)
+    manifest = prepared_manifest(tmp_path)
+    loaded = load_manifest(manifest.job_dir)
+    assert loaded == manifest
+    data = read_manifest_yaml(manifest.job_dir)
+    assert data["schema_version"] == 1
+    assert data["state"] == "PREPARED"
+    assert data["kind"] == "recompile"
+
+
+def test_staging_cleanup_on_failure_leaves_business_state_untouched(
+    tmp_path, monkeypatch
+):
+    seed_business_tree(tmp_path)
+    before = {
+        rel: sha256_file(tmp_path / rel) for rel in sorted(EXPECTED_ARTIFACT_PATHS)
+    }
+    config = runtime_config(tmp_path)
+
+    import api.compile_transactions as transactions
+
+    def boom(*args, **kwargs):
+        raise OSError("simulated durable write failure")
+
+    monkeypatch.setattr(transactions, "durable_write_yaml", boom)
+    with pytest.raises(OSError, match="simulated durable write failure"):
+        create_prepared_transaction(
+            base_dir=tmp_path,
+            config=config,
+            doc_id=DOC_ID,
+            kind=TransactionKind.RECOMPILE,
+            previous_meta={"id": DOC_ID, "status": "compiled"},
+        )
+    assert list(config.transaction_dir.iterdir()) == []
+    after = {
+        rel: sha256_file(tmp_path / rel) for rel in sorted(EXPECTED_ARTIFACT_PATHS)
+    }
+    assert after == before
+
+
+# ---------------------------------------------------------------------------
+# 状态机
+# ---------------------------------------------------------------------------
+
+
+def test_active_states_and_allowed_transitions_contract():
+    assert ACTIVE_STATES == frozenset({PREPARED, SCHEDULED, RUNNING, ROLLBACKING})
+    assert ALLOWED_TRANSITIONS == {
+        PREPARED: {SCHEDULED, ROLLBACKING},
+        SCHEDULED: {RUNNING, ROLLBACKING},
+        RUNNING: {COMMITTED, ROLLBACKING},
+        ROLLBACKING: {ROLLED_BACK},
+        COMMITTED: set(),
+        ROLLED_BACK: set(),
+    }
+
+
+def test_transition_rejects_wrong_expected_state(tmp_path):
+    manifest = prepared_manifest(tmp_path)
+    with pytest.raises(TransactionStateError):
+        transition_manifest(
+            manifest.job_dir,
+            expected=TransactionState.RUNNING,
+            target=TransactionState.COMMITTED,
+        )
+
+
+def test_transition_full_allowed_chain(tmp_path):
+    manifest = prepared_manifest(tmp_path)
+    updated = transition_manifest(
+        manifest.job_dir,
+        expected=PREPARED,
+        target=SCHEDULED,
+        scheduled_at="2026-08-06T14:30:01+00:00",
+    )
+    assert updated.state is SCHEDULED
+    updated = transition_manifest(
+        manifest.job_dir,
+        expected=SCHEDULED,
+        target=RUNNING,
+        started_at="2026-08-06T14:30:02+00:00",
+        process=ProcessRecord(
+            pid=12345,
+            create_time=1786007401.25,
+            executable="C:/Python312/python.exe",
+            cwd="D:/repo",
+            command_fingerprint=f"scripts.compile|{DOC_ID}",
+            process_group_id=12345,
+            platform="windows",
+        ),
+    )
+    assert updated.state is RUNNING
+    assert updated.process is not None
+    assert updated.process.pid == 12345
+    updated = transition_manifest(
+        manifest.job_dir, expected=RUNNING, target=COMMITTED
+    )
+    assert updated.state is COMMITTED
+    reloaded = load_manifest(manifest.job_dir)
+    assert reloaded.state is COMMITTED
+    assert reloaded.process is not None
+    assert reloaded.process.command_fingerprint == f"scripts.compile|{DOC_ID}"
+
+
+@pytest.mark.parametrize("target", [PREPARED, RUNNING, COMMITTED, ROLLED_BACK])
+def test_transition_rejects_disallowed_targets(tmp_path, target):
+    manifest = prepared_manifest(tmp_path)
+    with pytest.raises(TransactionStateError):
+        transition_manifest(manifest.job_dir, expected=PREPARED, target=target)
+
+
+def test_transition_from_terminal_state_rejected(tmp_path):
+    manifest = prepared_manifest(tmp_path)
+    transition_manifest(manifest.job_dir, expected=PREPARED, target=SCHEDULED)
+    transition_manifest(manifest.job_dir, expected=SCHEDULED, target=RUNNING)
+    transition_manifest(manifest.job_dir, expected=RUNNING, target=COMMITTED)
+    with pytest.raises(TransactionStateError):
+        transition_manifest(manifest.job_dir, expected=COMMITTED, target=ROLLBACKING)
+
+
+def test_transition_rollback_chain(tmp_path):
+    manifest = prepared_manifest(tmp_path)
+    transition_manifest(manifest.job_dir, expected=PREPARED, target=SCHEDULED)
+    transition_manifest(manifest.job_dir, expected=SCHEDULED, target=RUNNING)
+    updated = transition_manifest(
+        manifest.job_dir,
+        expected=RUNNING,
+        target=ROLLBACKING,
+        failure={"original_code": "timeout", "original_message": "hard timeout"},
+    )
+    assert updated.state is ROLLBACKING
+    assert updated.failure["original_code"] == "timeout"
+    updated = transition_manifest(
+        manifest.job_dir, expected=ROLLBACKING, target=ROLLED_BACK
+    )
+    assert updated.state is ROLLED_BACK
+
+
+def test_transition_rejects_unknown_change_field(tmp_path):
+    manifest = prepared_manifest(tmp_path)
+    with pytest.raises(TransactionStateError):
+        transition_manifest(
+            manifest.job_dir,
+            expected=PREPARED,
+            target=SCHEDULED,
+            doc_id="doc_20990101_999",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Manifest 完整性与安全校验
+# ---------------------------------------------------------------------------
+
+
+def test_load_manifest_rejects_unknown_schema_version(tmp_path):
+    manifest = prepared_manifest(tmp_path)
+    data = read_manifest_yaml(manifest.job_dir)
+    data["schema_version"] = 2
+    rewrite_manifest_yaml(manifest.job_dir, data)
+    with pytest.raises(ManifestIntegrityError):
+        load_manifest(manifest.job_dir)
+
+
+def test_load_manifest_rejects_unknown_state(tmp_path):
+    manifest = prepared_manifest(tmp_path)
+    data = read_manifest_yaml(manifest.job_dir)
+    data["state"] = "EXPLODED"
+    rewrite_manifest_yaml(manifest.job_dir, data)
+    with pytest.raises(ManifestIntegrityError):
+        load_manifest(manifest.job_dir)
+
+
+def test_load_manifest_rejects_unknown_top_level_key(tmp_path):
+    manifest = prepared_manifest(tmp_path)
+    data = read_manifest_yaml(manifest.job_dir)
+    data["unexpected"] = "value"
+    rewrite_manifest_yaml(manifest.job_dir, data)
+    with pytest.raises(ManifestIntegrityError):
+        load_manifest(manifest.job_dir)
+
+
+def test_load_manifest_rejects_unknown_artifact_key(tmp_path):
+    manifest = prepared_manifest(tmp_path)
+    data = read_manifest_yaml(manifest.job_dir)
+    data["artifacts"][0]["backdoor"] = True
+    rewrite_manifest_yaml(manifest.job_dir, data)
+    with pytest.raises(ManifestIntegrityError):
+        load_manifest(manifest.job_dir)
+
+
+def test_load_manifest_rejects_unknown_process_key(tmp_path):
+    manifest = prepared_manifest(tmp_path)
+    data = read_manifest_yaml(manifest.job_dir)
+    data["process"] = {
+        "pid": 1,
+        "create_time": 1.0,
+        "executable": "x",
+        "cwd": "y",
+        "command_fingerprint": "z",
+        "process_group_id": 1,
+        "platform": "windows",
+        "extra": "nope",
+    }
+    rewrite_manifest_yaml(manifest.job_dir, data)
+    with pytest.raises(ManifestIntegrityError):
+        load_manifest(manifest.job_dir)
+
+
+def test_load_manifest_rejects_unknown_published_intake_key(tmp_path):
+    manifest = prepared_manifest(tmp_path)
+    data = read_manifest_yaml(manifest.job_dir)
+    data["published_intake"] = {
+        "original_path": "originals/a.pdf",
+        "raw_text_path": f"raw/{DOC_ID}.txt",
+        "raw_meta_path": f"raw/{DOC_ID}.meta.yaml",
+        "published": False,
+        "extra": "nope",
+    }
+    rewrite_manifest_yaml(manifest.job_dir, data)
+    with pytest.raises(ManifestIntegrityError):
+        load_manifest(manifest.job_dir)
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "../outside.yaml",
+        "wiki/../../outside.yaml",
+        "..\\outside.yaml",
+        "/etc/passwd",
+        "C:/Windows/win.ini",
+    ],
+)
+def test_load_manifest_rejects_artifact_path_traversal(tmp_path, bad_path):
+    manifest = prepared_manifest(tmp_path)
+    data = read_manifest_yaml(manifest.job_dir)
+    data["artifacts"][0]["path"] = bad_path
+    rewrite_manifest_yaml(manifest.job_dir, data)
+    with pytest.raises(ManifestIntegrityError):
+        load_manifest(manifest.job_dir)
+
+
+def test_load_manifest_rejects_snapshot_path_traversal(tmp_path):
+    manifest = prepared_manifest(tmp_path)
+    data = read_manifest_yaml(manifest.job_dir)
+    data["artifacts"][0]["snapshot"] = "snapshots/../../escape.bin"
+    rewrite_manifest_yaml(manifest.job_dir, data)
+    with pytest.raises(ManifestIntegrityError):
+        load_manifest(manifest.job_dir)
+
+
+def test_load_manifest_rejects_artifact_paths_outside_whitelist(tmp_path):
+    manifest = prepared_manifest(tmp_path)
+    data = read_manifest_yaml(manifest.job_dir)
+    data["artifacts"][0]["path"] = "wiki/other.summary.yaml"
+    rewrite_manifest_yaml(manifest.job_dir, data)
+    with pytest.raises(ManifestIntegrityError):
+        load_manifest(manifest.job_dir)
+
+
+def test_load_manifest_rejects_corrupted_snapshot(tmp_path):
+    seed_business_tree(tmp_path)
+    manifest = prepared_manifest(tmp_path)
+    snapshot_file = manifest.job_dir / "snapshots" / "00.bin"
+    payload = bytearray(snapshot_file.read_bytes())
+    payload[0] ^= 0xFF
+    snapshot_file.write_bytes(bytes(payload))
+    with pytest.raises(ManifestIntegrityError):
+        load_manifest(manifest.job_dir)
+
+
+def test_load_manifest_rejects_missing_snapshot_file(tmp_path):
+    seed_business_tree(tmp_path)
+    manifest = prepared_manifest(tmp_path)
+    (manifest.job_dir / "snapshots" / "00.bin").unlink()
+    with pytest.raises(ManifestIntegrityError):
+        load_manifest(manifest.job_dir)
+
+
+def test_load_manifest_rejects_tampered_doc_id(tmp_path):
+    manifest = prepared_manifest(tmp_path)
+    data = read_manifest_yaml(manifest.job_dir)
+    data["doc_id"] = "../evil"
+    rewrite_manifest_yaml(manifest.job_dir, data)
+    with pytest.raises(ManifestIntegrityError):
+        load_manifest(manifest.job_dir)
+
+
+# ---------------------------------------------------------------------------
+# 事务目录扫描
+# ---------------------------------------------------------------------------
+
+
+def test_list_transaction_dirs_excludes_staging(tmp_path):
+    config = runtime_config(tmp_path)
+    config.transaction_dir.mkdir(parents=True)
+    (config.transaction_dir / ".staging-orphan").mkdir()
+    (config.transaction_dir / "stray-file.txt").write_text("x", encoding="utf-8")
+    manifest = prepared_manifest(tmp_path)
+    assert list_transaction_dirs(config) == [manifest.job_dir]
+
+
+def test_list_transaction_dirs_empty_when_no_transactions(tmp_path):
+    assert list_transaction_dirs(runtime_config(tmp_path)) == []
+
+
+def test_list_active_manifests_detects_multiple_active(tmp_path):
+    seed_business_tree(tmp_path)
+    first = prepared_manifest(tmp_path)
+    second = prepared_manifest(tmp_path)
+    active = list_active_manifests(runtime_config(tmp_path))
+    assert {m.job_id for m in active} == {first.job_id, second.job_id}
+    assert len(active) == 2
+
+    transition_manifest(first.job_dir, expected=PREPARED, target=SCHEDULED)
+    transition_manifest(first.job_dir, expected=SCHEDULED, target=RUNNING)
+    transition_manifest(first.job_dir, expected=RUNNING, target=COMMITTED)
+    active = list_active_manifests(runtime_config(tmp_path))
+    assert [m.job_id for m in active] == [second.job_id]
+
+    transition_manifest(second.job_dir, expected=PREPARED, target=ROLLBACKING)
+    transition_manifest(second.job_dir, expected=ROLLBACKING, target=ROLLED_BACK)
+    assert list_active_manifests(runtime_config(tmp_path)) == []
+
+
+# ---------------------------------------------------------------------------
+# compile_jobs 兼容再导出
+# ---------------------------------------------------------------------------
+
+
+def test_artifact_paths_reexported_from_compile_jobs(tmp_path):
+    from api.compile_jobs import artifact_paths as legacy_artifact_paths
+
+    assert legacy_artifact_paths is artifact_paths
+    paths = legacy_artifact_paths(tmp_path, DOC_ID)
+    assert len(paths) == 7
+    assert {p.relative_to(tmp_path).as_posix() for p in paths} == EXPECTED_ARTIFACT_PATHS

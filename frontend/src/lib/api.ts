@@ -11,6 +11,7 @@ export const API_BASE =
 /** 后端编译/回滚失败的稳定机器错误码(见 detail.code) */
 export type CompileErrorCode =
     | 'compile_in_progress'
+    | 'knowledge_base_busy'
     | 'llm_configuration'
     | 'service_unavailable'
     | 'timeout'
@@ -21,6 +22,7 @@ export type CompileErrorCode =
 /** 错误码 → 固定中文用户文案(不暴露后端原始 detail) */
 const COMPILE_ERROR_MESSAGES: Record<CompileErrorCode, string> = {
     compile_in_progress: '该文档正在编译，请稍后再试',
+    knowledge_base_busy: '知识库正在执行编译任务，请稍后再删除',
     llm_configuration: '模型服务暂不可用，请联系管理员检查配置',
     service_unavailable: '编译服务暂不可用，请稍后重试',
     timeout: '编译服务响应超时，请稍后重试',

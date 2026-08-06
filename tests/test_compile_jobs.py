@@ -74,6 +74,27 @@ def test_sanitize_compile_error_bearer_token_still_fully_redacted():
     assert "<redacted>" in safe
 
 
+@pytest.mark.parametrize(
+    ("raw", "secret"),
+    [
+        ('{"api_key": "plainsecret-a"}', "plainsecret-a"),
+        ("{'x-api-key': 'plainsecret-b'}", "plainsecret-b"),
+        ('{"access_token":"plainsecret-c"}', "plainsecret-c"),
+        ('{"client_secret": "plainsecret-d"}', "plainsecret-d"),
+        ('{"Authorization": "Bearer plainsecret-e"}', "plainsecret-e"),
+        ("{'authorization': 'Basic plainsecret-f'}", "plainsecret-f"),
+        ('api_key="plainsecret-g"', "plainsecret-g"),
+        ("x-api-key='plainsecret-h'", "plainsecret-h"),
+    ],
+)
+def test_sanitize_compile_error_redacts_quoted_credentials(raw, secret):
+    """E004-FIX-02:JSON/Python 字典、header 与环境变量形式中带引号的
+    凭据键值必须整体脱敏,不能只覆盖无引号键的特例。"""
+    safe = sanitize_compile_error(raw)
+    assert secret not in safe
+    assert "<redacted>" in safe
+
+
 def test_restore_artifact_snapshot_restores_existing_and_deletes_new(tmp_path):
     base = tmp_path / "repo"
     snapshot_dir = tmp_path / "snapshot"
@@ -376,3 +397,26 @@ def test_spawn_oserror_restores_old_artifacts_and_records_error(tmp_path):
     assert meta["error_code"] == "service_unavailable"
     assert "secret-value" not in meta["error_message"]
     assert index.read_bytes() == b"old-index"
+
+
+def test_run_compile_task_never_persists_quoted_provider_credentials(tmp_path):
+    """E004-FIX-02:真实落盘路径守卫——子进程 stderr 中带引号的凭据字段
+    在写入 raw meta 前必须脱敏,不得只测试辅助函数。"""
+    base = tmp_path / "repo"
+    doc_id = "doc_20260806_040"
+    _write_meta(base, doc_id)
+    _write_compile_script(base)
+
+    result = subprocess.CompletedProcess(
+        [], 1, stdout="", stderr='ProviderError: {"x-api-key": "plainsecret"}',
+    )
+    with patch("api.compile_jobs.subprocess.run", return_value=result):
+        run_compile_task(doc_id, base)
+
+    meta = read_doc_meta(doc_id, base)
+    assert meta["status"] == "error"
+    assert meta.get("error_message")
+    assert "plainsecret" not in meta["error_message"]
+    assert "<redacted>" in meta["error_message"]
+    assert len(meta["error_message"]) <= 500
+    assert "\n" not in meta["error_message"]

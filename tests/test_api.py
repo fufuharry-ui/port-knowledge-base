@@ -325,6 +325,141 @@ def test_delete_nonexistent_doc_returns_404(mock_remove):
     assert response.status_code == 404
 
 
+# ─── E004-FIX-02:删除与编译事务互斥 ─────────────────────────────────────────
+
+def test_delete_returns_busy_while_compile_transaction_is_active(tmp_path, monkeypatch):
+    """E004-FIX-02:编译事务(快照/回滚)持有执行锁时,删除必须立即 409,
+    不得阻塞等待,也不得让回滚覆盖删除造成的共享文件清理。"""
+    import api.main as api_mod
+    from api.compile_jobs import COMPILE_EXECUTION_LOCK
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    doc_id = "doc_20260806_050"
+    meta_path = raw / f"{doc_id}.meta.yaml"
+    meta_path.write_text(
+        yaml.safe_dump({"id": doc_id, "status": "compiled"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(api_mod, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(api_mod, "RAW_DIR", raw)
+
+    COMPILE_EXECUTION_LOCK.acquire()
+    try:
+        with patch("scripts.doc_admin.remove_doc") as mock_remove:
+            response = client.delete(f"/api/v1/docs/{doc_id}")
+    finally:
+        COMPILE_EXECUTION_LOCK.release()
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": {"code": "knowledge_base_busy"}}
+    mock_remove.assert_not_called()
+    assert meta_path.exists()
+    assert not COMPILE_EXECUTION_LOCK.locked()
+
+
+def test_delete_rejects_document_with_queued_compilation(tmp_path, monkeypatch):
+    """E004-FIX-02:文档已调度(status=compiling)但后台任务尚未取得执行锁时,
+    删除必须 409 compile_in_progress,封住排队窗口。"""
+    import api.main as api_mod
+    from api.compile_jobs import COMPILE_EXECUTION_LOCK
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    doc_id = "doc_20260806_051"
+    meta_path = raw / f"{doc_id}.meta.yaml"
+    meta_path.write_text(
+        yaml.safe_dump({"id": doc_id, "status": "compiling"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(api_mod, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(api_mod, "RAW_DIR", raw)
+
+    with patch("scripts.doc_admin.remove_doc") as mock_remove:
+        response = client.delete(f"/api/v1/docs/{doc_id}")
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": {"code": "compile_in_progress"}}
+    mock_remove.assert_not_called()
+    assert meta_path.exists()
+    assert not COMPILE_EXECUTION_LOCK.locked()
+
+
+def test_delete_holds_both_locks_while_removing(tmp_path, monkeypatch):
+    """E004-FIX-02:空闲删除时,remove_doc 调用瞬间调度锁与执行锁均被持有,
+    响应结束后执行锁已释放。"""
+    import api.main as api_mod
+    from api.compile_jobs import COMPILE_EXECUTION_LOCK
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    doc_id = "doc_20260806_052"
+    (raw / f"{doc_id}.meta.yaml").write_text(
+        yaml.safe_dump({"id": doc_id, "status": "compiled"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(api_mod, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(api_mod, "RAW_DIR", raw)
+
+    observed = {}
+
+    def fake_remove(doc_id_arg, base_dir=None):
+        observed["schedule_locked"] = api_mod.COMPILE_SCHEDULE_LOCK.locked()
+        observed["execution_locked"] = COMPILE_EXECUTION_LOCK.locked()
+        return {"doc_id": doc_id_arg, "removed": True, "cleaned_refs": {"index_removed": 1}}
+
+    with patch("scripts.doc_admin.remove_doc", side_effect=fake_remove):
+        response = client.delete(f"/api/v1/docs/{doc_id}")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "deleted"
+    assert observed == {"schedule_locked": True, "execution_locked": True}
+    assert not COMPILE_EXECUTION_LOCK.locked()
+
+
+def test_document_catalog_never_exposes_backend_error_message(tmp_path, monkeypatch):
+    """E004-FIX-02:公共 catalog 只投影 error_code,绝不返回 error_message;
+    raw 元数据中的脱敏诊断信息必须保留供后端排查。"""
+    import api.main as api_mod
+    from scripts.doc_admin import read_doc_meta
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    doc_id = "doc_20260806_053"
+    (raw / f"{doc_id}.meta.yaml").write_text(
+        yaml.safe_dump({
+            "id": doc_id,
+            "status": "error",
+            "error_code": "llm_configuration",
+            "error_message": "api_key=<redacted>",
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(api_mod, "RAW_DIR", raw)
+    monkeypatch.setattr(api_mod, "INDEX_FILE", tmp_path / "missing-index.yaml")
+
+    wiki = client.get("/api/v1/wiki/index")
+    assert wiki.status_code == 200
+    wiki_doc = wiki.json()["documents"][0]
+    assert wiki_doc["error_code"] == "llm_configuration"
+    assert "error_message" not in wiki_doc
+
+    listing = client.get("/api/v1/docs")
+    assert listing.status_code == 200
+    list_doc = listing.json()["documents"][0]
+    assert list_doc["error_code"] == "llm_configuration"
+    assert "error_message" not in list_doc
+
+    detail = client.get(f"/api/v1/docs/{doc_id}")
+    assert detail.status_code == 200
+    detail_doc = detail.json()
+    assert detail_doc["error_code"] == "llm_configuration"
+    assert "error_message" not in detail_doc
+
+    meta = read_doc_meta(doc_id, base_dir=tmp_path)
+    assert meta["error_message"] == "api_key=<redacted>"
+
+
 @patch("api.main.get_llm_client")
 @patch("api.main.run_consistency_check")
 def test_consistency_post_triggers_check(mock_run, mock_get_client, monkeypatch):

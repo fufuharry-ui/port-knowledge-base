@@ -5,6 +5,7 @@
  */
 
 import {
+    deleteDoc,
     getCompileErrorMessage,
     getUserFacingErrorMessage,
     recompileDoc,
@@ -59,8 +60,27 @@ describe('structured API errors', () => {
         ['document_processing', '文档编译未完成，请检查文件内容后重试'],
         ['compile_failed', '编译失败，请稍后重试或联系管理员'],
         ['rollback_failed', '编译失败，旧版本恢复异常，请联系管理员'],
+        ['knowledge_base_busy', '知识库正在执行编译任务，请稍后再删除'],
     ])('maps %s to fixed user copy', (code, expected) => {
         expect(getCompileErrorMessage(code)).toBe(expected);
+    });
+
+    test('parses knowledge_base_busy on delete without exposing 409 or Conflict', async () => {
+        mockFetch.mockResolvedValue({
+            ok: false,
+            status: 409,
+            statusText: 'Conflict',
+            text: async () => JSON.stringify({
+                detail: { code: 'knowledge_base_busy' },
+            }),
+        } as unknown as Response);
+
+        await expect(deleteDoc('doc_1')).rejects.toMatchObject({
+            name: 'ApiError',
+            status: 409,
+            code: 'knowledge_base_busy',
+            message: '知识库正在执行编译任务，请稍后再删除',
+        });
     });
 
     test('does not expose an arbitrary Error.message', () => {

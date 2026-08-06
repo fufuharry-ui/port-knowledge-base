@@ -30,19 +30,33 @@ CompileErrorCode = Literal[
 MAX_ERROR_MESSAGE = 500
 MAX_CAPTURE_CHARS = 8192
 
+# E004-FIX-02:带引号键值(JSON/Python dict/header/env)统一由 callable 脱敏,
+# 覆盖单/双引号键、单/双/无引号值、:与=、键值间任意空格;
+# authorization 整行模式必须先于通用凭据模式,处理无引号且含空格的值
+# (如 "Authorization: Bearer xxx"/"Authorization: Basic xxx")。
+_CREDENTIAL_KEY_PATTERN = re.compile(
+    r"(?P<key>[\"']?(?:x[_-]api[_-]key|api[_-]?key|access[_-]token"
+    r"|client[_-]secret|token|secret|password|authorization)[\"']?)"
+    r"(?P<sep>\s*[:=]\s*)"
+    r"(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;\}\)&]+)",
+    re.IGNORECASE,
+)
+
+
+def _redact_credential(match: re.Match) -> str:
+    return f"{match.group('key')}{match.group('sep')}<redacted>"
+
+
 _SECRET_PATTERNS = (
     (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer <redacted>"),
-    (re.compile(r"\bsk-[A-Za-z0-9_-]{6,}\b"), "sk-<redacted>"),
-    (
-        re.compile(r"(?i)(?<![A-Za-z0-9])(api[_-]?key|token|secret|password)\s*[:=]\s*([^\s,;]+)"),
-        r"\1=<redacted>",
-    ),
-    (
-        re.compile(r"(?i)([?&](?:api[_-]?key|apikey|access_token|token|key)=)[^&\s]+"),
-        r"\1<redacted>",
-    ),
     (
         re.compile(r"(?i)(authorization\s*[:=]\s*)([^\r\n]+)"),
+        r"\1<redacted>",
+    ),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{6,}\b"), "sk-<redacted>"),
+    (_CREDENTIAL_KEY_PATTERN, _redact_credential),
+    (
+        re.compile(r"(?i)([?&](?:api[_-]?key|apikey|access_token|token|key)=)[^&\s]+"),
         r"\1<redacted>",
     ),
 )

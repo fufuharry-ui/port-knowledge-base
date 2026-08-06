@@ -12,8 +12,8 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 import yaml
 
-from api.compile_jobs import run_compile_task
-from scripts.doc_admin import prepare_doc_compile
+from api.compile_jobs import COMPILE_EXECUTION_LOCK, run_compile_task
+from scripts.doc_admin import prepare_doc_compile, read_doc_meta
 from scripts.ingest import PARSERS, get_file_hash, ingest_file
 from scripts.search import (
     search, get_llm_client, layer1_filter, layer2_score, layer3_answer,
@@ -119,6 +119,10 @@ def _load_document_catalog() -> list[dict]:
     """
     compiled = _load_index().get("documents", [])
     by_id = {doc["id"]: dict(doc) for doc in compiled if doc.get("id")}
+    # E004-FIX-02:error_message 是后端诊断字段,公共 catalog 一律不投影;
+    # 旧 index 中可能残留的该字段同样剥除,只保留稳定 error_code。
+    for doc in by_id.values():
+        doc.pop("error_message", None)
 
     for meta_path in sorted(RAW_DIR.glob("*.meta.yaml")):
         try:
@@ -130,7 +134,7 @@ def _load_document_catalog() -> list[dict]:
             continue
         doc = by_id.setdefault(doc_id, {"id": doc_id, "abstract_short": "", "ontology_terms": []})
         for key in ("title", "status", "source_type", "file_hash", "char_count",
-                    "language", "ingested_at", "error_code", "error_message"):
+                    "language", "ingested_at", "error_code"):
             if key in meta:
                 doc[key] = meta[key]
 
@@ -412,14 +416,43 @@ async def get_doc(doc_id: str):
 
 # ─── 文档管理:删除 + 重编译(Loop #10)─────────────────────────────────────────
 
+def _remove_doc_exclusively(doc_id: str) -> dict:
+    """删除与完整编译事务互斥(E004-FIX-02)。
+
+    锁顺序恒为 COMPILE_SCHEDULE_LOCK → COMPILE_EXECUTION_LOCK,与
+    _schedule_compile(仅调度锁)、run_compile_task(仅执行锁)不构成循环等待。
+    执行锁被占用说明有编译事务(快照/编译/回滚)在进行:删除必须立即 409,
+    不得阻塞等待数分钟,否则失败回滚或成功发布都可能复活已删除的共享引用。
+    目标文档已排队 compiling(尚未取得执行锁)同样拒绝,封住调度窗口。
+    """
+    with COMPILE_SCHEDULE_LOCK:
+        if not COMPILE_EXECUTION_LOCK.acquire(blocking=False):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "knowledge_base_busy"},
+            )
+        try:
+            meta = read_doc_meta(doc_id, base_dir=BASE_DIR)
+            if meta and meta.get("status") == "compiling":
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "compile_in_progress"},
+                )
+            from scripts.doc_admin import remove_doc
+            return remove_doc(doc_id, base_dir=BASE_DIR)
+        finally:
+            COMPILE_EXECUTION_LOCK.release()
+
+
 @app.delete("/api/v1/docs/{doc_id}")
 async def delete_doc(doc_id: str):
     """删除文档 + 全部产物 + 清理 index/KG/entity_relations 引用。
 
     此前知识库只能追加无法维护——上传错文档/编译失败时无法清理。
+    E004-FIX-02:经 _remove_doc_exclusively 与编译事务互斥;编译进行中
+    返回 409(knowledge_base_busy / compile_in_progress),不阻塞等待。
     """
-    from scripts.doc_admin import remove_doc
-    summary = remove_doc(doc_id)
+    summary = _remove_doc_exclusively(doc_id)
     if not summary.get("removed"):
         raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found")
     return {"status": "deleted", **summary}

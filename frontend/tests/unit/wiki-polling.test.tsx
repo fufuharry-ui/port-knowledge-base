@@ -11,7 +11,7 @@ import '@testing-library/jest-dom';
 import React from 'react';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import WikiPage from '@/app/wiki/page';
-import { fetchWikiIndex, recompileDoc, type WikiIndexData } from '@/lib/api';
+import { deleteDoc, fetchWikiIndex, recompileDoc, type WikiIndexData } from '@/lib/api';
 
 const mockToastPush = jest.fn();
 
@@ -31,6 +31,7 @@ jest.mock('@/lib/api', () => {
 
 const mockedFetch = fetchWikiIndex as jest.MockedFunction<typeof fetchWikiIndex>;
 const mockedRecompile = recompileDoc as jest.MockedFunction<typeof recompileDoc>;
+const mockedDelete = deleteDoc as jest.MockedFunction<typeof deleteDoc>;
 
 /** 可控 Promise:精确决定每个 fetch 响应何时落地(无真实等待) */
 function createDeferred<T>() {
@@ -53,6 +54,7 @@ describe('Wiki 仪表盘编译轮询与失败 Toast (E004 Task 8)', () => {
     beforeEach(() => {
         mockedFetch.mockReset();
         mockedRecompile.mockReset();
+        mockedDelete.mockReset();
         mockToastPush.mockReset();
     });
 
@@ -219,6 +221,36 @@ describe('Wiki 仪表盘编译轮询与失败 Toast (E004 Task 8)', () => {
             /409|Conflict|RuntimeError|OPENAI_API_KEY/,
         );
     });
+
+    test('delete during an active compile shows fixed friendly copy only', async () => {
+        // E004-FIX-02:删除与编译事务互斥——后端 409 knowledge_base_busy 只显示固定文案
+        const { ApiError, getCompileErrorMessage } = jest.requireActual('@/lib/api');
+        mockedFetch.mockResolvedValue({
+            total_docs: 1,
+            documents: [{ id: 'doc_1', title: 'T', status: 'compiled' }],
+        });
+        mockedDelete.mockRejectedValue(
+            new ApiError(
+                getCompileErrorMessage('knowledge_base_busy'),
+                409,
+                'knowledge_base_busy',
+            ),
+        );
+
+        render(<WikiPage />);
+        fireEvent.click(await screen.findByTestId('delete-btn'));
+        fireEvent.click(await screen.findByTestId('confirm-accept'));
+
+        await waitFor(() => {
+            expect(mockToastPush).toHaveBeenCalledWith(
+                '知识库正在执行编译任务，请稍后再删除',
+                'error',
+            );
+        });
+        expect(mockToastPush.mock.calls.flat().join(' ')).not.toMatch(
+            /409|Conflict|Lock|threading|COMPILE_EXECUTION_LOCK/,
+        );
+    });
 });
 
 /**
@@ -239,6 +271,7 @@ describe('Wiki 仪表盘过期快照防护 (E004-FIX-01)', () => {
     beforeEach(() => {
         mockedFetch.mockReset();
         mockedRecompile.mockReset();
+        mockedDelete.mockReset();
         mockToastPush.mockReset();
     });
 

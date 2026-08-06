@@ -84,7 +84,7 @@ def classify_compile_error(text: str) -> CompileErrorCode:
     if any(token in value for token in (
         "connection refused", "connection error", "service unavailable",
         "bad gateway", "name resolution", "network is unreachable", "服务不可用",
-    )) or re.search(r"\b50[23]\b", value):
+    )) or re.search(r"\b5[0-9]{2}\b", value):
         return "service_unavailable"
     if any(token in value for token in (
         "找不到原始文本", "document content", "decode", "parse", "内容为空",

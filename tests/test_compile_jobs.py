@@ -24,6 +24,12 @@ from scripts.doc_admin import read_doc_meta, write_doc_compile_result
         ("401 Unauthorized invalid api key", "llm_configuration"),
         ("Connection refused by provider", "service_unavailable"),
         ("503 Service Unavailable", "service_unavailable"),
+        ("500 Internal Server Error", "service_unavailable"),
+        ("HTTP status 501", "service_unavailable"),
+        ("HTTP status 504", "service_unavailable"),
+        ("provider returned 599", "service_unavailable"),
+        ("504 Gateway Timeout", "timeout"),
+        ("HTTP 400 Bad Request", "compile_failed"),
         ("ReadTimeout request timed out", "timeout"),
         ("找不到原始文本", "document_processing"),
         ("unexpected compiler failure", "compile_failed"),
@@ -375,6 +381,43 @@ def test_recompile_failure_restores_all_artifacts_byte_for_byte(tmp_path):
     meta = read_doc_meta(doc_id, base)
     assert meta["status"] == "error"
     assert meta["error_code"] == "service_unavailable"
+
+
+def test_run_compile_task_classifies_upstream_500_as_service_unavailable(tmp_path):
+    """E004-FIX-03:真实运行器路径——上游 HTTP 5xx 全范围必须归类为
+    service_unavailable,且七类产物回滚行为不变。"""
+    base = tmp_path / "repo"
+    doc_id = "doc_20260806_050"
+    _write_meta(base, doc_id)
+    _write_compile_script(base)
+    targets = artifact_paths(base, doc_id)
+    original = {}
+    for index, target in enumerate(targets):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = f"old-{index}\r\n".encode("utf-8")
+        target.write_bytes(payload)
+        original[target] = payload
+
+    def fake_run(*_args, **_kwargs):
+        for target in targets:
+            target.write_bytes(b"partial\n")
+        return subprocess.CompletedProcess(
+            [],
+            1,
+            stdout="",
+            stderr="ProviderError: HTTP status 500 Internal Server Error",
+        )
+
+    with patch("api.compile_jobs.subprocess.run", side_effect=fake_run):
+        run_compile_task(doc_id, base)
+
+    for target, payload in original.items():
+        assert target.read_bytes() == payload
+    meta = read_doc_meta(doc_id, base)
+    assert meta["status"] == "error"
+    assert meta["error_code"] == "service_unavailable"
+    assert "500 Internal Server Error" in meta["error_message"]
+    assert len(meta["error_message"]) <= 500
 
 
 def test_spawn_oserror_restores_old_artifacts_and_records_error(tmp_path):

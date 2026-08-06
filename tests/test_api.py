@@ -5,9 +5,13 @@ from fastapi.testclient import TestClient
 from unittest.mock import patch, MagicMock
 
 # Will fail here on first run
-from api.main import app
+from api.main import app, create_app  # noqa: F401  (app: uvicorn/startup-smoke 引用保持)
 
-client = TestClient(app)
+# E005 Task 8:既有测试使用显式 allow_unmanaged=True 的测试实例。
+# 纯 TestClient(非上下文管理器)不触发 lifespan,app.state.runtime 不存在;
+# 生产 module-level app 不设置该旗标,同一情形 fail-closed(503)。
+unmanaged_app = create_app(allow_unmanaged=True)
+client = TestClient(unmanaged_app)
 
 # 真实数据目录(与 api/main.py 的 BASE_DIR 一致)
 _DATA_DIR = Path(__file__).resolve().parent.parent
@@ -528,6 +532,9 @@ def test_health_endpoint():
     assert "jieba_loaded" in data     # 分词引擎是否就绪
     assert "ontology_loaded" in data  # 本体是否加载
     assert "version" in data          # 版本可追溯
+    # E005 Task 8:liveness 始终 200,并附 ready 布尔与粗粒度 service_mode
+    assert data["ready"] is True
+    assert data["service_mode"] == "ready"
 
 
 # ─── 落地增强: /search/stream 进度反馈 ───────────────────────────────────────
@@ -814,3 +821,187 @@ def test_schedule_compile_allows_only_one_concurrent_request(tmp_path, monkeypat
         (raw / f"{doc_id}.meta.yaml").read_text(encoding="utf-8")
     )
     assert meta["status"] == "compiling"
+
+
+# ─── E005 Task 8:lifespan、readiness 与全局业务门禁 ──────────────────────────
+
+@pytest.fixture()
+def readiness(tmp_path):
+    """为共享测试 app 显式挂接一个带全新 ServiceReadiness 的 AppRuntime。
+
+    生产路径 runtime 由 lifespan 设置;纯 TestClient 不触发 lifespan,
+    这里显式挂接以驱动门禁分支。所有对象指向 tmp_path,绝不触碰真实仓库。
+    """
+    import api.main as api_mod
+    from api.runtime_guard import (
+        ApiInstanceLock,
+        ServiceReadiness,
+        load_compile_runtime_config,
+    )
+
+    service_readiness = ServiceReadiness()
+    runtime = api_mod.AppRuntime(
+        config=load_compile_runtime_config(tmp_path),
+        readiness=service_readiness,
+        instance_lock=ApiInstanceLock(tmp_path / ".runtime" / "api-instance.lock"),
+    )
+    had_runtime = hasattr(unmanaged_app.state, "runtime")
+    previous = getattr(unmanaged_app.state, "runtime", None)
+    unmanaged_app.state.runtime = runtime
+    try:
+        yield service_readiness
+    finally:
+        if had_runtime:
+            unmanaged_app.state.runtime = previous
+        else:
+            del unmanaged_app.state.runtime
+
+
+def test_ready_endpoint_reports_ready():
+    """E005 Task 8:GET /api/v1/ready 在 ready 时返回 200 {"status": "ready"}。"""
+    response = client.get("/api/v1/ready")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready"}
+
+
+def test_recovery_required_blocks_business_routes_but_not_health(readiness):
+    """E005 Task 8(brief 示例):门禁阻断业务路由,health 豁免,ready 变 503。"""
+    readiness.mark_recovery_required("rollback_failed")
+    gated = client.get("/api/v1/wiki/index")
+    assert gated.status_code == 503
+    assert gated.json() == {"detail": {"code": "recovery_required"}}
+    assert client.get("/api/v1/health").status_code == 200
+    assert client.get("/api/v1/ready").status_code == 503
+
+
+def test_gate_blocks_representative_business_routes(readiness):
+    """E005 Task 8:门禁覆盖代表性业务路由(上传/删除/检索/问答/图谱等),
+    响应体精确为 {"detail": {"code": "recovery_required"}},不泄露 reason。"""
+    readiness.mark_recovery_required("process_tree_survivors")
+    responses = [
+        client.get("/api/v1/wiki/index"),
+        client.get("/api/v1/docs"),
+        client.get("/api/v1/docs/doc_X"),
+        client.delete("/api/v1/docs/doc_X"),
+        client.post("/api/v1/docs/doc_X/recompile"),
+        client.post(
+            "/api/v1/upload",
+            files={"file": ("a.md", b"# a", "text/markdown")},
+        ),
+        client.post(
+            "/api/v1/ingest",
+            files={"file": ("a.md", b"# a", "text/markdown")},
+        ),
+        client.post("/api/v1/search", json={"query": "x"}),
+        client.get("/api/v1/search/stream?q=x"),
+        client.post("/api/v1/qa", json={"query": "x"}),
+        client.get("/api/v1/graph"),
+        client.get("/api/v1/ontology"),
+        client.get("/api/v1/entity-graph"),
+        client.post("/api/v1/lint"),
+        client.get("/api/v1/consistency"),
+        client.post("/api/v1/consistency"),
+    ]
+    for response in responses:
+        assert response.status_code == 503, response
+        assert response.json() == {"detail": {"code": "recovery_required"}}
+        assert "process_tree_survivors" not in response.text
+
+
+def test_health_always_200_under_gate_with_safe_body(readiness):
+    """E005 Task 8:liveness 在门禁下仍 200,保留既有字段,
+    ready=False 且 service_mode 为粗粒度字符串,不暴露内部原因码。"""
+    readiness.mark_recovery_required("rollback_failed")
+    response = client.get("/api/v1/health")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert "doc_count" in data and isinstance(data["doc_count"], int)
+    assert "llm_configured" in data
+    assert "jieba_loaded" in data
+    assert "ontology_loaded" in data
+    assert "version" in data
+    assert data["ready"] is False
+    assert data["service_mode"] == "recovery_required"
+    # 安全合同(设计 §19):不暴露 reason code、job、路径、PID 等内部信息
+    assert "rollback_failed" not in response.text
+
+
+def test_unmanaged_strict_app_fails_closed(tmp_path):
+    """E005 Task 8 fail-closed 合同:未经 lifespan(无 runtime)且未显式
+    opt-in 的 app,业务路由一律 503;health/ready 仍可用。
+
+    生产 uvicorn 必经 lifespan,该分支仅防御 --lifespan off 类误用;
+    测试实例必须显式 allow_unmanaged=True 才能绕过。
+    """
+    strict_app = create_app(base_dir=tmp_path)
+    strict_client = TestClient(strict_app)
+    assert strict_client.get("/api/v1/health").status_code == 200
+    assert strict_client.get("/api/v1/ready").status_code == 503
+    gated = strict_client.get("/api/v1/wiki/index")
+    assert gated.status_code == 503
+    assert gated.json() == {"detail": {"code": "recovery_required"}}
+
+
+async def _enter_lifespan(application):
+    """直接进入 app 的 lifespan 上下文(确定性,不经 TestClient 的 anyio 包装)。"""
+    async with application.router.lifespan_context(application):
+        pass
+
+
+def _run_lifespan(application):
+    import asyncio
+
+    asyncio.run(_enter_lifespan(application))
+
+
+def test_lifespan_starts_ready_on_clean_tmp_repo(tmp_path):
+    """E005 Task 8:干净 tmp 仓库 lifespan 启动成功,runtime 挂接,锁随 shutdown 释放。"""
+    import api.main as api_mod
+    from api.runtime_guard import ApiInstanceLock, ServiceReadiness
+
+    app = create_app(base_dir=tmp_path)
+    with TestClient(app) as test_client:
+        response = test_client.get("/api/v1/ready")
+        assert response.status_code == 200
+        assert response.json() == {"status": "ready"}
+        runtime = app.state.runtime
+        assert isinstance(runtime, api_mod.AppRuntime)
+        assert isinstance(runtime.readiness, ServiceReadiness)
+        assert isinstance(runtime.instance_lock, ApiInstanceLock)
+        assert runtime.config.transaction_dir.is_dir()
+        business = test_client.get("/api/v1/wiki/index")
+        assert business.status_code == 200
+    # lifespan 结束后实例锁已释放:第二个实例可在同目录正常启动
+    with TestClient(create_app(base_dir=tmp_path)):
+        pass
+
+
+def test_startup_refused_when_instance_lock_held(tmp_path):
+    """E005 Task 8(设计 §6.1):实例锁被持有时,第二个实例启动必须失败,不得服务。"""
+    import portalocker
+
+    first = create_app(base_dir=tmp_path)
+    with TestClient(first):
+        second = create_app(base_dir=tmp_path)
+        with pytest.raises(portalocker.AlreadyLocked):
+            _run_lifespan(second)
+
+
+def test_startup_refused_on_orphan_compiling(tmp_path):
+    """E005 Task 8(设计 §17):存在孤立 compiling 文档时启动必须被拒绝(fail closed)。"""
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    meta_path = raw / "doc_20260806_900.meta.yaml"
+    meta_path.write_text(
+        yaml.safe_dump({"id": "doc_20260806_900", "status": "compiling"}),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="startup recovery"):
+        _run_lifespan(create_app(base_dir=tmp_path))
+    # 拒绝启动后实例锁已释放;修复孤儿后同目录可重新启动
+    meta_path.write_text(
+        yaml.safe_dump({"id": "doc_20260806_900", "status": "compiled"}),
+        encoding="utf-8",
+    )
+    _run_lifespan(create_app(base_dir=tmp_path))

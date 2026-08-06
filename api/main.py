@@ -1,18 +1,29 @@
 import json
+import logging
 import os
 import shutil
 import tempfile
 import threading
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterable
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
+from fastapi import FastAPI, Request, UploadFile, File, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 import yaml
 
 from api.compile_jobs import COMPILE_EXECUTION_LOCK, run_compile_task
+from api.compile_transactions import recover_startup
+from api.durable_fs import probe_durable_directory
+from api.runtime_guard import (
+    ApiInstanceLock,
+    CompileRuntimeConfig,
+    ServiceReadiness,
+    load_compile_runtime_config,
+)
 from scripts.doc_admin import prepare_doc_compile, read_doc_meta
 from scripts.ingest import PARSERS, get_file_hash, ingest_file
 from scripts.search import (
@@ -25,7 +36,40 @@ from scripts.consistency import (
     run_consistency_check, load_contradictions, find_contradiction_candidates,
 )
 
-app = FastAPI(title="Karpathy-Style LLM Wiki API", version="2.0.0")
+logger = logging.getLogger(__name__)
+
+# ─── E005 Task 8:应用运行时与业务门禁原语 ────────────────────────────────────
+
+
+@dataclass
+class AppRuntime:
+    """lifespan 启动成功后挂接到 app.state.runtime 的运行时容器。"""
+
+    config: CompileRuntimeConfig
+    readiness: ServiceReadiness
+    instance_lock: ApiInstanceLock
+
+
+#: 门禁豁免路径(设计 §19):仅 liveness 与 readiness 探针。
+GATE_EXEMPT_PATHS = frozenset({"/api/v1/health", "/api/v1/ready"})
+
+#: 门禁响应体:只含稳定错误码,绝不泄露 reason、job、路径或 PID。
+RECOVERY_REQUIRED_BODY = {"detail": {"code": "recovery_required"}}
+
+
+def _current_service_mode(app: FastAPI) -> str:
+    """返回粗粒度 service_mode("ready" | "recovery_required")。
+
+    runtime 缺失(lifespan 未运行)时:显式 allow_unmanaged 的测试实例按
+    "ready" 处理,其余一律 fail-closed 视为 "recovery_required"。
+    """
+    runtime = getattr(app.state, "runtime", None)
+    if runtime is None:
+        if getattr(app.state, "allow_unmanaged", False):
+            return "ready"
+        return "recovery_required"
+    mode, _reason = runtime.readiness.snapshot()
+    return mode
 
 
 # ─── .env 加载(启动即读,避免 /health 在首次检索前读到空 env) ────────────────
@@ -51,19 +95,6 @@ try:
     _JIEBA_READY = True
 except Exception:
     pass  # jieba 不可用时 BM25 回退到空白分词,不影响启动
-
-# ─── CORS ─────────────────────────────────────────────────────────────────────
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        # 常规本地 dev(3000)+ UAT 隔离 live 套件(3001);均为本地回环,非生产策略。
-        "http://localhost:3000", "http://127.0.0.1:3000",
-        "http://localhost:3001", "http://127.0.0.1:3001",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent.parent
@@ -261,11 +292,12 @@ class QAQuery(BaseModel):
 
 # ─── GET /api/v1/health (落地增强:部署健康检查) ─────────────────────────────
 
-@app.get("/api/v1/health")
-async def health():
-    """运维健康检查。返回服务状态 + 关键依赖可用性(部署监控用)。
+async def health(request: Request):
+    """运维健康检查(liveness)。返回服务状态 + 关键依赖可用性(部署监控用)。
 
     设计:只读、快速、不调 LLM、不抛异常(即使部分依赖缺失也返回 200 + 如实字段)。
+    E005 Task 8:追加 ready 布尔与粗粒度 service_mode;不暴露 reason、job、
+    路径或 PID(设计 §19)。liveness 永远 200,不受业务门禁影响。
     """
     # 文档数
     try:
@@ -288,19 +320,31 @@ async def health():
     except Exception:
         ontology_loaded = False
 
+    service_mode = _current_service_mode(request.app)
+
     return {
         "status": "ok",
         "doc_count": doc_count,
         "llm_configured": llm_configured,
         "jieba_loaded": jieba_loaded,
         "ontology_loaded": ontology_loaded,
-        "version": app.version,
+        "ready": service_mode == "ready",
+        "service_mode": service_mode,
+        "version": request.app.version,
     }
+
+
+# ─── GET /api/v1/ready (E005 Task 8:readiness 探针) ─────────────────────────
+
+async def ready(request: Request):
+    """readiness 探针:ready 时 200 {"status": "ready"};门禁时 503(安全响应体)。"""
+    if _current_service_mode(request.app) == "ready":
+        return {"status": "ready"}
+    return JSONResponse(status_code=503, content={"status": "not_ready"})
 
 
 # ─── GET /api/v1/wiki/index ───────────────────────────────────────────────────
 
-@app.get("/api/v1/wiki/index")
 async def wiki_index():
     """Return the full wiki document catalog (compiled + raw) as JSON.
 
@@ -312,7 +356,6 @@ async def wiki_index():
 
 # ─── GET /api/v1/graph ───────────────────────────────────────────────────────
 
-@app.get("/api/v1/graph")
 async def graph_data():
     """Build nodes and edges from index and the knowledge graph.
 
@@ -357,7 +400,6 @@ async def graph_data():
     return {"nodes": nodes, "edges": unique_edges}
 
 
-@app.get("/api/v1/ontology")
 async def ontology_data():
     """Return the global ontology tree (供前端本体视图;Big-Loop #1 新增)。"""
     ont_file = META_DIR / "ontology" / "global_ontology.yaml"
@@ -372,7 +414,6 @@ async def ontology_data():
     }
 
 
-@app.get("/api/v1/entity-graph")
 async def entity_graph(term: str = "", depth: int = 1):
     """返回某术语的实体级邻居(Big-Loop #2 新增,供前端实体图谱查询)。
 
@@ -399,14 +440,12 @@ async def entity_graph(term: str = "", depth: int = 1):
 
 # ─── GET /api/v1/docs ────────────────────────────────────────────────────────
 
-@app.get("/api/v1/docs")
 async def list_docs():
     docs = _load_document_catalog()
     return {"documents": docs, "total": len(docs)}
 
 # ─── GET /api/v1/docs/{doc_id} ───────────────────────────────────────────────
 
-@app.get("/api/v1/docs/{doc_id}")
 async def get_doc(doc_id: str):
     for doc in _load_document_catalog():
         if doc["id"] == doc_id:
@@ -444,7 +483,6 @@ def _remove_doc_exclusively(doc_id: str) -> dict:
             COMPILE_EXECUTION_LOCK.release()
 
 
-@app.delete("/api/v1/docs/{doc_id}")
 async def delete_doc(doc_id: str):
     """删除文档 + 全部产物 + 清理 index/KG/entity_relations 引用。
 
@@ -458,7 +496,6 @@ async def delete_doc(doc_id: str):
     return {"status": "deleted", **summary}
 
 
-@app.post("/api/v1/docs/{doc_id}/recompile")
 async def recompile_doc_endpoint(doc_id: str, background_tasks: BackgroundTasks):
     """重编译既有文档(error 文档重试用)。
 
@@ -470,21 +507,18 @@ async def recompile_doc_endpoint(doc_id: str, background_tasks: BackgroundTasks)
 
 # ─── POST /api/v1/upload (alias for ingest) ──────────────────────────────────
 
-@app.post("/api/v1/upload")
 async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     """Frontend-compatible upload endpoint. 返回权威 doc_id + skipped 字段。"""
     return _accept_upload(background_tasks, file)
 
 # ─── POST /api/v1/ingest ─────────────────────────────────────────────────────
 
-@app.post("/api/v1/ingest")
 async def ingest_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     """Alias of /upload — 同一权威契约(权威 doc_id + skipped + 按 doc_id 编译)。"""
     return _accept_upload(background_tasks, file)
 
 # ─── POST /api/v1/search (sync JSON) ─────────────────────────────────────────
 
-@app.post("/api/v1/search")
 async def search_endpoint(request: SearchQuery):
     try:
         client = get_llm_client()
@@ -501,7 +535,6 @@ async def search_endpoint(request: SearchQuery):
 
 # ─── GET /api/v1/search/stream (SSE) ─────────────────────────────────────────
 
-@app.get("/api/v1/search/stream")
 async def search_stream(q: str):
     """SSE streaming search endpoint used by the Search page."""
     async def generate():
@@ -557,7 +590,6 @@ async def search_stream(q: str):
 
 # ─── POST /api/v1/qa (SSE Q&A with thought trace) ────────────────────────────
 
-@app.post("/api/v1/qa")
 async def qa_stream(request: QAQuery):
     """SSE streaming Q&A used by the ChatPanel on /qa page.
     Emits: thought, source, entity, delta, done events.
@@ -638,7 +670,6 @@ async def qa_stream(request: QAQuery):
 
 # ─── POST /api/v1/lint ────────────────────────────────────────────────────────
 
-@app.post("/api/v1/lint")
 async def lint_endpoint():
     linter = Linter()
     orphans = linter.detect_orphan_pages()
@@ -665,7 +696,6 @@ async def lint_endpoint():
 
 # ─── GET/POST /api/v1/consistency (Big-Loop #3: 跨文档一致性稽核) ─────────────
 
-@app.get("/api/v1/consistency")
 async def consistency_get():
     """查看已知矛盾报告(不触发 LLM,只读 contradictions.yaml)。"""
     report = load_contradictions()
@@ -678,7 +708,6 @@ async def consistency_get():
     }
 
 
-@app.post("/api/v1/consistency")
 async def consistency_run():
     """触发全库一致性稽核:生成候选对 → LLM 逐对判定 → 写 contradictions.yaml。
 
@@ -698,3 +727,140 @@ async def consistency_run():
         "last_updated": report.get("last_updated"),
         "contradictions": report.get("contradictions", []),
     }
+
+
+# ─── E005 Task 8:lifespan、单实例锁与启动恢复门禁 ────────────────────────────
+
+def _build_lifespan(base_dir: Path):
+    """构造绑定 base_dir 的 lifespan(设计 §6.1、§17)。
+
+    启动顺序(任何一步失败即拒绝启动,进程不得开始服务):
+
+        加载并校验 CompileRuntimeConfig(纯解析,无 I/O)
+        → 获取 ApiInstanceLock(第二实例立即失败)
+        → probe_durable_directory(transaction_dir)
+        → recover_startup(任何 blocker → 拒绝启动)
+        → 挂接 AppRuntime,service_mode=ready,开始服务
+
+    实例锁覆盖 配置/探针/恢复/服务 全周期,仅在 lifespan shutdown 释放。
+    recover_startup 自身不获取实例锁(Phase 1 评审结论),锁由本 lifespan 持有。
+    """
+
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI):
+        config = load_compile_runtime_config(base_dir)  # ValueError → 启动失败
+        lock = ApiInstanceLock(config.instance_lock_path)
+        lock.acquire()  # portalocker.AlreadyLocked → 第二实例启动失败
+        try:
+            probe_durable_directory(config.transaction_dir)
+            report = recover_startup(base_dir, config)
+            for warning in report.warnings:
+                logger.warning("startup recovery warning: %s", warning)
+            if not report.ready:
+                for blocker in report.blockers:
+                    logger.error("startup recovery blocker: %s", blocker)
+                raise RuntimeError(
+                    "startup recovery blocked; refusing to serve "
+                    f"({len(report.blockers)} blockers)"
+                )
+            app.state.runtime = AppRuntime(
+                config=config,
+                readiness=ServiceReadiness(),
+                instance_lock=lock,
+            )
+            yield
+        finally:
+            app.state.runtime = None
+            lock.release()
+
+    return _lifespan
+
+
+def create_app(
+    base_dir: Path | str | None = None,
+    *,
+    allow_unmanaged: bool = False,
+) -> FastAPI:
+    """应用工厂。
+
+    - base_dir:知识库根目录(事务目录、实例锁、启动恢复的作用域);
+      默认模块级 BASE_DIR(生产 uvicorn 路径)。
+    - allow_unmanaged: 仅测试使用的显式 opt-in。纯 TestClient(非上下文
+      管理器)不执行 lifespan,app.state.runtime 不存在;设 True 时该情形
+      按 ready 放行,设 False(默认,生产语义)时 fail-closed 返回 503。
+      生产 ASGI 服务器必经 lifespan,此旗标不得用于生产实例。
+    """
+    resolved_base = Path(base_dir) if base_dir is not None else BASE_DIR
+
+    app = FastAPI(
+        title="Karpathy-Style LLM Wiki API",
+        version="2.0.0",
+        lifespan=_build_lifespan(resolved_base),
+    )
+    app.state.base_dir = resolved_base
+    app.state.allow_unmanaged = allow_unmanaged
+
+    @app.middleware("http")
+    async def recovery_gate(request: Request, call_next):
+        """全局业务门禁(设计 §19):readiness != ready 时,除 health/ready 外
+        一律 503 {"detail": {"code": "recovery_required"}}(单向、fail-closed)。"""
+        if request.url.path in GATE_EXEMPT_PATHS:
+            return await call_next(request)
+        runtime = getattr(request.app.state, "runtime", None)
+        if runtime is None:
+            if getattr(request.app.state, "allow_unmanaged", False):
+                return await call_next(request)
+            logger.error(
+                "rejecting %s %s: runtime absent (lifespan not run)",
+                request.method, request.url.path,
+            )
+            return JSONResponse(status_code=503, content=RECOVERY_REQUIRED_BODY)
+        mode, reason = runtime.readiness.snapshot()
+        if mode != "ready":
+            # reason 仅服务端日志,绝不进入公共响应体。
+            logger.warning(
+                "gate rejecting %s %s: service_mode=%s reason=%s",
+                request.method, request.url.path, mode, reason,
+            )
+            return JSONResponse(status_code=503, content=RECOVERY_REQUIRED_BODY)
+        return await call_next(request)
+
+    # CORS 在门禁之后注册,成为最外层中间件,门禁 503 响应同样携带 CORS 头。
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            # 常规本地 dev(3000)+ UAT 隔离 live 套件(3001);均为本地回环,非生产策略。
+            "http://localhost:3000", "http://127.0.0.1:3000",
+            "http://localhost:3001", "http://127.0.0.1:3001",
+        ],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # 路由注册(处理器为模块级函数,路径常量仍在调用时解析模块属性,
+    # 既有测试的 monkeypatch 语义保持不变)。
+    app.get("/api/v1/health")(health)
+    app.get("/api/v1/ready")(ready)
+    app.get("/api/v1/wiki/index")(wiki_index)
+    app.get("/api/v1/graph")(graph_data)
+    app.get("/api/v1/ontology")(ontology_data)
+    app.get("/api/v1/entity-graph")(entity_graph)
+    app.get("/api/v1/docs")(list_docs)
+    app.get("/api/v1/docs/{doc_id}")(get_doc)
+    app.delete("/api/v1/docs/{doc_id}")(delete_doc)
+    app.post("/api/v1/docs/{doc_id}/recompile")(recompile_doc_endpoint)
+    app.post("/api/v1/upload")(upload_document)
+    app.post("/api/v1/ingest")(ingest_document)
+    app.post("/api/v1/search")(search_endpoint)
+    app.get("/api/v1/search/stream")(search_stream)
+    app.post("/api/v1/qa")(qa_stream)
+    app.post("/api/v1/lint")(lint_endpoint)
+    app.get("/api/v1/consistency")(consistency_get)
+    app.post("/api/v1/consistency")(consistency_run)
+    return app
+
+
+# 生产入口(uvicorn api.main:app):严格 fail-closed 语义;
+# lifespan 在服务器启动时执行,import 时不触发、不创建 .runtime。
+app = create_app()

@@ -384,7 +384,17 @@ raw/{doc_id}.meta.yaml
 
 ### 12.2 新的摄入边界
 
-摄入拆为：
+摄入拆为以下接口：
+
+```text
+prepare_ingest(
+    staged_source: Path,
+    *,
+    existing_doc_ids: set[str],
+) -> PreparedIngest
+```
+
+`PreparedIngest`字段：
 
 ```python
 @dataclass(frozen=True)
@@ -394,10 +404,6 @@ class PreparedIngest:
     file_hash: str
     text_bytes: bytes
     meta: dict
-
-
-def prepare_ingest(staged_source: Path, *, existing_doc_ids: set[str]) -> PreparedIngest:
-    ...
 ```
 
 `prepare_ingest()`：

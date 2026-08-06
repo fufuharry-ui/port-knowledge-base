@@ -381,16 +381,30 @@ def _terminate_timed_out_job(
     sanitized_message: str,
 ) -> None:
     """设计 §14 超时顺序: ROLLBACKING(reason) → 终止树 → 确认退出 → 回滚。"""
-    transition_manifest(
-        manifest.job_dir,
-        expected=TransactionState.RUNNING,
-        target=TransactionState.ROLLBACKING,
-        failure={"original_code": code, "original_message": sanitized_message},
-    )
+    try:
+        transition_manifest(
+            manifest.job_dir,
+            expected=TransactionState.RUNNING,
+            target=TransactionState.ROLLBACKING,
+            failure={"original_code": code, "original_message": sanitized_message},
+        )
+    except Exception as exc:
+        # 迁移失败时绝不让已超时的进程树存活: best-effort 终止并回收,
+        # 失败关闭(Manifest 停留 RUNNING,由启动恢复处理)。
+        logger.error(
+            "ROLLBACKING transition failed for timed-out job %s: %s",
+            manifest.job_id,
+            exc,
+        )
+        _terminate_spawned_best_effort(spawned, grace_seconds)
+        readiness.mark_recovery_required("rollback_transition_failed")
+        return
     identity = spawned.identity
-    termination = terminate_process_tree(identity, grace_seconds)
-    # 无论终止结果如何都必须回收 Popen,避免句柄/僵尸累积。
-    _reap_popen(spawned, grace_seconds)
+    try:
+        termination = terminate_process_tree(identity, grace_seconds)
+    finally:
+        # 无论终止结果如何(包括抛出)都必须回收 Popen,避免句柄/僵尸累积。
+        _reap_popen(spawned, grace_seconds)
     if not termination.success:
         readiness.mark_recovery_required(
             sanitize_compile_error(

@@ -721,6 +721,100 @@ def test_timeout_full_recovery_restores_old_version(tmp_path, monkeypatch):
     assert not manifest.job_dir.exists()
 
 
+def test_timeout_transition_failure_terminates_tree_best_effort(
+    tmp_path, monkeypatch
+):
+    """审查修复(Important): 超时后 ROLLBACKING 迁移自身失败(Manifest IO)
+    时,必须 best-effort 终止进程树并回收 Popen,失败关闭;绝不让存活的
+    编译子进程在 Manifest 停留 RUNNING 时继续改写业务文件。"""
+    manifest, _old = scheduled_transaction(tmp_path)
+
+    def fake_child():
+        (tmp_path / "wiki" / "index.yaml").write_bytes(b"partial-index")
+
+    spawned = install_fake_process(
+        monkeypatch,
+        tmp_path,
+        manifest.doc_id,
+        on_wait=fake_child,
+        result=ProcessResult(
+            status=STATUS_TIMED_OUT, returncode=None, stdout="", stderr=""
+        ),
+    )
+    real_transition = compile_jobs.transition_manifest
+
+    def flaky_transition(job_dir, expected, target, **changes):
+        if target is ROLLBACKING:
+            raise OSError("manifest io failed")
+        return real_transition(job_dir, expected, target, **changes)
+
+    monkeypatch.setattr("api.compile_jobs.transition_manifest", flaky_transition)
+    terminate_calls = []
+    monkeypatch.setattr(
+        "api.compile_jobs.terminate_process_tree",
+        lambda identity, grace_seconds: terminate_calls.append(identity.pid)
+        or TerminationResult(status=STATUS_TERMINATED),
+    )
+    restore_calls = []
+    monkeypatch.setattr(
+        "api.compile_jobs.restore_transaction_artifacts",
+        lambda *args, **kwargs: restore_calls.append(args),
+    )
+
+    readiness = ServiceReadiness()
+    run_compile_task(
+        manifest.job_id, tmp_path, runtime_config(tmp_path), readiness
+    )
+
+    # best-effort 终止已尝试且 Popen 已回收
+    assert terminate_calls == [4321]
+    assert spawned.popen.communicate_calls >= 1 or spawned.popen.wait_calls >= 1
+    # 失败关闭: readiness 进入 recovery_required,不回滚、不写文档终态
+    assert readiness.snapshot()[0] == "recovery_required"
+    assert restore_calls == []
+    meta = read_doc_meta(manifest.doc_id, tmp_path)
+    assert meta["status"] == "compiling"
+    assert meta["compile_job_id"] == manifest.job_id
+    # Manifest 保持 RUNNING(迁移从未成功),业务文件未被回滚触碰
+    assert load_manifest(manifest.job_dir).state is RUNNING
+    assert (tmp_path / "wiki" / "index.yaml").read_bytes() == b"partial-index"
+
+
+def test_timeout_terminate_raise_still_reaps_popen(tmp_path, monkeypatch):
+    """审查修复(Minor): terminate_process_tree 抛异常时 Popen 仍必须
+    被回收(try/finally),并失败关闭进入 recovery_required。"""
+    manifest, _old = scheduled_transaction(tmp_path)
+    spawned = install_fake_process(
+        monkeypatch,
+        tmp_path,
+        manifest.doc_id,
+        result=ProcessResult(
+            status=STATUS_TIMED_OUT, returncode=None, stdout="", stderr=""
+        ),
+    )
+
+    def broken_terminate(identity, grace_seconds):
+        raise OSError("signal delivery failed")
+
+    monkeypatch.setattr(
+        "api.compile_jobs.terminate_process_tree", broken_terminate
+    )
+    restore_calls = []
+    monkeypatch.setattr(
+        "api.compile_jobs.restore_transaction_artifacts",
+        lambda *args, **kwargs: restore_calls.append(args),
+    )
+
+    readiness = ServiceReadiness()
+    run_compile_task(
+        manifest.job_id, tmp_path, runtime_config(tmp_path), readiness
+    )
+
+    assert spawned.popen.communicate_calls >= 1 or spawned.popen.wait_calls >= 1
+    assert readiness.snapshot()[0] == "recovery_required"
+    assert restore_calls == []
+
+
 def test_timeout_unconfirmed_exit_marks_recovery_required_without_restore(
     tmp_path, monkeypatch
 ):

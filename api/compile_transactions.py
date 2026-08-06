@@ -817,15 +817,42 @@ def _sanitize_error_message(text: str | None) -> str:
     return sanitize_compile_error(text or "")
 
 
-def _doc_is_bound(base_dir: Path, manifest: CompileManifest) -> bool:
-    """判断业务文档是否已绑定本事务(meta 绑定 job 或 status=compiling)。"""
-    meta = read_doc_meta(manifest.doc_id, Path(base_dir))
+def _read_doc_meta_safe(
+    base_dir: Path, doc_id: str
+) -> tuple[dict | None, str | None]:
+    """read_doc_meta 的失败关闭包装。
+
+    返回 (meta, None);文件不存在返回 (None, None);损坏、不可读或
+    非映射返回 (None, 脱敏原因),绝不向恢复/启动路径抛出异常。
+    """
+    try:
+        meta = read_doc_meta(doc_id, Path(base_dir))
+    except (OSError, yaml.YAMLError) as exc:
+        return None, f"doc meta unreadable: {_sanitize_error_message(exc)}"
     if meta is None:
-        return False
+        return None, None
+    if not isinstance(meta, dict):
+        return None, f"raw/{doc_id}.meta.yaml is not a mapping"
+    return meta, None
+
+
+def _doc_is_bound(
+    base_dir: Path, manifest: CompileManifest
+) -> tuple[bool, str | None]:
+    """判断业务文档是否已绑定本事务(meta 绑定 job 或 status=compiling)。
+
+    返回 (bound, error);meta 损坏/不可读时返回 (False, error),
+    调用方必须失败关闭,不得按"未绑定"清理事务。
+    """
+    meta, error = _read_doc_meta_safe(base_dir, manifest.doc_id)
+    if error is not None:
+        return False, error
+    if meta is None:
+        return False, None
     for field in META_ACTIVE_JOB_FIELDS:
         if meta.get(field) == manifest.job_id:
-            return True
-    return meta.get("status") == "compiling"
+            return True, None
+    return meta.get("status") == "compiling", None
 
 
 def _recompute_intake_targets(
@@ -990,11 +1017,13 @@ def _execute_rollback(
     # 4. 文档终态: 重编译写 error + 原始稳定错误码并清除活动字段;
     #    上传不保留孤儿 error 文档(本轮 raw/meta/original 已撤销)。
     if manifest.kind is TransactionKind.RECOMPILE:
-        meta = read_doc_meta(doc_id, base_dir)
         meta_rel = f"raw/{doc_id}.meta.yaml"
+        meta, meta_error = _read_doc_meta_safe(base_dir, doc_id)
         if meta is None:
             _record_recovery_failure(
-                job_dir, "doc meta missing during rollback", [meta_rel]
+                job_dir,
+                meta_error or "doc meta missing during rollback",
+                [meta_rel],
             )
             return RecoveryResult(
                 job_id=manifest.job_id,
@@ -1063,23 +1092,29 @@ def recover_transaction(
     if manifest.state in (TransactionState.COMMITTED, TransactionState.ROLLED_BACK):
         return RecoveryResult(job_id=manifest.job_id, already_terminal=True)
 
-    if manifest.state is TransactionState.PREPARED and not _doc_is_bound(
-        base_dir, manifest
-    ):
-        try:
-            shutil.rmtree(job_dir)
-        except OSError as exc:
+    if manifest.state is TransactionState.PREPARED:
+        bound, binding_error = _doc_is_bound(base_dir, manifest)
+        if binding_error is not None:
             return RecoveryResult(
                 job_id=manifest.job_id,
                 blocked=True,
-                reason=f"prepared transaction cleanup failed: "
-                f"{_sanitize_error_message(exc)}",
+                reason=f"cannot prove binding state: {binding_error}",
             )
-        return RecoveryResult(
-            job_id=manifest.job_id,
-            completed=True,
-            reason="prepared_unbound_cleaned",
-        )
+        if not bound:
+            try:
+                shutil.rmtree(job_dir)
+            except OSError as exc:
+                return RecoveryResult(
+                    job_id=manifest.job_id,
+                    blocked=True,
+                    reason=f"prepared transaction cleanup failed: "
+                    f"{_sanitize_error_message(exc)}",
+                )
+            return RecoveryResult(
+                job_id=manifest.job_id,
+                completed=True,
+                reason="prepared_unbound_cleaned",
+            )
 
     if manifest.state is TransactionState.RUNNING:
         blocked_reason = _terminate_leftover_process(manifest, config)
@@ -1118,8 +1153,10 @@ def _verify_committed_terminal(base_dir: Path, manifest: CompileManifest) -> lis
     必需产物语义合法。"""
     failures: list[str] = []
     doc_id = manifest.doc_id
-    meta = read_doc_meta(doc_id, base_dir)
-    if meta is None:
+    meta, meta_error = _read_doc_meta_safe(base_dir, doc_id)
+    if meta_error is not None:
+        failures.append(meta_error)
+    elif meta is None:
         failures.append(f"raw/{doc_id}.meta.yaml missing")
     else:
         if meta.get("status") != "compiled":
@@ -1189,9 +1226,11 @@ def _verify_rolled_back_terminal(
                 if path.exists():
                     failures.append(f"upload published file not revoked: {path.name}")
     else:
-        meta = read_doc_meta(manifest.doc_id, base_dir)
+        meta, meta_error = _read_doc_meta_safe(base_dir, manifest.doc_id)
         expected_code = manifest.failure.get("original_code")
-        if meta is None:
+        if meta_error is not None:
+            failures.append(meta_error)
+        elif meta is None:
             failures.append("recompile doc meta missing after rollback")
         else:
             if meta.get("status") != "error":

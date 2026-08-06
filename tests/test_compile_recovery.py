@@ -14,6 +14,7 @@ import yaml
 
 from api.compile_transactions import (
     CompileManifest,
+    ManifestIntegrityError,
     PublishedIntake,
     TransactionKind,
     TransactionState,
@@ -483,19 +484,138 @@ def test_upload_manifest_with_unsafe_intake_path_blocks(tmp_path):
         previous_meta={"id": DOC_ID, "status": "raw"},
         published_intake=intake,
     )
-    # create_prepared_transaction 的 load 校验应已拒绝越界路径;
-    # 若未拒绝, recover_transaction 也必须失败关闭且不删除任何文件。
-    try:
-        loaded = load_manifest(manifest.job_dir)
-    except Exception:
-        loaded = None
-    if loaded is None:
-        return
+    # 越界路径必须在 load 阶段被拒绝(ManifestIntegrityError)。
+    with pytest.raises(ManifestIntegrityError):
+        load_manifest(manifest.job_dir)
+
+
+def _scheduled_upload_with_intake(tmp_path, intake):
+    """上传事务进入 SCHEDULED 并发布 intake 声明的全部文件。"""
+    manifest = make_prepared(
+        tmp_path, seed=False, kind=TransactionKind.UPLOAD,
+        previous_meta={"id": DOC_ID, "status": "raw"},
+        published_intake=intake,
+    )
+    for stored in (intake.original_path, intake.raw_text_path, intake.raw_meta_path):
+        target = tmp_path / stored
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"published::" + stored.encode("utf-8"))
+    transition_manifest(manifest.job_dir, expected=PREPARED, target=SCHEDULED,
+                        scheduled_at="2026-08-06T14:30:01+00:00")
+    return load_manifest(manifest.job_dir)
+
+
+def test_upload_rollback_blocks_on_raw_name_mismatch_without_deleting(tmp_path):
+    # raw/evil.txt 能通过 load 的安全相对路径校验,但不等于本 doc_id 的
+    # 重算目标;恢复必须失败关闭且不删除任何已发布文件。
+    intake = PublishedIntake(
+        original_path="originals/example.pdf",
+        raw_text_path="raw/evil.txt",
+        raw_meta_path=f"raw/{DOC_ID}.meta.yaml",
+        published=True,
+    )
+    manifest = _scheduled_upload_with_intake(tmp_path, intake)
     result = recover_transaction(
         tmp_path, runtime_config(tmp_path), manifest.job_dir,
         reason_code="interrupted", reason_message="service restart",
     )
     assert result.blocked is True
+    assert load_manifest(manifest.job_dir).state is ROLLBACKING
+    for stored in (intake.original_path, intake.raw_text_path, intake.raw_meta_path):
+        assert (tmp_path / stored).read_bytes() == b"published::" + stored.encode("utf-8")
+
+
+def test_upload_rollback_blocks_on_nested_original_path_without_deleting(tmp_path):
+    # originals/sub/f.pdf 能通过 load 校验,但不是 originals/ 直接子文件;
+    # 恢复必须失败关闭且不删除任何已发布文件。
+    intake = PublishedIntake(
+        original_path="originals/sub/f.pdf",
+        raw_text_path=f"raw/{DOC_ID}.txt",
+        raw_meta_path=f"raw/{DOC_ID}.meta.yaml",
+        published=True,
+    )
+    manifest = _scheduled_upload_with_intake(tmp_path, intake)
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+    assert result.blocked is True
+    assert load_manifest(manifest.job_dir).state is ROLLBACKING
+    for stored in (intake.original_path, intake.raw_text_path, intake.raw_meta_path):
+        assert (tmp_path / stored).read_bytes() == b"published::" + stored.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# 损坏/不可读 meta 的失败关闭(Finding 1)
+# ---------------------------------------------------------------------------
+
+
+def test_corrupt_bound_meta_blocks_recovery_without_raising(tmp_path):
+    manifest = scheduled_manifest(tmp_path)
+    (tmp_path / "raw" / f"{DOC_ID}.meta.yaml").write_text(
+        "key: [unclosed\n", encoding="utf-8"
+    )
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+    assert result.blocked is True
+    assert any("meta" in path for path in result.failed_paths)
+    # 保持 ROLLBACKING,记录失败路径,下次可幂等继续
+    reloaded = load_manifest(manifest.job_dir)
+    assert reloaded.state is ROLLBACKING
+    assert reloaded.recovery["failed_paths"]
+    # 原始失败原因保留
+    assert reloaded.failure["original_code"] == "interrupted"
+
+
+def test_non_mapping_bound_meta_blocks_recovery_without_raising(tmp_path):
+    manifest = scheduled_manifest(tmp_path)
+    (tmp_path / "raw" / f"{DOC_ID}.meta.yaml").write_text(
+        "- a\n- b\n", encoding="utf-8"
+    )
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+    assert result.blocked is True
+    assert load_manifest(manifest.job_dir).state is ROLLBACKING
+
+
+def test_corrupt_bound_meta_blocks_startup_with_report(tmp_path):
+    manifest = scheduled_manifest(tmp_path)
+    (tmp_path / "raw" / f"{DOC_ID}.meta.yaml").write_text(
+        "key: [unclosed\n", encoding="utf-8"
+    )
+    report = recover_startup(tmp_path, runtime_config(tmp_path))
+    assert report.ready is False
+    assert any(manifest.job_id in blocker for blocker in report.blockers)
+    assert manifest.job_dir.exists()
+
+
+def test_prepared_with_corrupt_meta_blocks_startup_without_cleaning(tmp_path):
+    manifest = make_prepared(tmp_path)
+    write_doc_meta(tmp_path, DOC_ID, {"id": DOC_ID, "status": "compiled"})
+    (tmp_path / "raw" / f"{DOC_ID}.meta.yaml").write_text(
+        "key: [unclosed\n", encoding="utf-8"
+    )
+    # 无法证明业务未绑定 → 失败关闭,绝不清理事务目录
+    report = recover_startup(tmp_path, runtime_config(tmp_path))
+    assert report.ready is False
+    assert any(manifest.job_id in blocker for blocker in report.blockers)
+    assert manifest.job_dir.exists()
+
+
+def test_corrupt_meta_fails_terminal_verification_without_raising(tmp_path):
+    manifest = committed_manifest(tmp_path)
+    (tmp_path / "raw" / f"{DOC_ID}.meta.yaml").write_text(
+        "key: [unclosed\n", encoding="utf-8"
+    )
+    verification = verify_terminal_transaction(tmp_path, load_manifest(manifest.job_dir))
+    assert verification.ok is False
+    report = cleanup_terminal_transactions(tmp_path, runtime_config(tmp_path))
+    assert report.cleaned == []
+    assert manifest.job_dir.exists()
 
 
 # ---------------------------------------------------------------------------

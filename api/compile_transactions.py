@@ -679,6 +679,22 @@ def create_prepared_transaction(
     return manifest
 
 
+def update_published_intake(
+    job_dir: Path, intake: PublishedIntake
+) -> CompileManifest:
+    """耐久更新 published_intake 区段(上传发布提交点);状态机字段不变。
+
+    与 _record_recovery_failure 同模式: load → replace → 原子 Manifest
+    写入 → 回读。仅供上传发布路径在三个业务目标全部耐久发布并记录
+    intake.yaml 之后翻转 published=True。
+    """
+    job_dir = Path(job_dir)
+    manifest = load_manifest(job_dir)
+    updated = replace(manifest, published_intake=intake)
+    durable_write_yaml(job_dir / MANIFEST_FILENAME, _manifest_to_dict(updated))
+    return load_manifest(job_dir)
+
+
 def transition_manifest(
     job_dir: Path,
     expected: TransactionState,
@@ -1106,6 +1122,19 @@ def recover_transaction(
                 reason=f"cannot prove binding state: {binding_error}",
             )
         if not bound:
+            # 设计 §12.4: 上传事务在 PREPARED 后、业务绑定前的崩溃窗口可能
+            # 已发布部分业务文件;先按 intake.yaml 日志精确撤销本请求创建
+            # 的目标(journal 缺失即本轮未发布,no-op),再清理事务目录。
+            # 延迟导入避免与 api.upload_intake 的循环依赖。
+            from api.upload_intake import rollback_published_intake
+
+            intake_failures = rollback_published_intake(manifest, base_dir)
+            if intake_failures:
+                return RecoveryResult(
+                    job_id=manifest.job_id,
+                    blocked=True,
+                    reason=f"intake rollback failed: {list(intake_failures)}",
+                )
             try:
                 shutil.rmtree(job_dir)
             except OSError as exc:

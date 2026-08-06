@@ -517,3 +517,89 @@ def test_artifact_paths_reexported_from_compile_jobs(tmp_path):
     paths = legacy_artifact_paths(tmp_path, DOC_ID)
     assert len(paths) == 7
     assert {p.relative_to(tmp_path).as_posix() for p in paths} == EXPECTED_ARTIFACT_PATHS
+
+
+# ---------------------------------------------------------------------------
+# 恢复协调(E005 Task 4 增补)
+# ---------------------------------------------------------------------------
+
+
+def _bind_meta_compiling(base, job_id, doc_id=DOC_ID):
+    raw_dir = base / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    (raw_dir / f"{doc_id}.meta.yaml").write_text(
+        yaml.dump(
+            {"id": doc_id, "status": "compiling", "compile_job_id": job_id},
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_recover_transaction_reports_already_terminal_for_committed(tmp_path):
+    from api.compile_transactions import recover_transaction
+
+    manifest = prepared_manifest(tmp_path)
+    transition_manifest(manifest.job_dir, expected=PREPARED, target=SCHEDULED)
+    transition_manifest(manifest.job_dir, expected=SCHEDULED, target=RUNNING)
+    transition_manifest(manifest.job_dir, expected=RUNNING, target=COMMITTED)
+    result = recover_transaction(
+        tmp_path,
+        runtime_config(tmp_path),
+        manifest.job_dir,
+        reason_code="interrupted",
+        reason_message="service restart",
+    )
+    assert result.already_terminal is True
+    assert result.completed is False
+    assert result.blocked is False
+    assert load_manifest(manifest.job_dir).state is COMMITTED
+
+
+def test_rollback_failure_keeps_rollbacking_and_records_failed_paths(
+    tmp_path, monkeypatch
+):
+    from api.compile_transactions import recover_transaction
+
+    manifest = prepared_manifest(tmp_path)
+    _bind_meta_compiling(tmp_path, manifest.job_id)
+    transition_manifest(
+        manifest.job_dir,
+        expected=PREPARED,
+        target=ROLLBACKING,
+        failure={"original_code": "interrupted", "original_message": "restart"},
+    )
+    (tmp_path / "wiki" / f"{DOC_ID}.summary.yaml").write_bytes(b"garbage")
+
+    import api.compile_transactions as transactions
+
+    def boom(*args, **kwargs):
+        raise OSError("simulated restore write failure")
+
+    monkeypatch.setattr(transactions, "durable_write_bytes", boom)
+    first = recover_transaction(
+        tmp_path,
+        runtime_config(tmp_path),
+        manifest.job_dir,
+        reason_code="interrupted",
+        reason_message="service restart",
+    )
+    assert first.blocked is True
+    assert first.failed_paths
+    reloaded = load_manifest(manifest.job_dir)
+    assert reloaded.state is ROLLBACKING
+    assert reloaded.recovery["failed_paths"]
+    assert reloaded.recovery["last_error"]
+    # 原始失败原因被保留,不被恢复错误覆盖
+    assert reloaded.failure["original_code"] == "interrupted"
+
+    monkeypatch.undo()
+    second = recover_transaction(
+        tmp_path,
+        runtime_config(tmp_path),
+        manifest.job_dir,
+        reason_code="interrupted",
+        reason_message="service restart",
+    )
+    assert second.completed is True
+    assert load_manifest(manifest.job_dir).state is ROLLED_BACK

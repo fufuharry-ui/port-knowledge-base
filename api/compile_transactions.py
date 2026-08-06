@@ -19,6 +19,7 @@ Manifest 不记录 API Key、环境变量值、文档正文或未脱敏输出。
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import secrets
 import shutil
@@ -36,7 +37,15 @@ from api.durable_fs import (
     durable_write_yaml,
     sha256_file,
 )
+from api.process_tree import (
+    STATUS_IDENTITY_MISMATCH,
+    STATUS_PROCESS_GONE,
+    ProcessIdentity,
+    terminate_process_tree,
+    verify_process_identity,
+)
 from api.runtime_guard import CompileRuntimeConfig
+from scripts.doc_admin import read_doc_meta, write_doc_compile_result
 
 MANIFEST_SCHEMA_VERSION = 1
 MANIFEST_FILENAME = "manifest.yaml"
@@ -732,3 +741,683 @@ def list_active_manifests(config: CompileRuntimeConfig) -> list[CompileManifest]
         if manifest.state in ACTIVE_STATES:
             manifests.append(manifest)
     return manifests
+
+
+# ---------------------------------------------------------------------------
+# E005 Task 4: 幂等恢复引擎(设计 §16、§17、§18)
+#
+# 安全合同:
+# - 恢复目标永远由 base_dir + doc_id + 七项白名单重新计算;上传发布文件
+#   只删除重算后确认落在 originals/ 或 raw/ 且属于本 doc_id 的目标;
+# - ManifestIntegrityError(含快照损坏、未知 schema/state)一律硬阻断,
+#   绝不 catch-and-continue,绝不触碰业务文件;
+# - RUNNING 进程身份不匹配时绝不 kill、绝不回滚,保留证据阻断;
+# - 进程树存在幸存者时绝不回滚;
+# - 恢复失败保持 ROLLBACKING 并记录失败路径,下次调用幂等继续。
+# ---------------------------------------------------------------------------
+
+#: raw meta 中的活动 job 绑定字段;终态(meta compiled/error)不得携带。
+META_ACTIVE_JOB_FIELDS = ("compile_job_id", "compile_deadline")
+
+#: 文档终态错误码: 未提交事务因服务生命周期中断而恢复(设计 §20.1)。
+ERROR_CODE_INTERRUPTED = "interrupted"
+ERROR_CODE_ROLLBACK_FAILED = "rollback_failed"
+
+
+@dataclass(frozen=True)
+class RecoveryResult:
+    """单个事务恢复结果: completed / already_terminal / blocked 三态互斥。"""
+
+    job_id: str
+    completed: bool = False
+    already_terminal: bool = False
+    blocked: bool = False
+    reason: str | None = None
+    failed_paths: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class VerificationReport:
+    """终态事务验证结果;ok=False 时绝不清理目录。"""
+
+    job_id: str
+    state: str
+    ok: bool
+    failures: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CleanupReport:
+    """终态清理报告: 验证失败计入 blockers,纯目录删除失败仅 warnings。"""
+
+    cleaned: list[str]
+    kept: list[str]
+    warnings: list[str]
+    blockers: list[str]
+
+
+@dataclass(frozen=True)
+class StartupRecoveryReport:
+    """启动恢复报告;blockers 非空即 ready=False,实例不得开始服务。"""
+
+    ready: bool
+    recovered: list[str]
+    cleaned: list[str]
+    blockers: list[str]
+    warnings: list[str]
+
+
+def _sanitize_error_message(text: str | None) -> str:
+    """脱敏、单行化并限长技术错误信息(复用 compile_jobs 脱敏规则)。
+
+    延迟导入避免与 api.compile_jobs 的循环依赖。
+    """
+    from api.compile_jobs import sanitize_compile_error
+
+    return sanitize_compile_error(text or "")
+
+
+def _doc_is_bound(base_dir: Path, manifest: CompileManifest) -> bool:
+    """判断业务文档是否已绑定本事务(meta 绑定 job 或 status=compiling)。"""
+    meta = read_doc_meta(manifest.doc_id, Path(base_dir))
+    if meta is None:
+        return False
+    for field in META_ACTIVE_JOB_FIELDS:
+        if meta.get(field) == manifest.job_id:
+            return True
+    return meta.get("status") == "compiling"
+
+
+def _recompute_intake_targets(
+    base_dir: Path, manifest: CompileManifest
+) -> list[Path] | None:
+    """重算上传发布撤销目标;任一目标不安全时返回 None(失败关闭)。
+
+    - raw 目标必须与 base_dir + doc_id 重算值完全一致;
+    - original 目标必须是 originals/ 的直接子文件;
+    - 其他前缀或越界一律拒绝,绝不按 Manifest 存储路径删除。
+    """
+    intake = manifest.published_intake
+    if intake is None or not intake.published:
+        return []
+    expected_raw = {f"raw/{manifest.doc_id}.txt", f"raw/{manifest.doc_id}.meta.yaml"}
+    targets: list[Path] = []
+    for stored in (
+        intake.original_path,
+        intake.raw_text_path,
+        intake.raw_meta_path,
+    ):
+        parts = PurePosixPath(stored).parts
+        if parts[0] == "raw":
+            if stored not in expected_raw:
+                return None
+        elif parts[0] == "originals":
+            if len(parts) != 2:
+                return None
+        else:
+            return None
+        targets.append(Path(base_dir) / stored)
+    return targets
+
+
+def _record_recovery_failure(
+    job_dir: Path, last_error: str, failed_paths: list[str]
+) -> None:
+    """在 ROLLBACKING 上记录恢复失败证据;状态不变,原始失败原因保留。"""
+    manifest = load_manifest(job_dir)
+    updated = replace(
+        manifest,
+        recovery={
+            "last_error": _sanitize_error_message(last_error),
+            "failed_paths": list(failed_paths),
+        },
+    )
+    durable_write_yaml(Path(job_dir) / MANIFEST_FILENAME, _manifest_to_dict(updated))
+
+
+def _terminate_leftover_process(
+    manifest: CompileManifest, config: CompileRuntimeConfig
+) -> str | None:
+    """RUNNING 遗留进程处理;返回 None 表示可继续回滚,否则为阻断原因。"""
+    record = manifest.process
+    if record is None:
+        return None
+    identity = ProcessIdentity(
+        pid=record.pid,
+        create_time=record.create_time,
+        executable=record.executable,
+        cwd=record.cwd,
+        command_fingerprint=record.command_fingerprint,
+        process_group_id=(
+            record.process_group_id
+            if record.process_group_id is not None
+            else record.pid
+        ),
+        platform=record.platform,
+    )
+    status = verify_process_identity(identity)
+    if status.status == STATUS_IDENTITY_MISMATCH:
+        fields = ",".join(status.mismatched_fields)
+        return (
+            f"process identity mismatch (fields: {fields}); "
+            "evidence preserved, nothing killed"
+        )
+    if status.status == STATUS_PROCESS_GONE:
+        return None
+    grace = manifest.termination_grace_seconds or config.termination_grace_seconds
+    result = terminate_process_tree(identity, grace)
+    if result.status == STATUS_IDENTITY_MISMATCH:
+        return "process identity mismatch during termination; evidence preserved"
+    if not result.success:
+        return f"process tree survivors remaining: {list(result.survivors)}"
+    return None
+
+
+def _execute_rollback(
+    base_dir: Path, manifest: CompileManifest
+) -> RecoveryResult:
+    """在 ROLLBACKING 上执行幂等回滚(设计 §16 顺序)。
+
+    每一步都可安全重入: 恢复已恢复的文件、删除已删除的文件、重写
+    文档终态均为幂等操作;崩溃后下次调用从同一状态继续。
+    """
+    base_dir = Path(base_dir)
+    job_dir = manifest.job_dir
+    doc_id = manifest.doc_id
+    targets = artifact_paths(base_dir, doc_id)  # 重算白名单目标
+    failed: list[str] = []
+
+    # 1. 恢复快照中原本存在的文件 / 删除本轮新建的文件。
+    for record in manifest.artifacts:
+        target = targets[record.slot]
+        if record.existed:
+            payload = (job_dir / record.snapshot).read_bytes()
+            if hashlib.sha256(payload).hexdigest() != record.snapshot_sha256:
+                failed.append(record.path)
+                continue
+            try:
+                durable_write_bytes(target, payload)
+            except OSError:
+                failed.append(record.path)
+        else:
+            try:
+                if target.is_file() or target.is_symlink():
+                    target.unlink()
+                elif target.exists():
+                    failed.append(record.path)
+            except OSError:
+                failed.append(record.path)
+
+    # 2. 撤销上传事务本轮发布的 original/raw 文件(重算安全目标)。
+    intake_targets = _recompute_intake_targets(base_dir, manifest)
+    if manifest.kind is TransactionKind.UPLOAD:
+        if intake_targets is None:
+            failed.append("published_intake")
+        else:
+            for path in intake_targets:
+                try:
+                    if path.is_file() or path.is_symlink():
+                        path.unlink()
+                    elif path.exists():
+                        failed.append(path.name)
+                except OSError:
+                    failed.append(path.name)
+
+    # 3. 验证恢复结果与事务前存在性 + SHA-256 完全一致。
+    for record in manifest.artifacts:
+        target = targets[record.slot]
+        if record.existed:
+            if not target.is_file() or sha256_file(target) != record.original_sha256:
+                if record.path not in failed:
+                    failed.append(record.path)
+        elif target.exists():
+            if record.path not in failed:
+                failed.append(record.path)
+    if manifest.kind is TransactionKind.UPLOAD and intake_targets:
+        for path in intake_targets:
+            if path.exists() and path.name not in failed:
+                failed.append(path.name)
+
+    if failed:
+        _record_recovery_failure(job_dir, "rollback verification failed", failed)
+        return RecoveryResult(
+            job_id=manifest.job_id,
+            blocked=True,
+            reason=ERROR_CODE_ROLLBACK_FAILED,
+            failed_paths=tuple(failed),
+        )
+
+    # 4. 文档终态: 重编译写 error + 原始稳定错误码并清除活动字段;
+    #    上传不保留孤儿 error 文档(本轮 raw/meta/original 已撤销)。
+    if manifest.kind is TransactionKind.RECOMPILE:
+        meta = read_doc_meta(doc_id, base_dir)
+        meta_rel = f"raw/{doc_id}.meta.yaml"
+        if meta is None:
+            _record_recovery_failure(
+                job_dir, "doc meta missing during rollback", [meta_rel]
+            )
+            return RecoveryResult(
+                job_id=manifest.job_id,
+                blocked=True,
+                reason=ERROR_CODE_ROLLBACK_FAILED,
+                failed_paths=(meta_rel,),
+            )
+        cleaned_meta = {
+            key: value
+            for key, value in meta.items()
+            if key not in META_ACTIVE_JOB_FIELDS
+        }
+        durable_write_yaml(base_dir / "raw" / f"{doc_id}.meta.yaml", cleaned_meta)
+        code = manifest.failure.get("original_code") or ERROR_CODE_INTERRUPTED
+        message = _sanitize_error_message(
+            manifest.failure.get("original_message") or "编译任务被中断"
+        )
+        if not write_doc_compile_result(
+            doc_id, "error",
+            error_code=code, error_message=message, base_dir=base_dir,
+        ):
+            _record_recovery_failure(
+                job_dir, "failed to write doc error terminal", [meta_rel]
+            )
+            return RecoveryResult(
+                job_id=manifest.job_id,
+                blocked=True,
+                reason=ERROR_CODE_ROLLBACK_FAILED,
+                failed_paths=(meta_rel,),
+            )
+
+    # 5. Manifest → ROLLED_BACK(原子状态提交点)。
+    transition_manifest(job_dir, expected=TransactionState.ROLLBACKING,
+                        target=TransactionState.ROLLED_BACK)
+    return RecoveryResult(job_id=manifest.job_id, completed=True)
+
+
+def recover_transaction(
+    base_dir: Path,
+    config: CompileRuntimeConfig,
+    job_dir: Path,
+    *,
+    reason_code: str,
+    reason_message: str,
+) -> RecoveryResult:
+    """恢复单个非终态事务(设计 §16、§17 状态表)。
+
+    - COMMITTED / ROLLED_BACK: already_terminal,不做任何修改;
+    - PREPARED 且业务未绑定: 清理事务目录,不写 interrupted;
+    - PREPARED 已绑定 / SCHEDULED: 按中断事务回滚,绝不重新排队;
+    - RUNNING: 验证进程身份并终止遗留树,确认退出后才回滚;
+    - ROLLBACKING: 继续幂等回滚;
+    - ManifestIntegrityError: 硬阻断,不触碰业务文件。
+    """
+    base_dir = Path(base_dir)
+    job_dir = Path(job_dir)
+    try:
+        manifest = load_manifest(job_dir)
+    except ManifestIntegrityError as exc:
+        return RecoveryResult(
+            job_id=job_dir.name,
+            blocked=True,
+            reason=f"manifest integrity: {_sanitize_error_message(exc)}",
+        )
+
+    if manifest.state in (TransactionState.COMMITTED, TransactionState.ROLLED_BACK):
+        return RecoveryResult(job_id=manifest.job_id, already_terminal=True)
+
+    if manifest.state is TransactionState.PREPARED and not _doc_is_bound(
+        base_dir, manifest
+    ):
+        try:
+            shutil.rmtree(job_dir)
+        except OSError as exc:
+            return RecoveryResult(
+                job_id=manifest.job_id,
+                blocked=True,
+                reason=f"prepared transaction cleanup failed: "
+                f"{_sanitize_error_message(exc)}",
+            )
+        return RecoveryResult(
+            job_id=manifest.job_id,
+            completed=True,
+            reason="prepared_unbound_cleaned",
+        )
+
+    if manifest.state is TransactionState.RUNNING:
+        blocked_reason = _terminate_leftover_process(manifest, config)
+        if blocked_reason is not None:
+            return RecoveryResult(
+                job_id=manifest.job_id, blocked=True, reason=blocked_reason
+            )
+
+    if manifest.state is not TransactionState.ROLLBACKING:
+        changes: dict[str, Any] = {}
+        if not manifest.failure.get("original_code"):
+            changes["failure"] = {
+                "original_code": reason_code,
+                "original_message": _sanitize_error_message(reason_message),
+            }
+        manifest = transition_manifest(
+            job_dir,
+            expected=manifest.state,
+            target=TransactionState.ROLLBACKING,
+            **changes,
+        )
+
+    return _execute_rollback(base_dir, manifest)
+
+
+def _load_yaml_mapping(path: Path) -> dict | None:
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _verify_committed_terminal(base_dir: Path, manifest: CompileManifest) -> list[str]:
+    """COMMITTED 清理前验证(设计 §15、§18): meta compiled 无活动字段,
+    必需产物语义合法。"""
+    failures: list[str] = []
+    doc_id = manifest.doc_id
+    meta = read_doc_meta(doc_id, base_dir)
+    if meta is None:
+        failures.append(f"raw/{doc_id}.meta.yaml missing")
+    else:
+        if meta.get("status") != "compiled":
+            failures.append("doc meta status is not compiled")
+        for field in META_ACTIVE_JOB_FIELDS:
+            if field in meta:
+                failures.append(f"doc meta still carries active field {field}")
+
+    for path, label in (
+        (base_dir / "wiki" / f"{doc_id}.summary.yaml", "summary"),
+        (base_dir / "meta" / "ontology" / f"{doc_id}.ontology.yaml", "ontology"),
+    ):
+        data = _load_yaml_mapping(path)
+        if data is None:
+            failures.append(f"{label} missing or unparsable")
+        elif data.get("doc_id") != doc_id:
+            failures.append(f"{label} doc_id mismatch")
+
+    index = _load_yaml_mapping(base_dir / "wiki" / "index.yaml")
+    documents = index.get("documents") if index else None
+    if not isinstance(documents, list) or sum(
+        1
+        for entry in documents
+        if isinstance(entry, Mapping) and entry.get("id") == doc_id
+    ) != 1:
+        failures.append("wiki/index.yaml must contain exactly one entry for doc")
+
+    relations_path = base_dir / "meta" / "relations" / f"{doc_id}.relations.yaml"
+    if relations_path.exists():
+        data = _load_yaml_mapping(relations_path)
+        if data is None or data.get("doc_id") != doc_id:
+            failures.append("doc relations missing or doc_id mismatch")
+
+    for global_path in (
+        base_dir / "meta" / "ontology" / "global_ontology.yaml",
+        base_dir / "meta" / "relations" / "knowledge_graph.yaml",
+        base_dir / "meta" / "ontology" / "entity_relations.yaml",
+    ):
+        if global_path.exists() and _load_yaml_mapping(global_path) is None:
+            failures.append(f"{global_path.name} top-level structure invalid")
+    return failures
+
+
+def _verify_rolled_back_terminal(
+    base_dir: Path, manifest: CompileManifest
+) -> list[str]:
+    """ROLLED_BACK 清理前验证(设计 §18): 七项产物与事务前存在性 + SHA
+    一致,上传发布已撤销,重编译 meta 为 error 且错误码匹配原始失败原因。"""
+    failures: list[str] = []
+    targets = artifact_paths(base_dir, manifest.doc_id)
+    for record in manifest.artifacts:
+        target = targets[record.slot]
+        if record.existed:
+            if not target.is_file():
+                failures.append(f"{record.path} missing after rollback")
+            elif sha256_file(target) != record.original_sha256:
+                failures.append(f"{record.path} sha256 differs from pre-transaction")
+        elif target.exists():
+            failures.append(f"{record.path} must not exist after rollback")
+
+    if manifest.kind is TransactionKind.UPLOAD:
+        intake_targets = _recompute_intake_targets(base_dir, manifest)
+        if intake_targets is None:
+            failures.append("published_intake paths fail safety recomputation")
+        else:
+            for path in intake_targets:
+                if path.exists():
+                    failures.append(f"upload published file not revoked: {path.name}")
+    else:
+        meta = read_doc_meta(manifest.doc_id, base_dir)
+        expected_code = manifest.failure.get("original_code")
+        if meta is None:
+            failures.append("recompile doc meta missing after rollback")
+        else:
+            if meta.get("status") != "error":
+                failures.append("recompile doc meta is not error after rollback")
+            if (
+                expected_code is not None
+                and meta.get("error_code") != expected_code
+            ):
+                failures.append(
+                    "recompile error_code does not match original failure reason"
+                )
+            for field in META_ACTIVE_JOB_FIELDS:
+                if field in meta:
+                    failures.append(f"doc meta still carries active field {field}")
+    return failures
+
+
+def verify_terminal_transaction(
+    base_dir: Path, manifest: CompileManifest
+) -> VerificationReport:
+    """验证终态事务是否满足清理合同(设计 §18);只看 state 不足以免验证。"""
+    base_dir = Path(base_dir)
+    if manifest.state in ACTIVE_STATES:
+        return VerificationReport(
+            job_id=manifest.job_id,
+            state=manifest.state.value,
+            ok=False,
+            failures=("transaction is not terminal",),
+        )
+    if manifest.state is TransactionState.COMMITTED:
+        failures = _verify_committed_terminal(base_dir, manifest)
+    else:
+        failures = _verify_rolled_back_terminal(base_dir, manifest)
+    return VerificationReport(
+        job_id=manifest.job_id,
+        state=manifest.state.value,
+        ok=not failures,
+        failures=tuple(failures),
+    )
+
+
+def cleanup_terminal_transactions(
+    base_dir: Path, config: CompileRuntimeConfig
+) -> CleanupReport:
+    """验证并清理全部终态事务(设计 §18)。
+
+    - 非终态事务只报告保留,绝不删除;
+    - Manifest 不可读或验证失败: 计入 blockers,保留目录;
+    - 纯目录删除失败: 仅 warnings,后续启动或 CLI 继续尝试。
+    """
+    base_dir = Path(base_dir)
+    cleaned: list[str] = []
+    kept: list[str] = []
+    warnings: list[str] = []
+    blockers: list[str] = []
+    for job_dir in list_transaction_dirs(config):
+        try:
+            manifest = load_manifest(job_dir)
+        except ManifestIntegrityError as exc:
+            blockers.append(
+                f"manifest integrity: {job_dir.name}: "
+                f"{_sanitize_error_message(exc)}"
+            )
+            continue
+        if manifest.state in ACTIVE_STATES:
+            kept.append(manifest.job_id)
+            continue
+        verification = verify_terminal_transaction(base_dir, manifest)
+        if not verification.ok:
+            blockers.append(
+                f"terminal verification failed for {manifest.job_id}: "
+                f"{list(verification.failures)}"
+            )
+            continue
+        try:
+            shutil.rmtree(job_dir)
+        except OSError as exc:
+            warnings.append(
+                f"directory deletion failed for {manifest.job_id}: "
+                f"{_sanitize_error_message(exc)}"
+            )
+            continue
+        cleaned.append(manifest.job_id)
+    return CleanupReport(
+        cleaned=cleaned, kept=kept, warnings=warnings, blockers=blockers
+    )
+
+
+def find_orphan_compiling_docs(
+    base_dir: Path, exclude_doc_ids: frozenset[str] | None = None
+) -> tuple[list[str], list[str]]:
+    """扫描全部 raw/*.meta.yaml,返回 (孤立 compiling doc_id 列表, 不可读 meta 列表)。
+
+    只读;孤立 compiling 由调用方阻断并展示 doc_id,绝不自动修复。
+    """
+    base_dir = Path(base_dir)
+    excluded = exclude_doc_ids or frozenset()
+    orphans: list[str] = []
+    unreadable: list[str] = []
+    raw_dir = base_dir / "raw"
+    if not raw_dir.is_dir():
+        return orphans, unreadable
+    suffix = ".meta.yaml"
+    for meta_path in sorted(raw_dir.glob(f"*{suffix}")):
+        doc_id = meta_path.name[: -len(suffix)]
+        data = _load_yaml_mapping(meta_path)
+        if data is None:
+            unreadable.append(doc_id)
+            continue
+        if data.get("status") == "compiling" and doc_id not in excluded:
+            orphans.append(doc_id)
+    return orphans, unreadable
+
+
+def _clean_unpublished_staging(config: CompileRuntimeConfig) -> list[str]:
+    """清理未发布的 upload/compile staging 目录(.staging-*);失败仅警告。"""
+    warnings: list[str] = []
+    for root in (Path(config.transaction_dir), Path(config.upload_intake_dir)):
+        if not root.is_dir():
+            continue
+        for entry in sorted(root.iterdir()):
+            if entry.is_dir() and entry.name.startswith(STAGING_PREFIX):
+                try:
+                    shutil.rmtree(entry)
+                except OSError as exc:
+                    warnings.append(
+                        f"staging cleanup failed: {entry.name}: "
+                        f"{_sanitize_error_message(exc)}"
+                    )
+    return warnings
+
+
+def recover_startup(
+    base_dir: Path, config: CompileRuntimeConfig
+) -> StartupRecoveryReport:
+    """启动恢复(设计 §17 顺序)。
+
+    清理未发布 staging → 扫描正式事务 → 硬阻断(未知 schema/state、
+    ≥2 活动事务、PID 身份不匹配、快照损坏)→ 按状态表恢复非终态事务
+    → 验证并清理终态事务 → 扫描孤立 compiling(输出 doc_id 并阻断,
+    绝不自动修复)→ ready。任何 blocker 都意味着 NOT ready。
+    """
+    base_dir = Path(base_dir)
+    recovered: list[str] = []
+    cleaned: list[str] = []
+    blockers: list[str] = []
+    warnings = _clean_unpublished_staging(config)
+
+    manifests: list[CompileManifest] = []
+    for job_dir in list_transaction_dirs(config):
+        try:
+            manifests.append(load_manifest(job_dir))
+        except ManifestIntegrityError as exc:
+            blockers.append(
+                f"manifest integrity: {job_dir.name}: "
+                f"{_sanitize_error_message(exc)}"
+            )
+    if blockers:
+        return StartupRecoveryReport(
+            ready=False,
+            recovered=recovered,
+            cleaned=cleaned,
+            blockers=blockers,
+            warnings=warnings,
+        )
+
+    active = [m for m in manifests if m.state in ACTIVE_STATES]
+    if len(active) >= 2:
+        blockers.append(
+            "multiple active transactions: "
+            + ", ".join(sorted(m.job_id for m in active))
+        )
+        return StartupRecoveryReport(
+            ready=False,
+            recovered=recovered,
+            cleaned=cleaned,
+            blockers=blockers,
+            warnings=warnings,
+        )
+
+    if active:
+        manifest = active[0]
+        result = recover_transaction(
+            base_dir,
+            config,
+            manifest.job_dir,
+            reason_code=ERROR_CODE_INTERRUPTED,
+            reason_message="compile interrupted by service restart",
+        )
+        if result.blocked:
+            blockers.append(
+                f"recovery blocked for {manifest.job_id}: {result.reason}"
+            )
+            return StartupRecoveryReport(
+                ready=False,
+                recovered=recovered,
+                cleaned=cleaned,
+                blockers=blockers,
+                warnings=warnings,
+            )
+        if result.completed:
+            recovered.append(manifest.job_id)
+
+    cleanup = cleanup_terminal_transactions(base_dir, config)
+    cleaned.extend(cleanup.cleaned)
+    blockers.extend(cleanup.blockers)
+    warnings.extend(cleanup.warnings)
+    if blockers:
+        return StartupRecoveryReport(
+            ready=False,
+            recovered=recovered,
+            cleaned=cleaned,
+            blockers=blockers,
+            warnings=warnings,
+        )
+
+    orphans, unreadable = find_orphan_compiling_docs(base_dir)
+    for doc_id in unreadable:
+        blockers.append(f"unreadable doc meta: {doc_id}")
+    for doc_id in orphans:
+        blockers.append(f"orphan compiling document: {doc_id}")
+
+    return StartupRecoveryReport(
+        ready=not blockers,
+        recovered=recovered,
+        cleaned=cleaned,
+        blockers=blockers,
+        warnings=warnings,
+    )

@@ -11,6 +11,7 @@ doc_admin.py — 文档管理操作(Big-Loop #10)
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 
 import yaml
@@ -125,23 +126,100 @@ def remove_doc(doc_id: str, base_dir: Path | None = None) -> dict:
     return {"doc_id": doc_id, "removed": True, "cleaned_refs": cleaned}
 
 
-def recompile_doc(doc_id: str) -> dict:
-    """重置文档状态为 raw,触发重编译(供 error 文档重试)。
+def _raw_dir(base_dir: Path | None = None) -> Path:
+    return Path(base_dir) / "raw" if base_dir is not None else RAW_DIR
 
-    实现:把 raw/{id}.meta.yaml 的 status 改回 raw,交由调用方(端点)
-    触发 compile.py。返回 {doc_id, reset: bool}。
-    """
-    meta_path = RAW_DIR / f"{doc_id}.meta.yaml"
-    if not meta_path.exists():
-        return {"doc_id": doc_id, "reset": False, "reason": "meta not found"}
+
+def _atomic_yaml_dump(path: Path, data: dict) -> None:
+    """同目录临时文件写入 + fsync + 原子替换,避免半成品 meta.yaml。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    temp_path = Path(temp_name)
     try:
-        meta = _safe_load(meta_path) or {}
-        meta["status"] = "raw"
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            yaml.dump(data, handle, allow_unicode=True, sort_keys=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def read_doc_meta(doc_id: str, base_dir: Path | None = None) -> dict | None:
+    """读取 raw/{doc_id}.meta.yaml;不存在返回 None。"""
+    path = _raw_dir(base_dir) / f"{doc_id}.meta.yaml"
+    if not path.exists():
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle) or {}
+
+
+def prepare_doc_compile(doc_id: str, base_dir: Path | None = None) -> dict:
+    """编译前置:原子地把状态置为 compiling 并清除旧错误字段。
+
+    返回:
+      - {doc_id, prepared: True}
+      - {doc_id, prepared: False, reason: "meta_not_found"}
+      - {doc_id, prepared: False, reason: "compile_in_progress"}
+    """
+    path = _raw_dir(base_dir) / f"{doc_id}.meta.yaml"
+    meta = read_doc_meta(doc_id, base_dir)
+    if meta is None:
+        return {"doc_id": doc_id, "prepared": False, "reason": "meta_not_found"}
+    if meta.get("status") == "compiling":
+        return {"doc_id": doc_id, "prepared": False, "reason": "compile_in_progress"}
+    meta["status"] = "compiling"
+    meta.pop("error_code", None)
+    meta.pop("error_message", None)
+    _atomic_yaml_dump(path, meta)
+    return {"doc_id": doc_id, "prepared": True}
+
+
+def write_doc_compile_result(
+    doc_id: str,
+    status: str,
+    *,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    base_dir: Path | None = None,
+) -> bool:
+    """写入编译终态(compiled/error),原子发布。
+
+    error 时记录 error_code/error_message(缺省给通用值);
+    compiled 时清除错误字段。meta 不存在返回 False。
+    """
+    if status not in {"compiled", "error"}:
+        raise ValueError(f"unsupported terminal compile status: {status}")
+    path = _raw_dir(base_dir) / f"{doc_id}.meta.yaml"
+    meta = read_doc_meta(doc_id, base_dir)
+    if meta is None:
+        return False
+    meta["status"] = status
+    if status == "error":
+        meta["error_code"] = error_code or "compile_failed"
+        meta["error_message"] = error_message or "编译失败"
+    else:
+        meta.pop("error_code", None)
         meta.pop("error_message", None)
-        _safe_dump(meta_path, meta)
-        return {"doc_id": doc_id, "reset": True}
-    except Exception as e:
-        return {"doc_id": doc_id, "reset": False, "reason": str(e)}
+    _atomic_yaml_dump(path, meta)
+    return True
+
+
+def recompile_doc(doc_id: str) -> dict:
+    """重置文档状态并准备重编译(供 error 文档重试)。
+
+    委托 prepare_doc_compile():状态原子置为 compiling 并清除旧错误,
+    交由调用方(端点)触发 compile.py。返回 {doc_id, reset: bool[, reason]},
+    保持既有返回键以兼容调用方。
+    """
+    result = prepare_doc_compile(doc_id)
+    return {
+        "doc_id": doc_id,
+        "reset": result.get("prepared", False),
+        **({"reason": result["reason"]} if result.get("reason") else {}),
+    }
 
 
 def _safe_load(path: Path):

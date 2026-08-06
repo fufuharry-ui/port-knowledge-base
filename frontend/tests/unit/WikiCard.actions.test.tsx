@@ -78,4 +78,27 @@ describe('WikiCard 管理操作 (Loop #10)', () => {
         render(<WikiCard doc={baseDoc} />);
         expect(screen.queryByTestId('card-actions')).toBeNull();
     });
+
+    test('error status renders fixed friendly reason', () => {
+        render(
+            <WikiCard
+                doc={{ ...baseDoc, status: 'error', error_code: 'llm_configuration' }}
+                onRecompile={jest.fn()}
+            />,
+        );
+        expect(screen.getByTestId('compile-error-message')).toHaveTextContent(
+            '模型服务暂不可用，请联系管理员检查配置',
+        );
+    });
+
+    test('error card never renders backend technical detail', () => {
+        const doc = {
+            ...baseDoc,
+            status: 'error' as const,
+            error_code: 'compile_failed' as const,
+            error_message: 'RuntimeError OPENAI_API_KEY=sk-secret API error 500',
+        } as typeof baseDoc & { error_message: string };
+        render(<WikiCard doc={doc} onRecompile={jest.fn()} />);
+        expect(screen.queryByText(/OPENAI_API_KEY|sk-secret|API error 500/)).toBeNull();
+    });
 });

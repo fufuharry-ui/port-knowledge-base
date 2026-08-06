@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { UploadCloud, CheckCircle2, XCircle, ArrowRight } from 'lucide-react';
 import { Spinner } from '@/components/ui/Spinner';
 import type { UploadResult } from '@/lib/api';
+import { getUserFacingErrorMessage } from '@/lib/api';
 import { cn } from '@/lib/utils';
 
 interface UploadItem {
@@ -44,7 +45,8 @@ export default function UploadZone({ onUpload }: UploadZoneProps) {
             const result = await onUpload(file);
             setItems(prev => prev.map(i => i.file === file ? { ...i, state: 'done', result } : i));
         } catch (err) {
-            setItems(prev => prev.map(i => i.file === file ? { ...i, state: 'error', error: (err as Error).message } : i));
+            const message = getUserFacingErrorMessage(err, '上传失败，请稍后重试');
+            setItems(prev => prev.map(i => i.file === file ? { ...i, state: 'error', error: message } : i));
         }
     }, [onUpload]);
 

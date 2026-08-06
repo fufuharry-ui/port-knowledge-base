@@ -2,6 +2,7 @@
 import React, { useState } from 'react';
 import { RefreshCw, Trash2 } from 'lucide-react';
 import type { DocMeta } from '@/lib/api';
+import { getCompileErrorMessage } from '@/lib/api';
 import { Card } from '@/components/ui/Card';
 import { Badge, STATUS_BADGE_VARIANT, STATUS_BADGE_LABEL } from '@/components/ui/Badge';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
@@ -57,6 +58,17 @@ export default function WikiCard({ doc, onExpand, onDelete, onRecompile }: WikiC
             {/* 摘要 */}
             {doc.abstract_short && (
                 <p className="line-clamp-3 text-[13px] leading-6 text-ink-2">{doc.abstract_short}</p>
+            )}
+
+            {/* 编译失败原因:固定安全文案,不渲染后端原始 detail */}
+            {isError && (
+                <p
+                    data-testid="compile-error-message"
+                    role="status"
+                    className="rounded-md bg-danger-soft px-2.5 py-2 text-[12px] leading-5 text-danger-ink"
+                >
+                    {getCompileErrorMessage(doc.error_code)}
+                </p>
             )}
 
             {/* 页脚:元信息 + 管理操作 */}

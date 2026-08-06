@@ -15,6 +15,7 @@ import pytest
 import yaml
 
 from scripts.doc_admin import edges_excluding_doc, remove_doc
+from scripts.doc_admin import prepare_doc_compile, read_doc_meta, write_doc_compile_result
 
 
 class TestEdgesExcludingDoc:
@@ -137,3 +138,85 @@ class TestRemoveDoc:
         monkeypatch.setattr(mod, "META_DIR", project_dir / "meta")
         summary = remove_doc("doc_nonexistent")
         assert summary["removed"] is False
+
+
+def test_prepare_doc_compile_marks_compiling_and_clears_errors(project_dir):
+    doc_id = "doc_20260805_001"
+    meta_path = project_dir / "raw" / f"{doc_id}.meta.yaml"
+    meta_path.write_text(
+        yaml.safe_dump({
+            "id": doc_id,
+            "status": "error",
+            "error_code": "compile_failed",
+            "error_message": "old failure",
+        }, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+    result = prepare_doc_compile(doc_id, base_dir=project_dir)
+
+    assert result == {"doc_id": doc_id, "prepared": True}
+    meta = read_doc_meta(doc_id, base_dir=project_dir)
+    assert meta["status"] == "compiling"
+    assert "error_code" not in meta
+    assert "error_message" not in meta
+
+
+def test_prepare_doc_compile_rejects_existing_compiling(project_dir):
+    doc_id = "doc_20260805_002"
+    meta_path = project_dir / "raw" / f"{doc_id}.meta.yaml"
+    meta_path.write_text(
+        yaml.safe_dump({"id": doc_id, "status": "compiling"}),
+        encoding="utf-8",
+    )
+
+    result = prepare_doc_compile(doc_id, base_dir=project_dir)
+
+    assert result == {
+        "doc_id": doc_id,
+        "prepared": False,
+        "reason": "compile_in_progress",
+    }
+
+
+def test_write_doc_compile_result_persists_terminal_error(project_dir):
+    doc_id = "doc_20260805_003"
+    meta_path = project_dir / "raw" / f"{doc_id}.meta.yaml"
+    meta_path.write_text(
+        yaml.safe_dump({"id": doc_id, "status": "compiling"}),
+        encoding="utf-8",
+    )
+
+    written = write_doc_compile_result(
+        doc_id,
+        "error",
+        error_code="timeout",
+        error_message="request timed out",
+        base_dir=project_dir,
+    )
+
+    assert written is True
+    meta = read_doc_meta(doc_id, base_dir=project_dir)
+    assert meta["status"] == "error"
+    assert meta["error_code"] == "timeout"
+    assert meta["error_message"] == "request timed out"
+
+
+def test_write_doc_compile_result_clears_errors_on_success(project_dir):
+    doc_id = "doc_20260805_004"
+    meta_path = project_dir / "raw" / f"{doc_id}.meta.yaml"
+    meta_path.write_text(
+        yaml.safe_dump({
+            "id": doc_id,
+            "status": "error",
+            "error_code": "compile_failed",
+            "error_message": "old",
+        }),
+        encoding="utf-8",
+    )
+
+    assert write_doc_compile_result(doc_id, "compiled", base_dir=project_dir) is True
+    meta = read_doc_meta(doc_id, base_dir=project_dir)
+    assert meta["status"] == "compiled"
+    assert "error_code" not in meta
+    assert "error_message" not in meta

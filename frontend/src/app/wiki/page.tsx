@@ -1,5 +1,5 @@
 'use client';
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { BookOpen, Upload, FileText, CheckCircle2, Clock } from 'lucide-react';
@@ -10,34 +10,87 @@ import { EmptyState } from '@/components/ui/EmptyState';
 import { Button } from '@/components/ui/Button';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { useToast } from '@/components/ui/Toast';
-import { fetchWikiIndex, deleteDoc, recompileDoc, type DocMeta } from '@/lib/api';
+import {
+    fetchWikiIndex,
+    deleteDoc,
+    recompileDoc,
+    getCompileErrorMessage,
+    getUserFacingErrorMessage,
+    type DocMeta,
+    type WikiIndexData,
+} from '@/lib/api';
 
 export default function WikiPage() {
     const router = useRouter();
-    const toast = useToast();
+    const { push: pushToast } = useToast();
     const [docs, setDocs] = useState<DocMeta[]>([]);
     const [total, setTotal] = useState(0);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
 
-    useEffect(() => {
-        fetchWikiIndex()
-            .then(data => { setDocs(data.documents); setTotal(data.total_docs); })
-            .catch(e => setError(e.message))
-            .finally(() => setLoading(false));
-    }, []);
+    // E004: 跟踪各文档上一份快照状态;首轮快照不弹 Toast(历史 error 不算新失败)
+    const statusByIdRef = useRef(new Map<string, DocMeta['status']>());
+    const initializedRef = useRef(false);
+    const pollInFlightRef = useRef(false);
 
-    // Loop #11: 任一文档编译中时,每 10s 轮询刷新;全部编译完自动停止。
+    // E004-FIX-01:本地变更纪元 + 请求序号守卫。
+    // 重编译等本地变更乐观写入前同步推进纪元;每个目录请求发出时捕获纪元并分配序号;
+    // 响应仅在「纪元未变且序号不落后于已应用序号」时才允许落地,过期响应一律丢弃。
+    const mutationEpochRef = useRef(0);
+    const requestSequenceRef = useRef(0);
+    const latestAppliedSequenceRef = useRef(0);
+
+    // 单一快照应用入口:先算状态迁移并弹 Toast,再更新 state(Updater 内无副作用)
+    const applySnapshot = useCallback((data: WikiIndexData, notify: boolean) => {
+        if (notify && initializedRef.current) {
+            for (const doc of data.documents) {
+                const previous = statusByIdRef.current.get(doc.id);
+                if ((previous === 'raw' || previous === 'compiling') && doc.status === 'error') {
+                    pushToast(getCompileErrorMessage(doc.error_code), 'error');
+                }
+            }
+        }
+        statusByIdRef.current = new Map(data.documents.map(doc => [doc.id, doc.status]));
+        initializedRef.current = true;
+        setDocs(data.documents);
+        setTotal(data.total_docs);
+    }, [pushToast]);
+
+    // 受保护的目录加载:初始加载与轮询共用;返回响应是否真正被应用
+    const loadSnapshot = useCallback(async (notify: boolean): Promise<boolean> => {
+        const requestEpoch = mutationEpochRef.current;
+        const requestSequence = ++requestSequenceRef.current;
+        const data = await fetchWikiIndex();
+        if (requestEpoch !== mutationEpochRef.current) return false;
+        if (requestSequence < latestAppliedSequenceRef.current) return false;
+        applySnapshot(data, notify);
+        latestAppliedSequenceRef.current = requestSequence;
+        return true;
+    }, [applySnapshot]);
+
+    useEffect(() => {
+        loadSnapshot(false)
+            .catch(e => setError(getUserFacingErrorMessage(e, '知识库加载失败，请稍后重试')))
+            .finally(() => setLoading(false));
+    }, [loadSnapshot]);
+
+    // E004: 任一文档编译中时,每 3s 条件轮询;全部进入终态自动停止;飞行中去重
     const hasPending = docs.some(d => d.status === 'raw' || d.status === 'compiling');
     useEffect(() => {
         if (!hasPending) return;
-        const timer = setInterval(() => {
-            fetchWikiIndex()
-                .then(data => { setDocs(data.documents); setTotal(data.total_docs); })
-                .catch(() => {});
-        }, 10000);
-        return () => clearInterval(timer);
-    }, [hasPending]);
+        const timer = window.setInterval(async () => {
+            if (pollInFlightRef.current) return;
+            pollInFlightRef.current = true;
+            try {
+                await loadSnapshot(true);
+            } catch {
+                // 瞬时轮询失败不覆盖上一份可用目录
+            } finally {
+                pollInFlightRef.current = false;
+            }
+        }, 3000);
+        return () => window.clearInterval(timer);
+    }, [hasPending, loadSnapshot]);
 
     const compiled = docs.filter(d => d.status === 'compiled').length;
     const pendingCount = docs.filter(d => d.status === 'raw' || d.status === 'compiling').length;
@@ -59,7 +112,7 @@ export default function WikiPage() {
             {hasPending && (
                 <p data-testid="compiling-hint" className="mt-3 flex items-center gap-2 text-[13px] font-medium text-warning-ink">
                     <span className="spin inline-block h-3 w-3 rounded-full border-2 border-warning border-t-transparent" />
-                    有文档编译中,每 10 秒自动刷新…
+                    有文档编译中，每3秒自动刷新…
                 </p>
             )}
 
@@ -118,20 +171,31 @@ export default function WikiPage() {
                                 onDelete={async id => {
                                     try {
                                         await deleteDoc(id);
+                                        // 本地变更:推进纪元使此前发出的目录响应失效,再乐观移除
+                                        mutationEpochRef.current += 1;
+                                        statusByIdRef.current.delete(id);
                                         setDocs(ds => ds.filter(d => d.id !== id));
                                         setTotal(t => Math.max(0, t - 1));
-                                        toast.push('文档已删除', 'success');
+                                        pushToast('文档已删除', 'success');
                                     } catch (e) {
-                                        toast.push(`删除失败: ${e instanceof Error ? e.message : e}`, 'error');
+                                        pushToast(getUserFacingErrorMessage(e, '删除失败，请稍后重试'), 'error');
                                     }
                                 }}
                                 onRecompile={async id => {
                                     try {
                                         await recompileDoc(id);
-                                        setDocs(ds => ds.map(d => d.id === id ? { ...d, status: 'compiling' } : d));
-                                        toast.push('已触发重编译,稍候自动刷新', 'info');
+                                        // 本地变更纪元 +1 与乐观编译中写在同一同步块内(中间无 await):
+                                        // 此前发出的轮询/加载响应落地时纪元不匹配,一律丢弃
+                                        mutationEpochRef.current += 1;
+                                        statusByIdRef.current.set(id, 'compiling');
+                                        setDocs(current => current.map(doc => (
+                                            doc.id === id
+                                                ? { ...doc, status: 'compiling', error_code: undefined }
+                                                : doc
+                                        )));
+                                        // 成功不弹 Toast:编译中提示条已反馈,结果由下一轮轮询统一通知
                                     } catch (e) {
-                                        toast.push(`重编译失败: ${e instanceof Error ? e.message : e}`, 'error');
+                                        pushToast(getUserFacingErrorMessage(e, '重编译失败，请稍后重试'), 'error');
                                     }
                                 }}
                             />

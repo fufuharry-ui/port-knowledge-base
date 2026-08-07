@@ -23,6 +23,7 @@ from api.compile_jobs import (
     sanitize_compile_error,
 )
 from api.compile_transactions import (
+    ERROR_CODE_UNACCEPTED,
     TransactionState,
     list_active_manifests,
     recover_startup,
@@ -349,8 +350,7 @@ def _schedule_compile(
 
         scheduled_at = datetime.now(timezone.utc)
         deadline = scheduled_at + timedelta(seconds=manifest.timeout_seconds)
-        scheduling_error: Exception | None = None
-        scheduled = False
+        bound = False
         try:
             bound = bind_doc_compile_job(
                 doc_id,
@@ -359,23 +359,47 @@ def _schedule_compile(
                 deadline.isoformat(),
                 base_dir=BASE_DIR,
             )
-            if bound:
+        except Exception as exc:
+            logger.error(
+                "compile binding raised for %s (job %s): %s",
+                doc_id, manifest.job_id, exc,
+            )
+        if bound:
+            try:
                 manifest = transition_manifest(
                     manifest.job_dir,
                     expected=TransactionState.PREPARED,
                     target=TransactionState.SCHEDULED,
                     scheduled_at=scheduled_at.isoformat(),
                 )
-                scheduled = True
-        except Exception as exc:
-            scheduling_error = exc
-        if not scheduled:
+            except Exception as exc:
+                logger.error(
+                    "SCHEDULED transition failed for job %s: %s",
+                    manifest.job_id, exc,
+                )
+                # bind 已生效但请求未被接受:回滚恢复绑定前 meta(绝不制造
+                # error 终态);响应恒为 503——回滚后无任何编译在进行,
+                # 不得按绑定中的 meta 报 409(评审修复)。
+                if not _rollback_unaccepted_compile(
+                    runtime,
+                    manifest,
+                    reason_code=ERROR_CODE_UNACCEPTED,
+                    reason_message=(
+                        f"schedule transition failed before acceptance: {exc}"
+                    ),
+                ):
+                    raise HTTPException(
+                        status_code=503, detail={"code": "recovery_required"}
+                    ) from None
+                raise HTTPException(
+                    status_code=503,
+                    detail={"code": "compile_transaction_unavailable"},
+                ) from None
+        else:
             logger.error(
-                "compile scheduling failed for %s (job %s): %s",
-                doc_id, manifest.job_id,
-                scheduling_error or "doc binding refused",
+                "compile binding refused for %s (job %s)", doc_id, manifest.job_id
             )
-            # 先按绑定前 meta 分类响应码,再回滚(回滚可能写文档终态)。
+            # 先按绑定前 meta 分类响应码,再回滚(回滚可能改写 meta)。
             meta_after = read_doc_meta(doc_id, base_dir=BASE_DIR)
             status_after = (
                 meta_after.get("status") if isinstance(meta_after, dict) else None
@@ -383,11 +407,8 @@ def _schedule_compile(
             if not _rollback_unaccepted_compile(
                 runtime,
                 manifest,
-                reason_code="compile_failed",
-                reason_message=(
-                    "compile scheduling failed before acceptance: "
-                    f"{scheduling_error or 'doc binding refused'}"
-                ),
+                reason_code=ERROR_CODE_UNACCEPTED,
+                reason_message="doc binding refused before acceptance",
             ):
                 raise HTTPException(
                     status_code=503, detail={"code": "recovery_required"}
@@ -412,10 +433,12 @@ def _schedule_compile(
                 "background task registration failed for job %s: %s",
                 manifest.job_id, exc,
             )
+            # add_task 失败 = 请求未被接受:立即回滚并恢复绑定前 meta,
+            # 绝不留下 SCHEDULED 事务或制造的 error 终态(设计 §11)。
             if not _rollback_unaccepted_compile(
                 runtime,
                 manifest,
-                reason_code="compile_failed",
+                reason_code=ERROR_CODE_UNACCEPTED,
                 reason_message=f"background task registration failed: {exc}",
             ):
                 raise HTTPException(

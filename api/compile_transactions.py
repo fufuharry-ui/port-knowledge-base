@@ -784,6 +784,13 @@ META_ACTIVE_JOB_FIELDS = (
 ERROR_CODE_INTERRUPTED = "interrupted"
 ERROR_CODE_ROLLBACK_FAILED = "rollback_failed"
 
+#: 请求未被接受的同步回滚原由(设计 §11):请求线程在事务被接受前
+#: (bind/SCHEDULED 迁移/add_task 失败)立即回滚时使用;回滚必须把文档
+#: meta 恢复为 source-meta-before.yaml 快照,绝不制造文档错误终态。
+#: 启动恢复与执行器路径绝不使用该码——已接受事务的中断回滚仍写
+#: interrupted 等文档终态错误码。
+ERROR_CODE_UNACCEPTED = "unaccepted"
+
 
 @dataclass(frozen=True)
 class RecoveryResult:
@@ -1039,42 +1046,85 @@ def _execute_rollback(
     #    上传不保留孤儿 error 文档(本轮 raw/meta/original 已撤销)。
     if manifest.kind is TransactionKind.RECOMPILE:
         meta_rel = f"raw/{doc_id}.meta.yaml"
-        meta, meta_error = _read_doc_meta_safe(base_dir, doc_id)
-        if meta is None:
-            _record_recovery_failure(
-                job_dir,
-                meta_error or "doc meta missing during rollback",
-                [meta_rel],
+        if manifest.failure.get("original_code") == ERROR_CODE_UNACCEPTED:
+            # 设计 §11:请求未正式接受时不制造文档错误终态;把 meta 字节级
+            # 恢复为绑定前的 source-meta-before.yaml 快照。快照缺失、不可读
+            # 或恢复写入失败一律阻断(失败关闭),保持 ROLLBACKING 证据。
+            snapshot_path = job_dir / SOURCE_META_FILENAME
+            snapshot_bytes: bytes | None = None
+            try:
+                snapshot_bytes = snapshot_path.read_bytes()
+                parsed = yaml.safe_load(snapshot_bytes.decode("utf-8"))
+                if not isinstance(parsed, Mapping):
+                    snapshot_bytes = None
+            except (OSError, UnicodeDecodeError, yaml.YAMLError):
+                snapshot_bytes = None
+            if snapshot_bytes is None:
+                _record_recovery_failure(
+                    job_dir,
+                    "unaccepted rollback source meta snapshot unreadable",
+                    [meta_rel],
+                )
+                return RecoveryResult(
+                    job_id=manifest.job_id,
+                    blocked=True,
+                    reason=ERROR_CODE_ROLLBACK_FAILED,
+                    failed_paths=(meta_rel,),
+                )
+            try:
+                durable_write_bytes(
+                    base_dir / "raw" / f"{doc_id}.meta.yaml", snapshot_bytes
+                )
+            except OSError as exc:
+                _record_recovery_failure(
+                    job_dir,
+                    "unaccepted rollback meta restore failed: "
+                    f"{_sanitize_error_message(exc)}",
+                    [meta_rel],
+                )
+                return RecoveryResult(
+                    job_id=manifest.job_id,
+                    blocked=True,
+                    reason=ERROR_CODE_ROLLBACK_FAILED,
+                    failed_paths=(meta_rel,),
+                )
+        else:
+            meta, meta_error = _read_doc_meta_safe(base_dir, doc_id)
+            if meta is None:
+                _record_recovery_failure(
+                    job_dir,
+                    meta_error or "doc meta missing during rollback",
+                    [meta_rel],
+                )
+                return RecoveryResult(
+                    job_id=manifest.job_id,
+                    blocked=True,
+                    reason=ERROR_CODE_ROLLBACK_FAILED,
+                    failed_paths=(meta_rel,),
+                )
+            cleaned_meta = {
+                key: value
+                for key, value in meta.items()
+                if key not in META_ACTIVE_JOB_FIELDS
+            }
+            durable_write_yaml(base_dir / "raw" / f"{doc_id}.meta.yaml", cleaned_meta)
+            code = manifest.failure.get("original_code") or ERROR_CODE_INTERRUPTED
+            message = _sanitize_error_message(
+                manifest.failure.get("original_message") or "编译任务被中断"
             )
-            return RecoveryResult(
-                job_id=manifest.job_id,
-                blocked=True,
-                reason=ERROR_CODE_ROLLBACK_FAILED,
-                failed_paths=(meta_rel,),
-            )
-        cleaned_meta = {
-            key: value
-            for key, value in meta.items()
-            if key not in META_ACTIVE_JOB_FIELDS
-        }
-        durable_write_yaml(base_dir / "raw" / f"{doc_id}.meta.yaml", cleaned_meta)
-        code = manifest.failure.get("original_code") or ERROR_CODE_INTERRUPTED
-        message = _sanitize_error_message(
-            manifest.failure.get("original_message") or "编译任务被中断"
-        )
-        if not write_doc_compile_result(
-            doc_id, "error",
-            error_code=code, error_message=message, base_dir=base_dir,
-        ):
-            _record_recovery_failure(
-                job_dir, "failed to write doc error terminal", [meta_rel]
-            )
-            return RecoveryResult(
-                job_id=manifest.job_id,
-                blocked=True,
-                reason=ERROR_CODE_ROLLBACK_FAILED,
-                failed_paths=(meta_rel,),
-            )
+            if not write_doc_compile_result(
+                doc_id, "error",
+                error_code=code, error_message=message, base_dir=base_dir,
+            ):
+                _record_recovery_failure(
+                    job_dir, "failed to write doc error terminal", [meta_rel]
+                )
+                return RecoveryResult(
+                    job_id=manifest.job_id,
+                    blocked=True,
+                    reason=ERROR_CODE_ROLLBACK_FAILED,
+                    failed_paths=(meta_rel,),
+                )
 
     # 5. Manifest → ROLLED_BACK(原子状态提交点)。
     transition_manifest(job_dir, expected=TransactionState.ROLLBACKING,
@@ -1095,6 +1145,8 @@ def recover_transaction(
     - COMMITTED / ROLLED_BACK: already_terminal,不做任何修改;
     - PREPARED 且业务未绑定: 清理事务目录,不写 interrupted;
     - PREPARED 已绑定 / SCHEDULED: 按中断事务回滚,绝不重新排队;
+      reason_code=ERROR_CODE_UNACCEPTED(仅请求线程在事务被接受前)时,
+      不写错误终态,而是把 meta 字节级恢复为 source-meta-before.yaml;
     - RUNNING: 验证进程身份并终止遗留树,确认退出后才回滚;
     - ROLLBACKING: 继续幂等回滚;
     - ManifestIntegrityError: 硬阻断,不触碰业务文件。
@@ -1266,6 +1318,22 @@ def _verify_rolled_back_terminal(
             failures.append(meta_error)
         elif meta is None:
             failures.append("recompile doc meta missing after rollback")
+        elif expected_code == ERROR_CODE_UNACCEPTED:
+            # 未接受请求的回滚(设计 §11):meta 必须与绑定前快照字节一致,
+            # 不携带活动字段,不得出现制造的错误终态。
+            meta_path = base_dir / "raw" / f"{manifest.doc_id}.meta.yaml"
+            snapshot_path = manifest.job_dir / SOURCE_META_FILENAME
+            try:
+                identical = meta_path.read_bytes() == snapshot_path.read_bytes()
+            except OSError:
+                identical = False
+            if not identical:
+                failures.append(
+                    "unaccepted rollback did not restore pre-bind doc meta"
+                )
+            for field in META_ACTIVE_JOB_FIELDS:
+                if field in meta:
+                    failures.append(f"doc meta still carries active field {field}")
         else:
             if meta.get("status") != "error":
                 failures.append("recompile doc meta is not error after rollback")

@@ -1080,9 +1080,15 @@ def _write_repo_doc(repo: Path, doc_id: str, status: str = "raw") -> Path:
     raw = repo / "raw"
     raw.mkdir(parents=True, exist_ok=True)
     meta_path = raw / f"{doc_id}.meta.yaml"
-    meta_path.write_text(
-        yaml.safe_dump({"id": doc_id, "title": doc_id, "status": status}),
-        encoding="utf-8",
+    # 与生产写入(doc_admin._atomic_yaml_dump / durable_write_yaml)相同的
+    # dump 设置与 LF 行尾(二进制写入,避免 Windows 文本模式 CRLF 转换),
+    # 保证"恢复绑定前 meta"断言可做字节级比较。
+    meta_path.write_bytes(
+        yaml.dump(
+            {"id": doc_id, "title": doc_id, "status": status},
+            allow_unicode=True,
+            sort_keys=False,
+        ).encode("utf-8")
     )
     return meta_path
 
@@ -1263,3 +1269,98 @@ def test_delete_rejected_under_active_prepared_transaction_other_doc(
     assert response.status_code == 409
     assert response.json() == {"detail": {"code": "knowledge_base_busy"}}
     assert (tmp_repo / "raw" / "doc_2.meta.yaml").exists()
+
+
+# ─── E005 Task 9 评审修复:未接受请求的回滚不得制造文档错误终态(设计 §11)──────
+
+def test_add_task_failure_restores_pre_bind_meta_without_error_terminal(
+    managed_client, tmp_repo
+):
+    """E005 Task 9 评审修复:add_task 失败 = 请求未被接受。请求线程必须立即
+    回滚:meta 恢复为绑定前内容(字节一致),绝不写入 error 终态;响应 503
+    compile_transaction_unavailable;无活动事务残留,readiness 不被污染,
+    回滚后终态事务满足清理合同(下次启动绝不阻断)。"""
+    from fastapi import BackgroundTasks
+    from api.compile_transactions import (
+        list_active_manifests,
+        list_transaction_dirs,
+        load_manifest,
+        verify_terminal_transaction,
+        TransactionState,
+    )
+
+    runtime = _repo_runtime(managed_client)
+    before = _read_meta_bytes(tmp_repo, "doc_1")
+    with patch.object(
+        BackgroundTasks, "add_task", side_effect=RuntimeError("queue down")
+    ):
+        response = managed_client.post("/api/v1/docs/doc_1/recompile")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": {"code": "compile_transaction_unavailable"}}
+    # meta 恢复绑定前内容(字节一致),无制造的 error 终态
+    assert _read_meta_bytes(tmp_repo, "doc_1") == before
+    meta = yaml.safe_load(before.decode("utf-8"))
+    assert meta["status"] == "raw"
+    assert "error_code" not in meta
+    assert "compile_job_id" not in meta
+    # 回滚已执行:无活动事务;ROLLED_BACK 终态满足清理合同
+    assert list_active_manifests(runtime.config) == []
+    job_dirs = list_transaction_dirs(runtime.config)
+    assert len(job_dirs) == 1
+    rolled_back = load_manifest(job_dirs[0])
+    assert rolled_back.state is TransactionState.ROLLED_BACK
+    assert verify_terminal_transaction(tmp_repo, rolled_back).ok is True
+    mode, _reason = runtime.readiness.snapshot()
+    assert mode == "ready"
+
+
+def test_scheduled_transition_failure_restores_meta_and_returns_unavailable(
+    managed_client, tmp_repo, monkeypatch
+):
+    """E005 Task 9 评审修复:bind 已生效但 PREPARED→SCHEDULED 持久迁移失败,
+    请求未被接受:回滚恢复绑定前 meta(无 error 终态);响应必须是 503
+    compile_transaction_unavailable——回滚后没有任何编译在进行,不得报 409。"""
+    runtime = _repo_runtime(managed_client)
+    before = _read_meta_bytes(tmp_repo, "doc_1")
+
+    def raising_transition(*args, **kwargs):
+        raise OSError("manifest write failed")
+
+    monkeypatch.setattr("api.main.transition_manifest", raising_transition)
+    response = managed_client.post("/api/v1/docs/doc_1/recompile")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": {"code": "compile_transaction_unavailable"}}
+    assert _read_meta_bytes(tmp_repo, "doc_1") == before
+    from api.compile_transactions import list_active_manifests
+
+    assert list_active_manifests(runtime.config) == []
+    mode, _reason = runtime.readiness.snapshot()
+    assert mode == "ready"
+
+
+def test_unaccepted_rollback_blocked_enters_recovery_required(
+    managed_client, tmp_repo, monkeypatch
+):
+    """E005 Task 9 评审修复:未接受请求的回滚被阻断(无法证明一致性)→
+    fail closed:readiness 进入 recovery_required,响应 503 recovery_required。"""
+    from fastapi import BackgroundTasks
+    from api.compile_transactions import RecoveryResult
+
+    runtime = _repo_runtime(managed_client)
+    monkeypatch.setattr(
+        "api.main.recover_transaction",
+        lambda *args, **kwargs: RecoveryResult(
+            job_id="stub", blocked=True, reason="rollback_failed"
+        ),
+    )
+    with patch.object(
+        BackgroundTasks, "add_task", side_effect=RuntimeError("queue down")
+    ):
+        response = managed_client.post("/api/v1/docs/doc_1/recompile")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": {"code": "recovery_required"}}
+    mode, _reason = runtime.readiness.snapshot()
+    assert mode == "recovery_required"

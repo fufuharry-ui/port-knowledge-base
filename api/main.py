@@ -6,6 +6,7 @@ import tempfile
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import AsyncIterable
 from fastapi import FastAPI, Request, UploadFile, File, BackgroundTasks, HTTPException
@@ -15,8 +16,19 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 import yaml
 
-from api.compile_jobs import COMPILE_EXECUTION_LOCK, run_compile_task
-from api.compile_transactions import recover_startup
+from api.compile_jobs import (
+    COMPILE_EXECUTION_LOCK,
+    prepare_recompile_transaction,
+    run_compile_task,
+    sanitize_compile_error,
+)
+from api.compile_transactions import (
+    TransactionState,
+    list_active_manifests,
+    recover_startup,
+    recover_transaction,
+    transition_manifest,
+)
 from api.durable_fs import probe_durable_directory
 from api.runtime_guard import (
     ApiInstanceLock,
@@ -24,7 +36,7 @@ from api.runtime_guard import (
     ServiceReadiness,
     load_compile_runtime_config,
 )
-from scripts.doc_admin import prepare_doc_compile, read_doc_meta
+from scripts.doc_admin import bind_doc_compile_job, read_doc_meta
 from scripts.ingest import PARSERS, get_file_hash, ingest_file
 from scripts.search import (
     search, get_llm_client, layer1_filter, layer2_score, layer3_answer,
@@ -227,27 +239,196 @@ def _stage_upload(file: UploadFile) -> tuple[Path | None, dict | None]:
     return destination, None
 
 
-def _schedule_compile(background_tasks: BackgroundTasks, doc_id: str) -> None:
+def _endpoint_runtime(request: Request) -> AppRuntime | None:
+    """解析当前请求所属 app 的运行时;缺失时返回 None(调用方 fail-closed)。
+
+    config/readiness 的唯一来源是 app.state.runtime(由 lifespan 挂接);
+    绝不另行构造 ServiceReadiness,避免第二 readiness 来源。
+    """
+    return getattr(request.app.state, "runtime", None)
+
+
+def _list_active_manifests_guarded(runtime: AppRuntime) -> list:
+    """枚举活动事务;扫描失败即无法证明无活动事务,失败关闭并进入门禁。"""
+    try:
+        return list_active_manifests(runtime.config)
+    except Exception as exc:
+        logger.error("active transaction scan failed: %s", exc)
+        runtime.readiness.mark_recovery_required("transaction_scan_failed")
+        raise HTTPException(
+            status_code=503, detail={"code": "recovery_required"}
+        ) from None
+
+
+def _rollback_unaccepted_compile(
+    runtime: AppRuntime,
+    manifest,
+    *,
+    reason_code: str,
+    reason_message: str,
+) -> bool:
+    """请求未被接受时经恢复库回滚事务(设计 §11);返回 False 表示一致性
+    无法证明(失败关闭:readiness 已进入 recovery_required)。"""
+    try:
+        result = recover_transaction(
+            BASE_DIR,
+            runtime.config,
+            manifest.job_dir,
+            reason_code=reason_code,
+            reason_message=reason_message,
+        )
+    except Exception as exc:
+        logger.error(
+            "compile transaction rollback raised for job %s: %s",
+            manifest.job_id, exc,
+        )
+        runtime.readiness.mark_recovery_required("rollback_failed")
+        return False
+    if result.blocked:
+        logger.error(
+            "compile transaction rollback blocked for job %s: %s",
+            manifest.job_id, result.reason,
+        )
+        runtime.readiness.mark_recovery_required(
+            sanitize_compile_error(result.reason or "rollback_failed")
+        )
+        return False
+    return True
+
+
+def _schedule_compile(
+    background_tasks: BackgroundTasks, doc_id: str, runtime: AppRuntime | None
+) -> None:
     """统一编译调度入口(/upload、/ingest、/docs/{id}/recompile 共用)。
 
-    COMPILE_SCHEDULE_LOCK 覆盖 读/判 → prepare_doc_compile 原子置 compiling →
-    add_task 的短临界区:并发请求中恰一个能进入编译,其余得 409。
-    detail 只含稳定错误码,不泄露内部技术细节。
+    E005 Task 9:调度迁移为持久化事务(设计 §11)。COMPILE_SCHEDULE_LOCK 覆盖
+    readiness 校验 → 活动事务检查 → PREPARED 准备 → meta 绑定 → SCHEDULED
+    持久迁移 → add_task 整个临界区:并发请求中恰一个能进入编译,其余得 409。
+    请求只有在事务正式发布、meta 绑定、Manifest 持久化 SCHEDULED 且后台任务
+    登记完成后才被接受;准备/绑定/登记失败时请求线程立即经恢复库回滚,
+    绝不留下活动事务或半绑定 meta。detail 只含稳定错误码,不泄露内部技术细节。
+    runtime 缺失时 fail-closed(生产路径门禁已 503,此处兜底直接调用)。
     """
+    if runtime is None:
+        logger.error("schedule compile for %s rejected: runtime absent", doc_id)
+        raise HTTPException(status_code=503, detail={"code": "recovery_required"})
+    config = runtime.config
+    readiness = runtime.readiness
     with COMPILE_SCHEDULE_LOCK:
-        result = prepare_doc_compile(doc_id, base_dir=BASE_DIR)
-        if result.get("prepared"):
-            background_tasks.add_task(run_compile_task, doc_id, BASE_DIR)
-            return
-        if result.get("reason") == "compile_in_progress":
+        try:
+            readiness.require_ready()
+        except RuntimeError:
+            raise HTTPException(
+                status_code=503, detail={"code": "recovery_required"}
+            ) from None
+        active = _list_active_manifests_guarded(runtime)
+        if active:
+            same_doc = any(manifest.doc_id == doc_id for manifest in active)
             raise HTTPException(
                 status_code=409,
-                detail={"code": "compile_in_progress"},
+                detail={
+                    "code": "compile_in_progress" if same_doc else "knowledge_base_busy"
+                },
             )
-        raise HTTPException(status_code=404, detail="Document metadata not found")
+        meta = read_doc_meta(doc_id, base_dir=BASE_DIR)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="Document metadata not found")
+        if meta.get("status") == "compiling":
+            raise HTTPException(
+                status_code=409, detail={"code": "compile_in_progress"}
+            )
+        try:
+            manifest = prepare_recompile_transaction(doc_id, BASE_DIR, config)
+        except Exception as exc:
+            logger.error(
+                "compile transaction preparation failed for %s: %s", doc_id, exc
+            )
+            raise HTTPException(
+                status_code=503, detail={"code": "compile_transaction_unavailable"}
+            ) from None
+
+        scheduled_at = datetime.now(timezone.utc)
+        deadline = scheduled_at + timedelta(seconds=manifest.timeout_seconds)
+        scheduling_error: Exception | None = None
+        scheduled = False
+        try:
+            bound = bind_doc_compile_job(
+                doc_id,
+                manifest.job_id,
+                scheduled_at.isoformat(),
+                deadline.isoformat(),
+                base_dir=BASE_DIR,
+            )
+            if bound:
+                manifest = transition_manifest(
+                    manifest.job_dir,
+                    expected=TransactionState.PREPARED,
+                    target=TransactionState.SCHEDULED,
+                    scheduled_at=scheduled_at.isoformat(),
+                )
+                scheduled = True
+        except Exception as exc:
+            scheduling_error = exc
+        if not scheduled:
+            logger.error(
+                "compile scheduling failed for %s (job %s): %s",
+                doc_id, manifest.job_id,
+                scheduling_error or "doc binding refused",
+            )
+            # 先按绑定前 meta 分类响应码,再回滚(回滚可能写文档终态)。
+            meta_after = read_doc_meta(doc_id, base_dir=BASE_DIR)
+            status_after = (
+                meta_after.get("status") if isinstance(meta_after, dict) else None
+            )
+            if not _rollback_unaccepted_compile(
+                runtime,
+                manifest,
+                reason_code="compile_failed",
+                reason_message=(
+                    "compile scheduling failed before acceptance: "
+                    f"{scheduling_error or 'doc binding refused'}"
+                ),
+            ):
+                raise HTTPException(
+                    status_code=503, detail={"code": "recovery_required"}
+                )
+            if meta_after is None:
+                raise HTTPException(
+                    status_code=404, detail="Document metadata not found"
+                )
+            if status_after == "compiling":
+                raise HTTPException(
+                    status_code=409, detail={"code": "compile_in_progress"}
+                )
+            raise HTTPException(
+                status_code=503, detail={"code": "compile_transaction_unavailable"}
+            )
+        try:
+            background_tasks.add_task(
+                run_compile_task, manifest.job_id, BASE_DIR, config, readiness
+            )
+        except Exception as exc:
+            logger.error(
+                "background task registration failed for job %s: %s",
+                manifest.job_id, exc,
+            )
+            if not _rollback_unaccepted_compile(
+                runtime,
+                manifest,
+                reason_code="compile_failed",
+                reason_message=f"background task registration failed: {exc}",
+            ):
+                raise HTTPException(
+                    status_code=503, detail={"code": "recovery_required"}
+                ) from None
+            raise HTTPException(
+                status_code=503, detail={"code": "compile_transaction_unavailable"}
+            ) from None
 
 
-def _accept_upload(background_tasks: BackgroundTasks, file: UploadFile) -> dict:
+def _accept_upload(
+    background_tasks: BackgroundTasks, file: UploadFile, runtime: AppRuntime | None
+) -> dict:
     """权威上传契约:落盘 → 去重 → 同步 ingest_file → 调度按 doc_id 编译。
 
     返回权威 doc_id(来自 ingest_file,而非上传时预生成),含 skipped 字段。
@@ -269,7 +450,7 @@ def _accept_upload(background_tasks: BackgroundTasks, file: UploadFile) -> dict:
         raise HTTPException(status_code=422, detail="文件无法解析或内容为空")
 
     doc_id = meta["id"]
-    _schedule_compile(background_tasks, doc_id)
+    _schedule_compile(background_tasks, doc_id, runtime)
     return {
         "status": "processing",
         "skipped": False,
@@ -455,15 +636,20 @@ async def get_doc(doc_id: str):
 
 # ─── 文档管理:删除 + 重编译(Loop #10)─────────────────────────────────────────
 
-def _remove_doc_exclusively(doc_id: str) -> dict:
-    """删除与完整编译事务互斥(E004-FIX-02)。
+def _remove_doc_exclusively(doc_id: str, runtime: AppRuntime | None) -> dict:
+    """删除与完整编译事务互斥(E004-FIX-02 + E005 Task 9)。
 
-    锁顺序恒为 COMPILE_SCHEDULE_LOCK → COMPILE_EXECUTION_LOCK,与
+    锁顺序恒为 COMPILE_SCHEDULE_LOCK → COMPILE_EXECUTION_LOCK(非阻塞),与
     _schedule_compile(仅调度锁)、run_compile_task(仅执行锁)不构成循环等待。
-    执行锁被占用说明有编译事务(快照/编译/回滚)在进行:删除必须立即 409,
+    执行锁被占用说明有编译事务(快照/编译/回滚)在执行:删除必须立即 409,
     不得阻塞等待数分钟,否则失败回滚或成功发布都可能复活已删除的共享引用。
-    目标文档已排队 compiling(尚未取得执行锁)同样拒绝,封住调度窗口。
+    存在任一活动 Manifest(PREPARED/SCHEDULED/RUNNING/ROLLBACKING)同样拒绝
+    ——同文档 409 compile_in_progress,其他文档 409 knowledge_base_busy——
+    封住调度窗口与恢复窗口。runtime 缺失时 fail-closed(生产路径门禁已 503)。
     """
+    if runtime is None:
+        logger.error("delete %s rejected: runtime absent", doc_id)
+        raise HTTPException(status_code=503, detail={"code": "recovery_required"})
     with COMPILE_SCHEDULE_LOCK:
         if not COMPILE_EXECUTION_LOCK.acquire(blocking=False):
             raise HTTPException(
@@ -471,6 +657,17 @@ def _remove_doc_exclusively(doc_id: str) -> dict:
                 detail={"code": "knowledge_base_busy"},
             )
         try:
+            active = _list_active_manifests_guarded(runtime)
+            if active:
+                same_doc = any(manifest.doc_id == doc_id for manifest in active)
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": (
+                            "compile_in_progress" if same_doc else "knowledge_base_busy"
+                        )
+                    },
+                )
             meta = read_doc_meta(doc_id, base_dir=BASE_DIR)
             if meta and meta.get("status") == "compiling":
                 raise HTTPException(
@@ -483,39 +680,49 @@ def _remove_doc_exclusively(doc_id: str) -> dict:
             COMPILE_EXECUTION_LOCK.release()
 
 
-async def delete_doc(doc_id: str):
+async def delete_doc(request: Request, doc_id: str):
     """删除文档 + 全部产物 + 清理 index/KG/entity_relations 引用。
 
     此前知识库只能追加无法维护——上传错文档/编译失败时无法清理。
     E004-FIX-02:经 _remove_doc_exclusively 与编译事务互斥;编译进行中
     返回 409(knowledge_base_busy / compile_in_progress),不阻塞等待。
+    E005 Task 9:任一活动 Manifest 期间删除一律 409。
     """
-    summary = _remove_doc_exclusively(doc_id)
+    summary = _remove_doc_exclusively(doc_id, _endpoint_runtime(request))
     if not summary.get("removed"):
         raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found")
     return {"status": "deleted", **summary}
 
 
-async def recompile_doc_endpoint(doc_id: str, background_tasks: BackgroundTasks):
+async def recompile_doc_endpoint(
+    request: Request, doc_id: str, background_tasks: BackgroundTasks
+):
     """重编译既有文档(error 文档重试用)。
 
-    与上传共用 _schedule_compile:prepare_doc_compile 原子置 compiling 并清旧错误;
-    compiling 中 → 409;meta 缺失 → 404。响应形状保持不变。
+    E005 Task 9:_schedule_compile 经持久化事务调度(PREPARED → 绑定 →
+    SCHEDULED → add_task);同文档活动事务 → 409 compile_in_progress,其他
+    文档活动事务 → 409 knowledge_base_busy,事务准备失败 → 503
+    compile_transaction_unavailable,meta 缺失 → 404。响应形状保持不变,
+    绝不返回 job_id。
     """
-    _schedule_compile(background_tasks, doc_id)
+    _schedule_compile(background_tasks, doc_id, _endpoint_runtime(request))
     return {"status": "recompiling", "doc_id": doc_id}
 
 # ─── POST /api/v1/upload (alias for ingest) ──────────────────────────────────
 
-async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+async def upload_document(
+    request: Request, background_tasks: BackgroundTasks, file: UploadFile = File(...)
+):
     """Frontend-compatible upload endpoint. 返回权威 doc_id + skipped 字段。"""
-    return _accept_upload(background_tasks, file)
+    return _accept_upload(background_tasks, file, _endpoint_runtime(request))
 
 # ─── POST /api/v1/ingest ─────────────────────────────────────────────────────
 
-async def ingest_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+async def ingest_document(
+    request: Request, background_tasks: BackgroundTasks, file: UploadFile = File(...)
+):
     """Alias of /upload — 同一权威契约(权威 doc_id + skipped + 按 doc_id 编译)。"""
-    return _accept_upload(background_tasks, file)
+    return _accept_upload(background_tasks, file, _endpoint_runtime(request))
 
 # ─── POST /api/v1/search (sync JSON) ─────────────────────────────────────────
 

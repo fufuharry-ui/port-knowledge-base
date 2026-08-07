@@ -26,16 +26,25 @@ def isolate_api_originals(tmp_path, monkeypatch):
     - scripts.ingest: 后台 ingest_file 用的是 ingest 模块自己的 RAW_DIR/INDEX_FILE
       (独立常量,不是 api.main 的),不一并 patch 会写真实 raw/
     - scripts.logger: ingest_file 调用时 `from scripts.logger import global_logger`
+
+    E005 Task 9:_schedule_compile/_remove_doc_exclusively 的 config/readiness
+    一律来自 app.state.runtime;为共享测试 app 挂接指向 tmp_path 的就绪
+    runtime(与 monkeypatch 的 BASE_DIR 一致),不触碰真实仓库。
     """
     import api.main as api_mod
     import scripts.ingest as ingest_mod
     import scripts.logger as logger_mod
+    from api.runtime_guard import (
+        ApiInstanceLock,
+        ServiceReadiness,
+        load_compile_runtime_config,
+    )
     originals = tmp_path / "originals"
     originals.mkdir()
     monkeypatch.setattr(api_mod, "ORIGINALS_DIR", originals)
     monkeypatch.setattr(api_mod, "RAW_DIR", tmp_path / "raw")
-    # BASE_DIR: _schedule_compile 以 BASE_DIR 调用 prepare_doc_compile/run_compile_task,
-    # run_compile_task 用其作 cwd + 找 scripts/compile.py。
+    # BASE_DIR: _schedule_compile 以 BASE_DIR 调用 prepare_recompile_transaction/
+    # bind_doc_compile_job,并把 BASE_DIR 传给 run_compile_task。
     # 指向 tmp_path 后 compile_script 不存在 → 终态 error(隔离),绝不 spawn 指向真实仓库的子进程。
     monkeypatch.setattr(api_mod, "BASE_DIR", tmp_path)
     monkeypatch.setattr(ingest_mod, "BASE_DIR", tmp_path)
@@ -45,14 +54,30 @@ def isolate_api_originals(tmp_path, monkeypatch):
     monkeypatch.setattr(ingest_mod, "INDEX_FILE", tmp_path / "wiki" / "index.yaml")
     sandbox_logger = logger_mod.ActivityLogger(tmp_path / "wiki")
     monkeypatch.setattr(logger_mod, "global_logger", sandbox_logger)
-    return originals
+    runtime = api_mod.AppRuntime(
+        config=load_compile_runtime_config(tmp_path),
+        readiness=ServiceReadiness(),
+        instance_lock=ApiInstanceLock(tmp_path / ".runtime" / "api-instance.lock"),
+    )
+    had_runtime = hasattr(unmanaged_app.state, "runtime")
+    previous = getattr(unmanaged_app.state, "runtime", None)
+    unmanaged_app.state.runtime = runtime
+    try:
+        yield originals
+    finally:
+        if had_runtime:
+            unmanaged_app.state.runtime = previous
+        else:
+            del unmanaged_app.state.runtime
 
 
 @patch("api.main.run_compile_task")
 @patch("api.main.ingest_file")
 def test_ingest_endpoint(mock_ingest, mock_run, isolate_api_originals):
     """UAT Big-Loop Task 6:/ingest 返回权威 doc_id(来自 ingest_file,而非上传时预生成),
-    含 skipped 字段,并经统一入口 _schedule_compile 调度 run_compile_task(doc_id, BASE_DIR)。
+    含 skipped 字段,并经统一入口 _schedule_compile 调度。
+    E005 Task 9:后台任务以持久化事务的 job_id(绝非 doc_id)登记,
+    即 run_compile_task(job_id, BASE_DIR, config, readiness)。
     参数顺序:@patch mock 在前,fixture 在后(pytest 9.x arg_names[N:] 语义)。
     """
     import api.main as api_mod
@@ -85,7 +110,19 @@ def test_ingest_endpoint(mock_ingest, mock_run, isolate_api_originals):
     assert data["skipped"] is False
     assert (isolate_api_originals / "test.txt").exists()
     mock_ingest.assert_called_once()
-    mock_run.assert_called_once_with(doc_id, api_mod.BASE_DIR)
+    mock_run.assert_called_once()
+    args = mock_run.call_args.args
+    job_id = args[0]
+    assert isinstance(job_id, str) and job_id != doc_id
+    assert args[1] == api_mod.BASE_DIR
+    runtime = unmanaged_app.state.runtime
+    assert args[2] is runtime.config
+    assert args[3] is runtime.readiness
+    meta = yaml.safe_load(
+        (api_mod.RAW_DIR / f"{doc_id}.meta.yaml").read_text(encoding="utf-8")
+    )
+    assert meta["status"] == "compiling"
+    assert meta["compile_job_id"] == job_id
 
 @patch("api.main.search")
 @patch("api.main.get_llm_client")
@@ -637,7 +674,19 @@ def test_upload_returns_authoritative_ingested_id(mock_ingest, mock_run, isolate
     assert response.json()["doc_id"] == "doc_20260719_007"
     assert response.json()["skipped"] is False
     mock_ingest.assert_called_once()
-    mock_run.assert_called_once_with(doc_id, api_mod.BASE_DIR)
+    # E005 Task 9:后台任务以 job_id(绝非 doc_id)登记。
+    mock_run.assert_called_once()
+    args = mock_run.call_args.args
+    job_id = args[0]
+    assert isinstance(job_id, str) and job_id != doc_id
+    assert args[1] == api_mod.BASE_DIR
+    runtime = unmanaged_app.state.runtime
+    assert args[2] is runtime.config
+    assert args[3] is runtime.readiness
+    meta = yaml.safe_load(
+        (api_mod.RAW_DIR / f"{doc_id}.meta.yaml").read_text(encoding="utf-8")
+    )
+    assert meta["compile_job_id"] == job_id
 
 
 @patch("api.main.run_compile_task")
@@ -717,7 +766,12 @@ def test_upload_marks_compiling_before_background_task(
         (api_mod.RAW_DIR / f"{doc_id}.meta.yaml").read_text(encoding="utf-8")
     )
     assert meta["status"] == "compiling"
-    mock_run.assert_called_once_with(doc_id, api_mod.BASE_DIR)
+    # E005 Task 9:后台任务以 job_id(绝非 doc_id)登记,与 meta 绑定一致。
+    mock_run.assert_called_once()
+    args = mock_run.call_args.args
+    assert args[0] == meta["compile_job_id"]
+    assert args[0] != doc_id
+    assert args[1] == api_mod.BASE_DIR
 
 
 def test_recompile_returns_409_when_document_is_compiling(tmp_path, monkeypatch):
@@ -766,14 +820,22 @@ def test_catalog_projects_error_code(tmp_path, monkeypatch):
 
 
 def test_schedule_compile_allows_only_one_concurrent_request(tmp_path, monkeypatch):
-    """E004 并发守卫:同一 doc 的两个并发调度,恰一个成功,另一个得 409。
+    """E004/E005 Task 9 并发守卫:同一 doc 的两个并发调度,恰一个成功,另一个得 409。
 
     直接调用 _schedule_compile(不经 TestClient),Starlette 不会执行排队的
-    后台任务;锁必须覆盖 读/判 → 置 compiling → add_task 整个临界区。
+    后台任务;锁必须覆盖 readiness 校验 → 活动事务检查 → PREPARED 准备 →
+    meta 绑定 → SCHEDULED 迁移 → add_task 整个临界区。E005 Task 9:
+    第二名请求经活动 Manifest 检查被拒绝(manifest 驱动),config/readiness
+    来自显式构造的 runtime(与直接调用的生产语义一致)。
     """
     import threading
     from fastapi import BackgroundTasks, HTTPException
     import api.main as api_mod
+    from api.runtime_guard import (
+        ApiInstanceLock,
+        ServiceReadiness,
+        load_compile_runtime_config,
+    )
 
     raw = tmp_path / "raw"
     raw.mkdir()
@@ -784,6 +846,11 @@ def test_schedule_compile_allows_only_one_concurrent_request(tmp_path, monkeypat
     )
     monkeypatch.setattr(api_mod, "BASE_DIR", tmp_path)
     monkeypatch.setattr(api_mod, "RAW_DIR", raw)
+    runtime = api_mod.AppRuntime(
+        config=load_compile_runtime_config(tmp_path),
+        readiness=ServiceReadiness(),
+        instance_lock=ApiInstanceLock(tmp_path / ".runtime" / "api-instance.lock"),
+    )
 
     barrier = threading.Barrier(2)
     backgrounds = [BackgroundTasks(), BackgroundTasks()]
@@ -793,7 +860,7 @@ def test_schedule_compile_allows_only_one_concurrent_request(tmp_path, monkeypat
     def worker(background_tasks):
         barrier.wait(timeout=2)
         try:
-            api_mod._schedule_compile(background_tasks, doc_id)
+            api_mod._schedule_compile(background_tasks, doc_id, runtime)
             result = "scheduled"
         except HTTPException as exc:
             result = (exc.status_code, exc.detail)
@@ -1005,3 +1072,194 @@ def test_startup_refused_on_orphan_compiling(tmp_path):
         encoding="utf-8",
     )
     _run_lifespan(create_app(base_dir=tmp_path))
+
+
+# ─── E005 Task 9:重编译/删除的持久化事务合同 ──────────────────────────────────
+
+def _write_repo_doc(repo: Path, doc_id: str, status: str = "raw") -> Path:
+    raw = repo / "raw"
+    raw.mkdir(parents=True, exist_ok=True)
+    meta_path = raw / f"{doc_id}.meta.yaml"
+    meta_path.write_text(
+        yaml.safe_dump({"id": doc_id, "title": doc_id, "status": status}),
+        encoding="utf-8",
+    )
+    return meta_path
+
+
+def _read_meta_bytes(repo: Path, doc_id: str) -> bytes:
+    return (repo / "raw" / f"{doc_id}.meta.yaml").read_bytes()
+
+
+@pytest.fixture()
+def tmp_repo(tmp_path, monkeypatch):
+    """隔离知识库:两篇 raw 文档;api.main.BASE_DIR/RAW_DIR 指向该仓库。"""
+    import api.main as api_mod
+
+    (tmp_path / "wiki").mkdir(exist_ok=True)
+    _write_repo_doc(tmp_path, "doc_1")
+    _write_repo_doc(tmp_path, "doc_2")
+    monkeypatch.setattr(api_mod, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(api_mod, "RAW_DIR", tmp_path / "raw")
+    return tmp_path
+
+
+@pytest.fixture()
+def managed_client(tmp_repo):
+    """经真实 lifespan 启动的 app(base_dir=tmp_repo):runtime/config/readiness 就位。"""
+    managed_app = create_app(base_dir=tmp_repo)
+    with TestClient(managed_app) as test_client:
+        yield test_client
+
+
+def _repo_runtime(test_client):
+    return test_client.app.state.runtime
+
+
+@pytest.fixture()
+def active_transaction(managed_client, tmp_repo):
+    """lifespan 启动完成后,在 doc_1 上发布一个 PREPARED 持久化事务(未绑定)。"""
+    from api.compile_transactions import (
+        TransactionKind,
+        create_prepared_transaction,
+    )
+    from scripts.doc_admin import read_doc_meta
+
+    runtime = _repo_runtime(managed_client)
+    return create_prepared_transaction(
+        base_dir=tmp_repo,
+        config=runtime.config,
+        doc_id="doc_1",
+        kind=TransactionKind.RECOMPILE,
+        previous_meta=read_doc_meta("doc_1", tmp_repo),
+    )
+
+
+def test_other_active_transaction_rejects_recompile(managed_client, active_transaction):
+    """E005 Task 9(brief 示例):其他文档存在活动事务时,重编译必须 409
+    knowledge_base_busy(精确响应体)。"""
+    response = managed_client.post("/api/v1/docs/doc_2/recompile")
+    assert response.status_code == 409
+    assert response.json() == {"detail": {"code": "knowledge_base_busy"}}
+
+
+def test_same_doc_active_transaction_rejects_recompile(
+    managed_client, active_transaction, tmp_repo
+):
+    """E005 Task 9:同一文档已有活动事务 → 409 compile_in_progress(精确响应体),
+    meta 与既有事务保持原样。"""
+    before = _read_meta_bytes(tmp_repo, "doc_1")
+    response = managed_client.post("/api/v1/docs/doc_1/recompile")
+    assert response.status_code == 409
+    assert response.json() == {"detail": {"code": "compile_in_progress"}}
+    assert _read_meta_bytes(tmp_repo, "doc_1") == before
+
+
+def test_transaction_prepare_failure_does_not_change_meta(
+    managed_client, tmp_repo, monkeypatch
+):
+    """E005 Task 9(brief 示例):事务准备任何失败 → 503
+    compile_transaction_unavailable(精确响应体),meta 字节不变(请求未被接受)。"""
+    before = _read_meta_bytes(tmp_repo, "doc_1")
+
+    def raising_prepare(*args, **kwargs):
+        raise OSError("durable publish failed")
+
+    monkeypatch.setattr("api.main.prepare_recompile_transaction", raising_prepare)
+    response = managed_client.post("/api/v1/docs/doc_1/recompile")
+    assert response.status_code == 503
+    assert response.json() == {"detail": {"code": "compile_transaction_unavailable"}}
+    assert _read_meta_bytes(tmp_repo, "doc_1") == before
+
+
+def test_recompile_gated_returns_recovery_required(managed_client):
+    """E005 Task 9:readiness 进入 recovery_required 时,重编译 503(精确响应体)。"""
+    _repo_runtime(managed_client).readiness.mark_recovery_required("rollback_failed")
+    response = managed_client.post("/api/v1/docs/doc_1/recompile")
+    assert response.status_code == 503
+    assert response.json() == {"detail": {"code": "recovery_required"}}
+
+
+def test_recompile_success_schedules_background_task_by_job_id(
+    managed_client, tmp_repo
+):
+    """E005 Task 9 成功路径:响应体精确且不含 job_id;后台任务以 job_id(绝非
+    doc_id)登记 run_compile_task,config/readiness 来自 app runtime;meta 绑定
+    同一 job;Manifest 已持久迁移到 SCHEDULED。"""
+    from api.compile_transactions import (
+        TransactionState,
+        list_transaction_dirs,
+        load_manifest,
+    )
+
+    runtime = _repo_runtime(managed_client)
+    with patch("api.main.run_compile_task") as mock_run:
+        response = managed_client.post("/api/v1/docs/doc_2/recompile")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "recompiling", "doc_id": "doc_2"}
+    assert "job_id" not in response.text
+
+    meta = yaml.safe_load(
+        (tmp_repo / "raw" / "doc_2.meta.yaml").read_text(encoding="utf-8")
+    )
+    assert meta["status"] == "compiling"
+    job_id = meta["compile_job_id"]
+    assert job_id and job_id != "doc_2"
+
+    mock_run.assert_called_once()
+    args = mock_run.call_args.args
+    assert args[0] == job_id
+    assert args[1] == tmp_repo
+    assert args[2] is runtime.config
+    assert args[3] is runtime.readiness
+
+    job_dirs = list_transaction_dirs(runtime.config)
+    assert [path.name for path in job_dirs] == [job_id]
+    assert load_manifest(job_dirs[0]).state is TransactionState.SCHEDULED
+
+
+def test_bind_failure_rolls_back_prepared_transaction(
+    managed_client, tmp_repo, monkeypatch
+):
+    """E005 Task 9:bind 拒绝时,已发布的 PREPARED 事务必须经恢复库回滚(事务
+    目录清理、无活动事务残留),meta 不得残留 compiling 或 job 绑定字段,
+    readiness 不被污染,请求 503 compile_transaction_unavailable。"""
+    from api.compile_transactions import list_transaction_dirs
+
+    runtime = _repo_runtime(managed_client)
+    monkeypatch.setattr("api.main.bind_doc_compile_job", lambda *args, **kwargs: False)
+    response = managed_client.post("/api/v1/docs/doc_1/recompile")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": {"code": "compile_transaction_unavailable"}}
+    meta = yaml.safe_load(
+        (tmp_repo / "raw" / "doc_1.meta.yaml").read_text(encoding="utf-8")
+    )
+    assert meta["status"] == "raw"
+    assert "compile_job_id" not in meta
+    assert list_transaction_dirs(runtime.config) == []
+    mode, _reason = runtime.readiness.snapshot()
+    assert mode == "ready"
+
+
+def test_delete_rejected_under_active_prepared_transaction_same_doc(
+    managed_client, active_transaction, tmp_repo
+):
+    """E005 Task 9:活动事务处于 PREPARED(尚未取得执行锁)时,同文档删除必须
+    409 compile_in_progress,文档文件保持完整。"""
+    response = managed_client.delete("/api/v1/docs/doc_1")
+    assert response.status_code == 409
+    assert response.json() == {"detail": {"code": "compile_in_progress"}}
+    assert (tmp_repo / "raw" / "doc_1.meta.yaml").exists()
+
+
+def test_delete_rejected_under_active_prepared_transaction_other_doc(
+    managed_client, active_transaction, tmp_repo
+):
+    """E005 Task 9:活动事务处于 PREPARED 时,其他文档删除必须 409
+    knowledge_base_busy,文档文件保持完整。"""
+    response = managed_client.delete("/api/v1/docs/doc_2")
+    assert response.status_code == 409
+    assert response.json() == {"detail": {"code": "knowledge_base_busy"}}
+    assert (tmp_repo / "raw" / "doc_2.meta.yaml").exists()

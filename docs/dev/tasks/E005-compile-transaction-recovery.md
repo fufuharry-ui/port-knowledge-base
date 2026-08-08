@@ -1,6 +1,6 @@
 # E005 编译事务恢复、硬超时与严格一致性 — 任务事实记录
 
-> Date: 2026-08-07（记录起草） | Task: E005 | 状态: 代码任务 1–12 已实施并通过各任务审查，Phase 3 文档任务（Task 13）完成；最终全量门禁、R1–R8 最终矩阵、数据清单复核由 Task 14 新鲜执行，本文档相应项保持 `未执行` 占位
+> Date: 2026-08-07（记录起草）/ 2026-08-08（Task 14 最终验证） | Task: E005 | 状态: 代码任务 1–12 已实施并通过各任务审查，Phase 3 文档任务（Task 13）完成；Task 14 已新鲜执行最终 R1–R8 矩阵、Windows/POSIX 进程树证据、全量离线门禁与数据清单复核（见第 9 节）；PR、Codex review 与合并待用户授权
 
 ## 1. 任务身份
 
@@ -89,23 +89,42 @@ COMPILE_TERMINATION_GRACE_SECONDS=5
 - **单实例合同**：恢复、硬超时与门禁只保证单 API 实例；不覆盖多 worker / 多宿主写入；
 - **外部 CLI 无协调**：`scripts/` CLI 并发摄入/编译不与 API 事务协调（非目标，设计 §3）；
 - **非目标（设计 §3）保留**：多副本部署、跨主机锁、共享 YAML 通用事务框架（风险 6 仍保留）、外部向量库、真实 LLM UAT 声明；
-- **POSIX 证据待 Task 14/CI**：进程树 killpg/session 路径与 fsync 耐久证据在本 Windows 机器上未执行，属 Task 14/CI 范围；
+- **POSIX 证据（Task 14 已补齐进程树与耐久/实例锁部分）**：进程树 killpg/session 路径、fsync 耐久写入与 portalocker 实例锁已由 Task 14 在本地 WSL Ubuntu-22.04 真实执行（详见第 9 节）；POSIX fsync 与锁的 CI 复核仍由 ubuntu-latest 全量套件承担；
 - **跨进程 portalocker 语义未实测**（两个真实 uvicorn 实例，设计 §6.1 接受，OS 级 LockFile）；
 - **LF-vs-CRLF 披露**：Task 6 起 `publish` 以 LF 二进制写 raw txt（旧文本模式在 Windows 写 CRLF）；消费方均已规范化，char_count 与磁盘字节一致（潜在修复，如实披露）；
 - **Task 5 设计级残留**：meta 在 COMMITTED 翻转前已规范化 compiled，翻转失败会在启动时回滚一次有效编译（符合任务书顺序，属设计残留非缺陷）；
 - **ledger 登记的 deferred minors 摘要**（完整清单见 SDD ledger）：durable_fs 重读校验失败时目标状态未知；probe 固定文件名仅单实例安全；Manifest 迁移无内部锁（互斥由 COMPILE_EXECUTION_LOCK 负责）；`failure.original_message` 原文存储（脱敏责任在写入方）；`stage_upload` 全文件内存缓冲（峰值约 2–3 倍，流式变体留后续任务）；journal 读取 UnicodeDecodeError 未捕获（fail-closed 方向）；journal 损坏重写时条目丢弃（泄漏方向）；请求线程回滚不持 EXECUTION 锁（任务书认可，单活动不变量下安全）；前端若干测试断言弱点与报告口径瑕疵（机制归因、子断言强度，均为测试侧 cosmetic）。
 
-## 9. 最终验证（Task 14 范围，本文档一律 `未执行`）
+## 9. 最终验证（Task 14 新鲜执行，2026-08-08）
 
-以下项目必须由 Task 14 新鲜执行后替换 `未执行`，本文档起草时不得预填：
+执行环境：worktree 根目录；后端全部运行为离线环境（`OPENAI_API_KEY=""`、`EMBEDDING_API_KEY=""`、黑洞代理 `http://127.0.0.1:9`）；解释器 `D:\ProgramData\anaconda3\python.exe`（Python 3.12.7）；每次测试运行后均新鲜执行 `git status --short` 与 `.runtime` 残留检查，结果仅为本任务范围文件、无 raw/wiki/meta/originals/.runtime 污染。
 
-- 最终 R1–R8 完整崩溃恢复矩阵新鲜运行：未执行；
-- Windows 进程树终止最终证据：未执行；
-- POSIX 进程树与 fsync 证据：未执行（Task 14/CI）；
-- 最终完整后端 pytest / 前端 Jest / ESLint / Next build 全量门禁：未执行；
-- before/after 数据清单对比（数据目录零污染复核）：未执行；
-- PR / required checks / Codex review / merge / 分支与 worktree 清理：未执行。
+- 最终 R1–R8 完整崩溃恢复矩阵（`tests/test_e005_crash_recovery.py`，14 项）：`python -m pytest tests/test_e005_crash_recovery.py -v` → **13 passed, 1 skipped（POSIX 平台门禁项）, 7 pre-existing warnings, exit 0**。R1–R7 由 Task 14 补齐为确定性集成场景（tmp 仓库 + 短生命周期本地进程，重启一律调用生产入口 `recover_startup`）：
+  - R1 SCHEDULED 崩溃（已绑定、进程未启动）：重启回滚 + meta `error/interrupted` + 活动字段清除 + 事务目录清理，产物保持事务前字节；
+  - R2 RUNNING 崩溃（3 项产物半成品 + 真实父+子遗留进程树）：重启验证身份并终止整树（双 pid 退出经 deadline 断言），半成品逐字节恢复；
+  - R3 提交点前崩溃（子进程成功、Manifest 仍 RUNNING、进程已退出）：成功形态产物被撤销，逐字节回滚 + interrupted；
+  - R4 提交点后崩溃（COMMITTED）：`recovered == []`，仅验证并清理事务目录，业务目录（raw/wiki/meta/originals）逐字节零变化，无 error 终态；
+  - R5 回滚中再次崩溃：monkeypatch `api.compile_transactions.durable_write_bytes` 耐久写入边界，2 个目标真实恢复后第 3 次调用抛专用 `_InjectedCrash`；再启动从 ROLLBACKING 幂等完成，第三次启动零副作用；
+  - R6 损坏恢复依据（快照 00 字节翻转）：严格阻断（`manifest integrity` blocker），事务目录保留证据，业务与 `.runtime` 逐字节不变，meta 保持 compiling；
+  - R7 双崩溃（RUNNING 进程已退出 → 恢复进入 ROLLBACKING → 第 2 个恢复目标写入边界再次注入崩溃）：第三次启动逐字节恢复全部七项 + interrupted + 验证清理，原始失败原因保留；
+  - R8 六上传窗口（Task 10 实现）：6 项参数化全部保持绿色，注入机制与断言未改动；
+- Windows 进程树终止最终证据：`python -m pytest tests/test_process_tree.py::test_verify_and_terminate_real_process_tree -v` → **1 passed, exit 0**（真实父+子树整树终止）；
+- POSIX 进程树与 fsync 证据（本地 WSL Ubuntu-22.04 真实执行，Python 3.10.12 / pytest 9.1.1，用户级安装 pytest/psutil/PyYAML/portalocker，离线环境变量同上）：
+  - `python3 -m pytest tests/test_e005_crash_recovery.py -v -k 'not r8'` → **8 passed, exit 0**（R1–R7 + `test_posix_real_process_tree_group_termination`，killpg/session 路径真实执行；R8 六项因 WSL 未装 fastapi 而 deselect，其 POSIX 复核由 CI 全量套件承担）；
+  - `python3 -m pytest tests/test_process_tree.py -q` → **10 passed, exit 0**；
+  - `python3 -m pytest tests/test_durable_fs.py tests/test_runtime_guard.py tests/test_compile_transactions.py tests/test_compile_recovery.py tests/test_compile_jobs.py -q` → **153 passed, exit 0**（POSIX fsync 耐久写入与 portalocker 实例锁证据）；
+  - Windows 本地运行 `test_posix_real_process_tree_group_termination` 报告为 skipped（平台门禁，符合预期，不替代本平台自身真实树测试）；
+- 目标后端组（任务书 Step 2 十文件）：`python -m pytest tests/test_durable_fs.py tests/test_runtime_guard.py tests/test_compile_transactions.py tests/test_process_tree.py tests/test_compile_recovery.py tests/test_compile_jobs.py tests/test_upload_intake.py tests/test_ingest.py tests/test_api.py tests/test_e005_crash_recovery.py -q` → **291 passed, 1 skipped, 7 pre-existing warnings, exit 0**；
+- 完整后端门禁：`python -m pytest tests/ -q` → **506 passed, 1 skipped, 7 pre-existing warnings（pkg_resources deprecation）, exit 0（116s）**；
+- 前端 Jest：`npm test -- --runInBand` → **17 suites / 155 tests passed, exit 0**；
+- ESLint：`npx eslint src tests` → **exit 1（如实记录）**：1 error + 5 warnings，全部位于本任务未触碰的既有文件；唯一 error 为 `frontend/tests/unit/search-progress.test.ts` 的 `@typescript-eslint/no-require-imports`（源自既有提交 `cc8d539`，先于 E005 全部前端改动；工作区 frontend 零改动）；ESLint 不是 CI required check（frontend-unit-build 仅 Jest + build），本任务合同禁止修改前端，故保留为既有债务如实上报；
+- Next.js build：`npm run build` → **exit 0**；
+- pip check：`python -m pip check` → **exit 1（如实记录）**：6 项冲突全部为共享 anaconda 环境的既有非项目依赖冲突（crewai 1.11.0 要求 portalocker~=2.7.0 与 pydantic~=2.11.9；opencv-python 4.13.0.92 要求 numpy>=2；streamlit 1.37.1 要求 rich<14 与 tenacity<9；typer-slim 0.23.1 要求 typer>=0.23.1），均不在 `requirements.txt` 项目依赖内；权威干净检查为 CI python-core 的新鲜安装 + `pip check`；
+- compileall：`python -m compileall api scripts tests` → **exit 0**；
+- before/after 数据清单对比（数据目录零污染复核）：按任务书 Step 4 原样脚本捕获 `$env:TEMP\e005-data-after.json`（76 文件，path+size+mtime_ns+sha256），与 `e005-data-before.json` 的 Get-FileHash 比对 **完全一致**（两文件 SHA-256 均为 `3B93F37884F307D60E952D633733B9C024E3D6040970BC74A1759C4A741F401E`）；
+- git 范围检查：`git status --short` 仅 `tests/test_e005_crash_recovery.py` 与本文件；`git diff --check` exit 0；`git ls-files` 无 `.runtime` / `.pytest_cache` tracked 文件；`.github/workflows/ci.yml` 未改动（python-core 既有 `python -m pytest tests/ -q` 步骤自动覆盖新测试文件，任务书预期，无需修改）；
+- PR / required checks / Codex review / merge / 分支与 worktree 清理：超出 Task 14 的 Git 授权范围，Task 14 未执行；待用户明确授权后由最终集成阶段处理。
 
 ## 10. 完成标准声明边界
 
-本文档只记录 Task 1–13 的已验证事实与明确 `未执行` 占位；不构成 E005 整体完成声明。E005 的完成声明只能由 Task 14 的新鲜验证证据与最终 PR/完成报告给出。
+本文档记录 Task 1–13 的已验证事实与 Task 14 的新鲜验证证据（第 9 节全部为本会话新鲜运行结果）。E005 的最终完成声明仍须待用户授权的 PR、required checks 与 Codex review 通过后给出；第 9 节的 ESLint 既有 error 与 pip check 既有环境噪声已如实上报，不构成 E005 范围缺陷。

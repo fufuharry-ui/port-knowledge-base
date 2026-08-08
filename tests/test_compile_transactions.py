@@ -605,6 +605,18 @@ def test_list_transaction_dirs_excludes_staging(tmp_path):
     assert list_transaction_dirs(config) == [manifest.job_dir]
 
 
+def test_list_transaction_dirs_excludes_cleanup_quarantine(tmp_path):
+    """Codex R3 P2-1: .cleanup-* 隔离区残留绝不视为事务目录(半删除现场
+    不得成为 manifest-integrity blocker)。"""
+    config = runtime_config(tmp_path)
+    config.transaction_dir.mkdir(parents=True)
+    residue = config.transaction_dir / ".cleanup-20260806T000000000000Z-deadbeef"
+    residue.mkdir()
+    (residue / "snapshots").mkdir()  # 半删除现场: manifest 已消失
+    manifest = prepared_manifest(tmp_path)
+    assert list_transaction_dirs(config) == [manifest.job_dir]
+
+
 def test_list_transaction_dirs_empty_when_no_transactions(tmp_path):
     assert list_transaction_dirs(runtime_config(tmp_path)) == []
 

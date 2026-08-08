@@ -319,6 +319,57 @@ def test_rollback_without_journal_is_noop(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Codex Round 3 (P1-1): journal 驱动的精确撤销同样必须经 durable_unlink
+# 耐久删除(POSIX 父目录 fsync);删除失败计入 failures(失败关闭)
+# ---------------------------------------------------------------------------
+
+
+def test_rollback_published_intake_uses_durable_unlink(tmp_path, monkeypatch):
+    """P1-1: journal 证明由本请求创建的每个目标都经 durable_unlink 删除。"""
+    manifest, staged, prepared = prepared_upload_transaction(tmp_path, "report.txt")
+    publish_upload_intake(manifest, staged, prepared, tmp_path)
+
+    import api.upload_intake as intake_mod
+    from api.durable_fs import durable_unlink as real_unlink
+
+    calls = []
+
+    def spy_unlink(path):
+        calls.append(Path(path).name)
+        return real_unlink(path)
+
+    monkeypatch.setattr(intake_mod, "durable_unlink", spy_unlink)
+    failures = rollback_published_intake(manifest, tmp_path)
+
+    assert failures == []
+    assert set(calls) == {
+        "report.txt",
+        f"{prepared.doc_id}.txt",
+        f"{prepared.doc_id}.meta.yaml",
+    }
+
+
+def test_rollback_published_intake_unlink_failure_is_failure(tmp_path, monkeypatch):
+    """P1-1: 耐久删除(含父目录 fsync)失败 → 计入 failures,失败关闭。"""
+    manifest, staged, prepared = prepared_upload_transaction(tmp_path, "report.txt")
+    publish_upload_intake(manifest, staged, prepared, tmp_path)
+
+    import api.upload_intake as intake_mod
+
+    def boom(path):
+        raise OSError("simulated parent fsync failure")
+
+    monkeypatch.setattr(intake_mod, "durable_unlink", boom)
+    failures = rollback_published_intake(manifest, tmp_path)
+
+    assert set(failures) == {
+        "originals/report.txt",
+        f"raw/{prepared.doc_id}.txt",
+        f"raw/{prepared.doc_id}.meta.yaml",
+    }
+
+
+# ---------------------------------------------------------------------------
 # 不安全 journal 路径: 失败关闭, 绝不删除
 # ---------------------------------------------------------------------------
 

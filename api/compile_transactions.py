@@ -20,6 +20,8 @@ Manifest 不记录 API Key、环境变量值、文档正文或未脱敏输出。
 from __future__ import annotations
 
 import hashlib
+import logging
+import os
 import re
 import secrets
 import shutil
@@ -33,8 +35,10 @@ import yaml
 
 from api.durable_fs import (
     durable_publish_directory,
+    durable_unlink,
     durable_write_bytes,
     durable_write_yaml,
+    fsync_parent_directory,
     sha256_file,
 )
 from api.process_tree import (
@@ -51,6 +55,11 @@ MANIFEST_SCHEMA_VERSION = 1
 MANIFEST_FILENAME = "manifest.yaml"
 SOURCE_META_FILENAME = "source-meta-before.yaml"
 STAGING_PREFIX = ".staging-"
+#: 终态目录删除前的隔离区前缀(P2-1): 先原子换名再递归删除,半删除现场
+#: 绝不以正式事务目录形态存在;残留由启动 staging 清理 best-effort 重试。
+CLEANUP_PREFIX = ".cleanup-"
+
+logger = logging.getLogger(__name__)
 
 _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
@@ -704,8 +713,14 @@ def create_prepared_transaction(
         # 必须一并移除本调用创建的正式事务目录,绝不留下无归属的 PREPARED
         # 孤儿(原请求 503 且后续全部变更把它误判为 busy)。final_dir 名即本
         # 调用生成的唯一 job_id,只可能是本调用创建。
+        # P2-1: 与终态清理同一隔离机制(best-effort): 先换名 .cleanup-*
+        # 再递归删除,半删除现场绝不以正式事务目录形态残留。
         if final_dir.is_dir():
-            shutil.rmtree(final_dir, ignore_errors=True)
+            quarantine = _quarantine_transaction_dir(final_dir)
+            shutil.rmtree(
+                quarantine if quarantine is not None else final_dir,
+                ignore_errors=True,
+            )
         raise
     return manifest
 
@@ -766,14 +781,20 @@ def transition_manifest(
 
 
 def list_transaction_dirs(config: CompileRuntimeConfig) -> list[Path]:
-    """返回正式事务目录(排除 .staging-* staging 与非目录项),按名称排序。"""
+    """返回正式事务目录(排除 .staging-* 与 .cleanup-* 及非目录项),按名称排序。
+
+    .cleanup-* 是删除流程的隔离残留(可能处于半删除状态),绝不视为事务,
+    否则半删除现场会被误判为 manifest-integrity blocker。
+    """
     root = Path(config.transaction_dir)
     if not root.is_dir():
         return []
     return sorted(
         entry
         for entry in root.iterdir()
-        if entry.is_dir() and not entry.name.startswith(STAGING_PREFIX)
+        if entry.is_dir()
+        and not entry.name.startswith(STAGING_PREFIX)
+        and not entry.name.startswith(CLEANUP_PREFIX)
     )
 
 
@@ -1033,6 +1054,8 @@ def _execute_rollback(
     failed: list[str] = []
 
     # 1. 恢复快照中原本存在的文件 / 删除本轮新建的文件。
+    #    删除经 durable_unlink 耐久化(POSIX 父目录 fsync): 掉电不得在
+    #    ROLLED_BACK 提交点后复活已删除的业务文件。
     for record in manifest.artifacts:
         target = targets[record.slot]
         if record.existed:
@@ -1047,7 +1070,7 @@ def _execute_rollback(
         else:
             try:
                 if target.is_file() or target.is_symlink():
-                    target.unlink()
+                    durable_unlink(target)
                 elif target.exists():
                     failed.append(record.path)
             except OSError:
@@ -1062,7 +1085,7 @@ def _execute_rollback(
             for path in intake_targets:
                 try:
                     if path.is_file() or path.is_symlink():
-                        path.unlink()
+                        durable_unlink(path)
                     elif path.exists():
                         failed.append(path.name)
                 except OSError:
@@ -1238,15 +1261,29 @@ def recover_transaction(
                     blocked=True,
                     reason=f"intake rollback failed: {list(intake_failures)}",
                 )
-            try:
-                shutil.rmtree(job_dir)
-            except OSError as exc:
-                return RecoveryResult(
-                    job_id=manifest.job_id,
-                    blocked=True,
-                    reason=f"prepared transaction cleanup failed: "
-                    f"{_sanitize_error_message(exc)}",
-                )
+            # P2-1: 与终态清理同一隔离机制——先换名 .cleanup-* 再递归删除;
+            # 换名失败(正式目录仍在)失败关闭;隔离区 rmtree 失败仅警告,
+            # 语义内容已结算,残留由启动清理重试,绝不阻断恢复完成。
+            quarantine = _quarantine_transaction_dir(job_dir)
+            if quarantine is None:
+                if job_dir.is_dir():
+                    return RecoveryResult(
+                        job_id=manifest.job_id,
+                        blocked=True,
+                        reason="prepared transaction cleanup failed: "
+                        "quarantine rename failed",
+                    )
+                # 换名成功但父目录 fsync 失败: 证据已脱离事务命名空间,
+                # 残留重试即可,不阻断恢复完成。
+            else:
+                try:
+                    shutil.rmtree(quarantine)
+                except OSError as exc:
+                    logger.warning(
+                        "prepared transaction %s quarantine removal failed "
+                        "(%s); residue retried at startup",
+                        manifest.job_id, exc,
+                    )
             return RecoveryResult(
                 job_id=manifest.job_id,
                 completed=True,
@@ -1437,6 +1474,51 @@ def _mark_cleanup_verified(job_dir: Path) -> None:
     durable_write_yaml(Path(job_dir) / MANIFEST_FILENAME, _manifest_to_dict(updated))
 
 
+def _quarantine_transaction_dir(job_dir: Path) -> Path | None:
+    """把正式事务目录原子换名为同级 .cleanup-{name} 隔离目录并 fsync 父目录。
+
+    Codex R3 P2-1: 递归删除前先换名隔离——rmtree 在半删除状态(如已删
+    manifest、目录残留)失败或掉电时,残留永远以 .cleanup-* 形态存在,
+    不会被 list_transaction_dirs 当作损坏事务阻断启动;残留由启动
+    staging 清理 best-effort 重试。
+
+    返回隔离目录路径(换名与父目录 fsync 均成功);失败返回 None:
+    - 换名失败: 原目录原样保留,调用方警告后留待下次重试;
+    - fsync 失败: 换名已完成但耐久性无法证明,绝不继续递归删除,
+      残留由下次启动清理(失败关闭)。
+    既有同名隔离残留先 best-effort 移除;无法移除则本轮拒绝换名。
+    """
+    job_dir = Path(job_dir)
+    quarantine = job_dir.parent / f"{CLEANUP_PREFIX}{job_dir.name}"
+    if quarantine.exists():
+        try:
+            shutil.rmtree(quarantine)
+        except OSError as exc:
+            logger.warning(
+                "pre-existing cleanup residue %s cannot be removed (%s); "
+                "skipping quarantine rename this round",
+                quarantine.name, exc,
+            )
+            return None
+    try:
+        os.replace(job_dir, quarantine)
+    except OSError as exc:
+        logger.warning(
+            "quarantine rename failed for %s: %s", job_dir.name, exc
+        )
+        return None
+    try:
+        fsync_parent_directory(quarantine)
+    except OSError as exc:
+        logger.warning(
+            "parent fsync failed after quarantine rename of %s (%s); "
+            "residue left for startup retry",
+            job_dir.name, exc,
+        )
+        return None
+    return quarantine
+
+
 def cleanup_terminal_transactions(
     base_dir: Path, config: CompileRuntimeConfig
 ) -> CleanupReport:
@@ -1447,7 +1529,9 @@ def cleanup_terminal_transactions(
     - 终态验证通过后先把 cleanup_verified=True 耐久写入 Manifest,
       再尝试删除;cleanup_verified=True 的目录只重试删除,绝不重新
       内容验证(期间合法编译对共享产物的改变不被误判为损坏);
-    - 纯目录删除失败: 仅 warnings,后续启动或 CLI 继续尝试。
+    - 删除先原子换名 .cleanup-* 隔离区(POSIX 父目录 fsync)再递归删除:
+      半删除现场绝不以正式事务目录形态存在,残留由启动清理重试;
+    - 换名失败与纯目录删除失败: 仅 warnings,后续启动或 CLI 继续尝试。
     """
     base_dir = Path(base_dir)
     cleaned: list[str] = []
@@ -1483,8 +1567,15 @@ def cleanup_terminal_transactions(
                     f"cleanup_verified marker write failed for "
                     f"{manifest.job_id}: {_sanitize_error_message(exc)}"
                 )
+        quarantine = _quarantine_transaction_dir(job_dir)
+        if quarantine is None:
+            warnings.append(
+                f"quarantine failed for {manifest.job_id}; "
+                "retry next cleanup round or startup"
+            )
+            continue
         try:
-            shutil.rmtree(job_dir)
+            shutil.rmtree(quarantine)
         except OSError as exc:
             warnings.append(
                 f"directory deletion failed for {manifest.job_id}: "
@@ -1524,13 +1615,22 @@ def find_orphan_compiling_docs(
 
 
 def _clean_unpublished_staging(config: CompileRuntimeConfig) -> list[str]:
-    """清理未发布的 upload/compile staging 目录(.staging-*);失败仅警告。"""
+    """清理未发布的 upload/compile staging(.staging-*)与终态删除的
+    .cleanup-* 隔离残留;失败仅警告。
+
+    .cleanup-* 只存在于事务命名空间(终态清理/PREPARED 未绑定删除的
+    隔离区);upload-intake 树不使用该前缀,只清理 .staging-*。
+    """
     warnings: list[str] = []
-    for root in (Path(config.transaction_dir), Path(config.upload_intake_dir)):
+    roots = (
+        (Path(config.transaction_dir), (STAGING_PREFIX, CLEANUP_PREFIX)),
+        (Path(config.upload_intake_dir), (STAGING_PREFIX,)),
+    )
+    for root, prefixes in roots:
         if not root.is_dir():
             continue
         for entry in sorted(root.iterdir()):
-            if entry.is_dir() and entry.name.startswith(STAGING_PREFIX):
+            if entry.is_dir() and entry.name.startswith(prefixes):
                 try:
                     shutil.rmtree(entry)
                 except OSError as exc:

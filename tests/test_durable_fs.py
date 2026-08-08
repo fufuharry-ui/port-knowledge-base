@@ -6,12 +6,14 @@ from __future__ import annotations
 
 import hashlib
 import os
+from pathlib import Path
 
 import pytest
 import yaml
 
 from api.durable_fs import (
     durable_publish_directory,
+    durable_unlink,
     durable_write_bytes,
     durable_write_yaml,
     probe_durable_directory,
@@ -134,3 +136,87 @@ def test_probe_durable_directory_raises_when_directory_uncreatable(tmp_path):
 
     with pytest.raises(OSError):
         probe_durable_directory(blocker / "nested")
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 3 (P1-1): durable_unlink —— 事务语义删除必须在状态提交点前
+# 耐久(POSIX fsync 父目录);Windows 仅删除,不伪造父目录同步承诺。
+# ---------------------------------------------------------------------------
+
+
+def test_durable_unlink_deletes_file_and_fsyncs_parent(tmp_path, monkeypatch):
+    """P1-1: 删除文件后必须经父目录 fsync 原语(以目标路径为参数)。"""
+    import api.durable_fs as durable_fs
+
+    target = tmp_path / "sub" / "gone.bin"
+    target.parent.mkdir()
+    target.write_bytes(b"x")
+    events = []
+    monkeypatch.setattr(
+        durable_fs,
+        "_fsync_parent_directory",
+        lambda path: events.append(Path(path)),
+    )
+
+    durable_unlink(target)
+
+    assert not target.exists()
+    assert events == [target]
+
+
+def test_durable_unlink_posix_branch_opens_fsyncs_closes_parent(
+    tmp_path, monkeypatch
+):
+    """P1-1: POSIX 父目录 fsync 分支必须 open(父目录)→fsync→close。"""
+    import api.durable_fs as durable_fs
+
+    target = tmp_path / "sub" / "gone.bin"
+    events = []
+    monkeypatch.setattr(durable_fs.os, "name", "posix")
+    monkeypatch.setattr(
+        durable_fs.os, "open", lambda *args: events.append(("open", args[0])) or 999
+    )
+    monkeypatch.setattr(
+        durable_fs.os, "fsync", lambda fd: events.append(("fsync", fd))
+    )
+    monkeypatch.setattr(
+        durable_fs.os, "close", lambda fd: events.append(("close", fd))
+    )
+
+    durable_fs._fsync_parent_directory(target)
+
+    assert ("open", str(target.parent)) in events
+    assert ("fsync", 999) in events
+    assert ("close", 999) in events
+
+
+def test_durable_unlink_skips_parent_fsync_on_windows(tmp_path, monkeypatch):
+    """P1-1: Windows 分支只删除,绝不尝试父目录 fsync。"""
+    import api.durable_fs as durable_fs
+
+    target = tmp_path / "gone.bin"
+    target.write_bytes(b"x")
+    monkeypatch.setattr(durable_fs.os, "name", "nt")
+
+    def forbidden_open(*args, **kwargs):
+        raise AssertionError("Windows 不得尝试父目录 fsync")
+
+    monkeypatch.setattr(durable_fs.os, "open", forbidden_open)
+    durable_unlink(target)
+    assert not target.exists()
+
+
+def test_durable_unlink_propagates_parent_fsync_failure(tmp_path, monkeypatch):
+    """P1-1: 父目录 fsync 失败必须抛出 OSError(调用方按删除失败失败关闭)。"""
+    import api.durable_fs as durable_fs
+
+    target = tmp_path / "gone.bin"
+    target.write_bytes(b"x")
+
+    def boom_fsync(path):
+        raise OSError("simulated fsync failure")
+
+    monkeypatch.setattr(durable_fs, "_fsync_parent_directory", boom_fsync)
+
+    with pytest.raises(OSError, match="simulated fsync failure"):
+        durable_unlink(target)

@@ -46,6 +46,27 @@ def _fsync_parent_directory(path: Path) -> None:
         os.close(fd)
 
 
+def fsync_parent_directory(path: Path) -> None:
+    """POSIX 下 fsync path 的父目录;Windows 不做等价承诺,直接返回。
+
+    供删除/换名等不经过本模块写入原语、但仍需父目录耐久确认的调用方
+    使用;所有父目录同步统一走本原语,调用方不得自行散落 fsync。
+    """
+    _fsync_parent_directory(Path(path))
+
+
+def durable_unlink(path: Path) -> None:
+    """删除文件并在 POSIX 下 fsync 父目录,使删除先于后续状态提交点耐久。
+
+    语义与 Path.unlink 一致: 目标不存在抛 FileNotFoundError;父目录
+    fsync 失败抛 OSError(此时目标可能已删除,调用方必须按删除失败
+    失败关闭)。Windows 仅执行 unlink,不伪造父目录同步承诺。
+    """
+    path = Path(path)
+    path.unlink()
+    _fsync_parent_directory(path)
+
+
 def durable_write_bytes(path: Path, payload: bytes) -> None:
     """按耐久写入合同把 payload 原子发布到 path 并回读验证。"""
     path = Path(path)

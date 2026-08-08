@@ -7,7 +7,10 @@
   规范化业务命令指纹);
 - PID 存在但身份不匹配时,绝不终止、绝不 kill,返回 identity_mismatch 并保留证据;
 - 只有根进程与全部已捕获后代都退出时才返回成功;存在幸存者时返回
-  survivors_remaining,调用方据此进入 recovery_required 且不得回滚。
+  survivors_remaining,调用方据此进入 recovery_required 且不得回滚;
+- POSIX 进程组: 组存在性(killpg 0)不是归属证明——每次发信号前必须
+  重新枚举组成员并逐一复核指纹 + cwd;任一成员不可读或不匹配即失败
+  关闭,绝不发信号(防误杀优先于自动恢复)。
 
 子进程 stdout/stderr 使用管道捕获(communicate 排出,避免缓冲死锁),仅用于
 诊断,不写入 Manifest。
@@ -385,22 +388,79 @@ def _settle_already_gone(
 def _recorded_tree_survivors(identity: ProcessIdentity) -> tuple[int, ...] | None:
     """返回记录树的幸存后代标识;检查本身失败返回 None(不确定,失败关闭)。"""
     if os.name != "nt":
-        try:
-            os.killpg(identity.process_group_id, 0)
-        except ProcessLookupError:
-            return ()
-        except PermissionError:
-            # 组存在但无权发信号 → 组内存活进程,以 pgid 为幸存标识。
-            return (identity.process_group_id,)
-        except OSError as exc:
-            logger.warning(
-                "process group %d survivor check failed: %s",
-                identity.process_group_id,
-                exc,
-            )
-            return None
-        return (identity.process_group_id,)
+        return _posix_recorded_group_members(identity)
     return _scan_business_command_survivors(identity)
+
+
+def _posix_recorded_group_members(
+    identity: ProcessIdentity,
+) -> tuple[int, ...] | None:
+    """POSIX: 枚举记录进程组成员并逐一绑定记录树身份(防误杀优先)。
+
+    - killpg(pgid, 0) ProcessLookupError → 组已消失,返回 ();
+    - killpg 探活 PermissionError → 组属于其他用户,无法证明归属,
+      返回 None(失败关闭,绝不发信号);
+    - 探活其他 OSError 或成员枚举失败 → None;
+    - 组存在但枚举不到成员(竞态: 成员刚好全部退出) → ();
+    - 每个成员必须经 _is_recorded_tree_fingerprint + 规范化 cwd 复核属于
+      记录树(与 _scan_business_command_survivors 同一规则);任一成员
+      不可读或不匹配 → None(PGID 复用/损坏证据,绝不发信号);
+    - 全部匹配 → 返回成员 pid 元组。
+    """
+    pgid = identity.process_group_id
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return ()
+    except PermissionError:
+        logger.warning(
+            "process group %d probe denied (owned by another user); "
+            "cannot prove ownership, nothing signaled",
+            pgid,
+        )
+        return None
+    except OSError as exc:
+        logger.warning(
+            "process group %d survivor check failed: %s", pgid, exc,
+        )
+        return None
+    expected_cwd = _normalize_path(identity.cwd)
+    members: list[int] = []
+    try:
+        for proc in psutil.process_iter():
+            try:
+                if os.getpgid(proc.pid) != pgid:
+                    continue
+            except (ProcessLookupError, PermissionError, OSError, psutil.Error):
+                continue
+            try:
+                fingerprint = command_fingerprint(proc.cmdline() or [])
+                cwd = proc.cwd()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error) as exc:
+                logger.warning(
+                    "process group %d member %d unreadable (%s); "
+                    "cannot prove ownership, nothing signaled",
+                    pgid, proc.pid, exc,
+                )
+                return None
+            if not _is_recorded_tree_fingerprint(identity, fingerprint):
+                logger.warning(
+                    "process group %d member %d fingerprint mismatch "
+                    "(possible pgid reuse); nothing signaled",
+                    pgid, proc.pid,
+                )
+                return None
+            if _normalize_path(cwd) != expected_cwd:
+                logger.warning(
+                    "process group %d member %d cwd mismatch; nothing signaled",
+                    pgid, proc.pid,
+                )
+                return None
+            members.append(proc.pid)
+    except psutil.Error as exc:
+        logger.warning("process group %d membership scan failed: %s", pgid, exc)
+        return None
+    return tuple(members)
 
 
 def _is_recorded_tree_fingerprint(
@@ -449,34 +509,50 @@ def _scan_business_command_survivors(
 def _terminate_verified_survivors(
     identity: ProcessIdentity, survivors: tuple[int, ...], grace_seconds: int
 ) -> None:
-    """只终止经指纹 + cwd 复核的确切幸存进程(身份不匹配绝不 kill)。"""
+    """只终止经指纹 + cwd 复核的确切幸存进程(身份不匹配绝不 kill)。
+
+    POSIX: 每次 killpg(SIGTERM / 宽限后 SIGKILL)前都重新枚举并复核组
+    成员身份——组存在性不是归属证明;复核失败立即返回,不发任何信号,
+    由调用方的幸存复查失败关闭(exit_unconfirmed / survivors_remaining)。
+    """
     if os.name != "nt":
+        pgid = identity.process_group_id
+        if not _posix_recorded_group_members(identity):
+            logger.warning(
+                "refusing to signal process group %d: membership no longer "
+                "verifiably bound to the recorded tree",
+                pgid,
+            )
+            return
         try:
-            os.killpg(identity.process_group_id, signal.SIGTERM)
+            os.killpg(pgid, signal.SIGTERM)
         except OSError as exc:
             logger.warning(
-                "killpg(%d, SIGTERM) for survivors failed: %s",
-                identity.process_group_id,
-                exc,
+                "killpg(%d, SIGTERM) for survivors failed: %s", pgid, exc,
             )
             return
         deadline = time.monotonic() + max(grace_seconds, 0)
         while time.monotonic() < deadline:
             try:
-                os.killpg(identity.process_group_id, 0)
+                os.killpg(pgid, 0)
             except OSError:
                 return
             time.sleep(0.05)
+        if not _posix_recorded_group_members(identity):
+            logger.warning(
+                "refusing to SIGKILL process group %d: membership changed "
+                "during grace wait",
+                pgid,
+            )
+            return
         try:
             os.killpg(
-                identity.process_group_id,
+                pgid,
                 getattr(signal, "SIGKILL", signal.SIGTERM),
             )
         except OSError as exc:
             logger.warning(
-                "killpg(%d, SIGKILL) for survivors failed: %s",
-                identity.process_group_id,
-                exc,
+                "killpg(%d, SIGKILL) for survivors failed: %s", pgid, exc,
             )
         return
     expected_cwd = _normalize_path(identity.cwd)

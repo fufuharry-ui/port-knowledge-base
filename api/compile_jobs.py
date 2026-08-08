@@ -16,8 +16,9 @@
 - 超时顺序固定: Manifest=ROLLBACKING(reason=timeout)→ 终止进程树
   → 等待宽限 → 强制终止 → 确认退出 → 回滚;无法确认退出时失败关闭,
   readiness 进入 recovery_required,绝不回滚、绝不写文档终态;
-- 后台任务绝不抛出: 未知 job 只记录日志;任何无法证明一致性的基础设施
-  失败进入 recovery_required 并返回。
+- 后台任务绝不抛出: 非法 job id 只记录日志;well-formed job 但事务目录
+  丢失按证据丢失失败关闭(recovery_required);任何无法证明一致性的
+  基础设施失败进入 recovery_required 并返回。
 
 Manifest failure 字段与 raw meta 错误信息一律先经 sanitize_compile_error
 脱敏;绝不写入原始 stderr/stdout 或密钥。
@@ -672,11 +673,21 @@ def _execute_compile_job(
     readiness: ServiceReadiness,
 ) -> None:
     if not _SAFE_JOB_ID.match(job_id) or ".." in job_id:
+        # 非法 job id 绝不可能来自合法调度: 只记录日志,readiness 不变。
         logger.warning("compile task rejected unsafe job id %r; ignoring", job_id)
         return
     job_dir = Path(config.transaction_dir) / job_id
     if not job_dir.is_dir():
-        logger.warning("compile task for unknown job %s; ignoring", job_id)
+        # Codex R3 P2-3: well-formed job_id 但事务目录丢失 = 已接受任务丢失
+        # 耐久证据(完整性失败)。静默返回会让文档永远停留 compiling 而服务
+        # 保持 ready(仅重启可发现孤儿);必须失败关闭,保留全部证据,
+        # 绝不伪造终态、绝不删除数据。
+        logger.error(
+            "accepted compile job %s lost its transaction directory; "
+            "marking recovery_required",
+            job_id,
+        )
+        readiness.mark_recovery_required("transaction_evidence_missing")
         return
     try:
         manifest = load_manifest(job_dir)
@@ -723,7 +734,9 @@ def run_compile_task(
 ) -> None:
     """以 job_id 为输入的事务化编译后台任务;绝不抛出。
 
-    - 未知 job: 记录日志并返回,readiness 不变;
+    - 非法 job id(正则拒绝): 只记录日志,readiness 不变;
+    - well-formed job 但事务目录丢失: 已接受任务丢失耐久证据,按完整性
+      失败进入 recovery_required(transaction_evidence_missing);
     - 非 SCHEDULED: 按恢复库语义处理,绝不重新执行;
     - 任何无法证明一致性的基础设施失败: readiness 进入
       recovery_required,失败关闭。

@@ -50,6 +50,7 @@ from api.compile_transactions import (
 )
 from api.durable_fs import (
     durable_stream_to_file,
+    durable_unlink,
     durable_write_bytes,
     durable_write_yaml,
 )
@@ -414,7 +415,9 @@ def rollback_published_intake(
             continue
         try:
             if target.is_file() or target.is_symlink():
-                target.unlink()
+                # 耐久删除(POSIX 父目录 fsync): 掉电不得在恢复完成后复活
+                # 已撤销的发布文件;fsync 失败按删除失败失败关闭。
+                durable_unlink(target)
             elif target.exists():
                 failures.append(str(relative_path))
         except OSError:

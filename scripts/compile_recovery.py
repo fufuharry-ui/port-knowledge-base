@@ -8,6 +8,8 @@
     python -m scripts.compile_recovery cleanup-terminal --base-dir .
 
 - recover 与 cleanup-terminal 先获取 ApiInstanceLock;
+- recover 在锁内重扫全部事务目录: 存在其他活动事务或其他 Manifest
+  不可读时拒绝恢复(失败关闭,绝不猜测恢复顺序);
 - inspect 与 verify 保持只读,但报告实例锁当前是否被持有;
 - 恢复、验证与清理全部复用 api.compile_transactions 的恢复引擎,
   不存在 force-delete / ignore-checksum / skip-process-check /
@@ -181,6 +183,30 @@ def _cmd_recover(base_dir: Path, config, job_id: str) -> int:
     if lock is None:
         return 1
     try:
+        # Codex R3 P1-2: 恢复目标前重扫全部事务目录——存在其他活动事务
+        # (目标自身除外)时拒绝恢复: 另一事务的遗留编译进程可能仍在写共享
+        # 产物,此时回滚会与残留写入交错;绝不猜测恢复顺序。其他目录的
+        # Manifest 不可读同样失败关闭(无法证明无其他活动事务)。
+        other_active: list[str] = []
+        for other_dir in list_transaction_dirs(config):
+            try:
+                other = load_manifest(other_dir)
+            except ManifestIntegrityError:
+                print(
+                    f"refusing to recover {job_dir.name}: another transaction "
+                    "manifest is unreadable; run inspect and resolve it first"
+                )
+                return 1
+            if other.state in ACTIVE_STATES and other.job_id != job_id:
+                other_active.append(other.job_id)
+        if other_active:
+            print(
+                f"refusing to recover {job_dir.name}: other active "
+                "transactions exist: "
+                + ", ".join(sorted(other_active))
+                + "; run inspect and recover them first"
+            )
+            return 1
         result = recover_transaction(
             base_dir,
             config,

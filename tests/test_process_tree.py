@@ -515,9 +515,11 @@ def test_already_gone_survivor_check_error_is_uncertain(monkeypatch):
 
 
 def test_already_gone_posix_group_alive_terminates_group(monkeypatch):
-    """F6(POSIX 分支): 根进程退出但进程组仍存活 → SIGTERM 终止组,
-    组消失后才允许 already_gone。"""
+    """F6(POSIX 分支)+ Codex R3 P1-3: 根进程退出但进程组仍存活,且全部
+    组成员经指纹 + cwd 复核属于记录树 → SIGTERM 终止组,组消失后才允许
+    already_gone。"""
     identity = _fake_identity(pid=424245)
+    member = _survivor_fake(434345, identity)
     calls = []
 
     def fake_killpg(pgid, sig):
@@ -529,6 +531,15 @@ def test_already_gone_posix_group_alive_terminates_group(monkeypatch):
 
     monkeypatch.setattr(os, "name", "posix")
     monkeypatch.setattr(os, "killpg", fake_killpg, raising=False)
+    monkeypatch.setattr(
+        os,
+        "getpgid",
+        lambda pid: (
+            identity.process_group_id if pid == member.pid else pid + 10**9
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(psutil, "process_iter", lambda: [member])
     monkeypatch.setattr(
         psutil,
         "Process",
@@ -579,3 +590,152 @@ def test_already_gone_posix_group_check_error_is_uncertain(monkeypatch):
 
     assert result.status != "already_gone"
     assert not result.success
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 3 (P1-3): POSIX 进程组在发信号前必须绑定记录树身份——
+# 组存在性(killpg 0)不是归属证明;PGID 复用或损坏(但可解析)的 Manifest
+# 携带的正 PGID 绝不允许误杀无关进程组(防误杀优先于自动恢复)。
+# ---------------------------------------------------------------------------
+
+
+def _posix_group_member(pid, identity, cmdline=None):
+    """属于记录进程组的伪成员进程;默认与记录树指纹 + cwd 匹配。"""
+    return _FakeProcess(
+        pid=pid,
+        create_time=identity.create_time,
+        executable=identity.executable,
+        cwd=identity.cwd,
+        cmdline=(
+            cmdline
+            if cmdline is not None
+            else ["python", "-m", "scripts.compile", "doc_1"]
+        ),
+    )
+
+
+def _install_posix_probe(monkeypatch, identity, signals, alive=True):
+    """安装 killpg 探活替身: alive=True 时 sig=0 成功,否则 ProcessLookupError。"""
+    def fake_killpg(pgid, sig):
+        signals.append(sig)
+        if sig == 0 and not alive:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(os, "killpg", fake_killpg, raising=False)
+    monkeypatch.setattr(
+        psutil,
+        "Process",
+        Mock(side_effect=psutil.NoSuchProcess(identity.pid)),
+    )
+
+
+def test_already_gone_posix_member_fingerprint_mismatch_never_signaled(monkeypatch):
+    """P1-3(a): 组存活但成员指纹不匹配 → 绝不 SIGTERM/SIGKILL,
+    exit_unconfirmed(失败关闭),绝非 already_gone。"""
+    identity = _fake_identity(pid=424245)
+    member = _posix_group_member(
+        434345, identity, cmdline=["/usr/bin/python3", "-m", "scripts.compile", "doc_2"]
+    )
+    signals = []
+    _install_posix_probe(monkeypatch, identity, signals)
+    monkeypatch.setattr(
+        os, "getpgid", lambda pid: identity.process_group_id, raising=False
+    )
+    monkeypatch.setattr(psutil, "process_iter", lambda: [member])
+
+    result = terminate_process_tree(identity, grace_seconds=1)
+
+    assert result.status == "exit_unconfirmed"
+    assert not result.success
+    # 除探活(0)外绝不发送任何信号
+    assert all(sig == 0 for sig in signals)
+
+
+def test_already_gone_posix_pgid_reuse_by_unrelated_group_never_killed(monkeypatch):
+    """P1-3(c): PGID 被无关进程组复用(成员与记录树毫无关系)→ 绝不 kill。"""
+    identity = _fake_identity(pid=424245)
+    member = _posix_group_member(
+        434345, identity, cmdline=["/usr/sbin/cron", "-f"]
+    )
+    signals = []
+    _install_posix_probe(monkeypatch, identity, signals)
+    monkeypatch.setattr(
+        os, "getpgid", lambda pid: identity.process_group_id, raising=False
+    )
+    monkeypatch.setattr(psutil, "process_iter", lambda: [member])
+
+    result = terminate_process_tree(identity, grace_seconds=1)
+
+    assert result.status == "exit_unconfirmed"
+    assert all(sig == 0 for sig in signals)
+
+
+def test_already_gone_posix_membership_flip_before_signal_never_kills(monkeypatch):
+    """P1-3(e): 幸存确认与发信号之间组成员翻转(第二次复核不再匹配)→
+    SIGTERM/SIGKILL 均不得发出,exit_unconfirmed(失败关闭)。"""
+    identity = _fake_identity(pid=424245)
+    matching = _posix_group_member(434345, identity)
+    foreign = _posix_group_member(
+        434346, identity, cmdline=["/usr/bin/python3", "-m", "http.server"]
+    )
+    scans = [[matching], [foreign], [foreign]]
+    signals = []
+    _install_posix_probe(monkeypatch, identity, signals)
+    monkeypatch.setattr(
+        os, "getpgid", lambda pid: identity.process_group_id, raising=False
+    )
+    monkeypatch.setattr(
+        psutil,
+        "process_iter",
+        lambda: scans.pop(0) if scans else [foreign],
+    )
+
+    result = terminate_process_tree(identity, grace_seconds=1)
+
+    assert result.status == "exit_unconfirmed"
+    assert not result.success
+    assert all(sig == 0 for sig in signals)
+
+
+def test_already_gone_posix_probe_permission_error_fails_closed(monkeypatch):
+    """P1-3: killpg 探活 PermissionError(组属于其他用户)→ 无法证明归属,
+    绝不发信号,exit_unconfirmed(失败关闭)。"""
+    identity = _fake_identity(pid=424245)
+    signals = []
+
+    def fake_killpg(pgid, sig):
+        signals.append(sig)
+        raise PermissionError("group owned by another user")
+
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(os, "killpg", fake_killpg, raising=False)
+    monkeypatch.setattr(
+        psutil,
+        "Process",
+        Mock(side_effect=psutil.NoSuchProcess(identity.pid)),
+    )
+
+    result = terminate_process_tree(identity, grace_seconds=1)
+
+    assert result.status == "exit_unconfirmed"
+    assert not result.success
+    assert all(sig == 0 for sig in signals)
+
+
+def test_already_gone_posix_group_without_members_returns_already_gone(monkeypatch):
+    """P1-3: killpg 探活成功但枚举不到任何成员(竞态: 成员刚好全部退出)
+    → 视为组已消失,already_gone,不发信号。"""
+    identity = _fake_identity(pid=424245)
+    signals = []
+    _install_posix_probe(monkeypatch, identity, signals)
+    monkeypatch.setattr(
+        os, "getpgid", lambda pid: identity.process_group_id, raising=False
+    )
+    monkeypatch.setattr(psutil, "process_iter", lambda: [])
+
+    result = terminate_process_tree(identity, grace_seconds=1)
+
+    assert result.status == "already_gone"
+    assert result.success
+    assert all(sig == 0 for sig in signals)

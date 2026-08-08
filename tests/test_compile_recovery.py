@@ -20,6 +20,7 @@ from api.compile_transactions import (
     TransactionState,
     cleanup_terminal_transactions,
     create_prepared_transaction,
+    list_transaction_dirs,
     load_manifest,
     recover_startup,
     recover_transaction,
@@ -709,7 +710,13 @@ def test_cleanup_directory_deletion_failure_is_warning_only(tmp_path, monkeypatc
     assert report.cleaned == []
     assert report.blockers == []
     assert any(manifest.job_id in warning for warning in report.warnings)
-    assert manifest.job_dir.exists()
+    # Codex R3 P2-1: 递归删除前先原子换名隔离——rmtree 失败时正式目录
+    # 已不存在,残留位于 .cleanup-* 隔离区(绝不半删除正式事务目录)。
+    assert not manifest.job_dir.exists()
+    residue = (
+        runtime_config(tmp_path).transaction_dir / f".cleanup-{manifest.job_id}"
+    )
+    assert residue.is_dir()
 
 
 def test_cleanup_blocks_on_unreadable_manifest_without_deleting(tmp_path):
@@ -796,6 +803,66 @@ def test_cli_cleanup_terminal(tmp_path, capsys):
 def test_cli_rejects_unsafe_job_id(tmp_path, capsys):
     exit_code = cli_main(["verify", "../escape", "--base-dir", str(tmp_path)])
     assert exit_code == 1
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 3 (P1-2): CLI recover 在持有实例锁后、恢复目标前必须重扫全部
+# 事务目录——存在其他活动事务或其他 Manifest 不可读时拒绝恢复(失败关闭),
+# 绝不猜测恢复顺序;拒绝信息只含 job_id,不泄露绝对路径。
+# ---------------------------------------------------------------------------
+
+
+def test_cli_recover_refuses_when_other_transaction_active(tmp_path, capsys):
+    """P1-2: 目标活动 + 另一活动事务 → 拒绝恢复,两份 Manifest 与业务文件
+    全部字节不变。"""
+    target = scheduled_manifest(tmp_path)
+    other = make_prepared(tmp_path)
+    target_bytes = (target.job_dir / "manifest.yaml").read_bytes()
+    other_bytes = (other.job_dir / "manifest.yaml").read_bytes()
+    before = hash_tree(tmp_path)
+
+    exit_code = cli_main(["recover", target.job_id, "--base-dir", str(tmp_path)])
+
+    assert exit_code == 1
+    out = capsys.readouterr().out
+    assert "refus" in out
+    assert other.job_id in out
+    # 拒绝信息不得包含绝对路径
+    assert str(tmp_path) not in out
+    assert (target.job_dir / "manifest.yaml").read_bytes() == target_bytes
+    assert (other.job_dir / "manifest.yaml").read_bytes() == other_bytes
+    assert hash_tree(tmp_path) == before
+
+
+def test_cli_recover_refuses_terminal_target_when_other_active(tmp_path, capsys):
+    """P1-2: 目标已终态但另一事务活动 → 同样拒绝(绝不猜测恢复顺序)。"""
+    target = committed_manifest(tmp_path)
+    other = make_prepared(tmp_path)
+
+    exit_code = cli_main(["recover", target.job_id, "--base-dir", str(tmp_path)])
+
+    assert exit_code == 1
+    assert "refus" in capsys.readouterr().out
+    assert load_manifest(target.job_dir).state is COMMITTED
+    assert load_manifest(other.job_dir).state is PREPARED
+
+
+def test_cli_recover_refuses_when_other_manifest_unreadable(tmp_path, capsys):
+    """P1-2: 另一事务目录 Manifest 损坏 → 失败关闭,拒绝恢复目标。"""
+    target = scheduled_manifest(tmp_path)
+    other = make_prepared(tmp_path)
+    (other.job_dir / "manifest.yaml").write_text("{{{{", encoding="utf-8")
+    target_bytes = (target.job_dir / "manifest.yaml").read_bytes()
+    before = hash_tree(tmp_path)
+
+    exit_code = cli_main(["recover", target.job_id, "--base-dir", str(tmp_path)])
+
+    assert exit_code == 1
+    out = capsys.readouterr().out
+    assert "refus" in out
+    assert str(tmp_path) not in out
+    assert (target.job_dir / "manifest.yaml").read_bytes() == target_bytes
+    assert hash_tree(tmp_path) == before
 
 
 # ---------------------------------------------------------------------------
@@ -1072,8 +1139,8 @@ def test_recovery_never_signals_nonpositive_recorded_identity(
 
 
 def test_cleanup_deletion_failure_marks_cleanup_verified(tmp_path, monkeypatch):
-    """N6: 验证通过但 rmtree 失败 → warning 不变,且 Manifest 耐久记录
-    cleanup_verified=True。"""
+    """N6: 验证通过但删除失败 → warning 不变,且 Manifest 耐久记录
+    cleanup_verified=True(P2-1 后证据随目录一起进入 .cleanup-* 隔离区)。"""
     manifest = committed_manifest(tmp_path)
     import api.compile_transactions as transactions
 
@@ -1085,9 +1152,12 @@ def test_cleanup_deletion_failure_marks_cleanup_verified(tmp_path, monkeypatch):
     assert report.cleaned == []
     assert report.blockers == []
     assert any(manifest.job_id in warning for warning in report.warnings)
-    assert manifest.job_dir.exists()
+    assert not manifest.job_dir.exists()
+    residue = (
+        runtime_config(tmp_path).transaction_dir / f".cleanup-{manifest.job_id}"
+    )
     data = yaml.safe_load(
-        (manifest.job_dir / "manifest.yaml").read_text(encoding="utf-8")
+        (residue / "manifest.yaml").read_text(encoding="utf-8")
     )
     assert data["cleanup_verified"] is True
 
@@ -1095,9 +1165,9 @@ def test_cleanup_deletion_failure_marks_cleanup_verified(tmp_path, monkeypatch):
 def test_cleanup_verified_terminal_deletion_retry_never_reverifies(
     tmp_path, monkeypatch
 ):
-    """N6 核心: ROLLED_BACK 目录删除失败后,后续合法编译改变了共享产物;
-    下一次清理必须只重试删除、绝不重新内容验证(旧行为把合法变化误判为
-    损坏并阻断启动)。"""
+    """N6 核心(P2-1 语义): ROLLED_BACK 目录隔离换名失败后,后续合法编译
+    改变了共享产物;下一次清理必须只重试删除、绝不重新内容验证(旧行为把
+    合法变化误判为损坏并阻断启动)。"""
     manifest = scheduled_manifest(tmp_path)
     result = recover_transaction(
         tmp_path, runtime_config(tmp_path), manifest.job_dir,
@@ -1107,14 +1177,21 @@ def test_cleanup_verified_terminal_deletion_retry_never_reverifies(
 
     import api.compile_transactions as transactions
 
-    def boom(path, *args, **kwargs):
-        raise OSError("simulated rmtree failure")
+    real_replace = transactions.os.replace
 
-    monkeypatch.setattr(transactions.shutil, "rmtree", boom)
+    def flaky_replace(src, dst):
+        # 只拦截事务目录的隔离换名;耐久写入的临时文件 replace 不受影响
+        if Path(src).name == manifest.job_id:
+            raise OSError("simulated quarantine rename failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(transactions.os, "replace", flaky_replace)
     first = cleanup_terminal_transactions(tmp_path, runtime_config(tmp_path))
     assert first.blockers == []
+    assert first.cleaned == []
     assert any(manifest.job_id in warning for warning in first.warnings)
     monkeypatch.undo()
+    assert manifest.job_dir.exists()
     assert load_manifest(manifest.job_dir).cleanup_verified is True
 
     # 模拟后续合法编译改变共享产物(与事务前 SHA 不再一致)
@@ -1143,3 +1220,278 @@ def test_cleanup_unverified_terminal_still_verifies_before_deletion(tmp_path):
         (manifest.job_dir / "manifest.yaml").read_text(encoding="utf-8")
     )
     assert data.get("cleanup_verified") is not True
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 3 (P1-1): 回滚删除必须经 durable_unlink 耐久化(POSIX 父目录
+# fsync),且全部删除先于 Manifest 的 ROLLED_BACK 提交点;删除失败失败关闭。
+# ---------------------------------------------------------------------------
+
+
+def _scheduled_upload_with_new_artifacts(tmp_path):
+    """上传事务 SCHEDULED 现场: 本轮已发布 original/raw + 本轮新建产物。"""
+    intake = PublishedIntake(
+        original_path="originals/example.pdf",
+        raw_text_path=f"raw/{DOC_ID}.txt",
+        raw_meta_path=f"raw/{DOC_ID}.meta.yaml",
+        published=True,
+    )
+    manifest = make_prepared(
+        tmp_path, seed=False, kind=TransactionKind.UPLOAD,
+        previous_meta={"id": DOC_ID, "status": "raw"},
+        published_intake=intake,
+    )
+    for stored in (intake.original_path, intake.raw_text_path, intake.raw_meta_path):
+        target = tmp_path / stored
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"published::" + stored.encode("utf-8"))
+    summary = tmp_path / "wiki" / f"{DOC_ID}.summary.yaml"
+    summary.parent.mkdir(parents=True, exist_ok=True)
+    summary.write_bytes(b"partial-summary")
+    write_doc_meta(tmp_path, DOC_ID, {
+        "id": DOC_ID, "status": "compiling", "compile_job_id": manifest.job_id,
+    })
+    transition_manifest(manifest.job_dir, expected=PREPARED, target=SCHEDULED,
+                        scheduled_at="2026-08-06T14:30:01+00:00")
+    return load_manifest(manifest.job_dir)
+
+
+def test_rollback_deletions_are_durable_and_precede_rolled_back(
+    tmp_path, monkeypatch
+):
+    """P1-1: 回滚路径上每个业务文件删除都经 durable_unlink(耐久删除原语),
+    且全部删除严格先于 ROLLED_BACK 原子提交点。"""
+    manifest = _scheduled_upload_with_new_artifacts(tmp_path)
+    import api.compile_transactions as transactions
+    from api.durable_fs import durable_unlink as real_unlink
+
+    events = []
+
+    def spy_unlink(path):
+        events.append(("unlink", Path(path).name))
+        return real_unlink(path)
+
+    real_transition = transactions.transition_manifest
+
+    def spy_transition(job_dir, expected, target, **changes):
+        events.append(("transition", target))
+        return real_transition(job_dir, expected, target, **changes)
+
+    monkeypatch.setattr(transactions, "durable_unlink", spy_unlink)
+    monkeypatch.setattr(transactions, "transition_manifest", spy_transition)
+
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+    assert result.completed is True
+    deleted = {
+        name for kind, name in events if kind == "unlink"
+    }
+    assert deleted == {
+        f"{DOC_ID}.summary.yaml",
+        "example.pdf",
+        f"{DOC_ID}.txt",
+        f"{DOC_ID}.meta.yaml",
+    }
+    rolled_back_at = next(
+        index for index, event in enumerate(events)
+        if event == ("transition", ROLLED_BACK)
+    )
+    assert all(
+        index < rolled_back_at
+        for index, event in enumerate(events)
+        if event[0] == "unlink"
+    )
+
+
+def test_rollback_unlink_failure_blocks_and_stays_rollbacking(tmp_path, monkeypatch):
+    """P1-1: 删除(含父目录 fsync)失败一律按删除失败处理: 恢复阻断、
+    保持 ROLLBACKING 证据,绝不进入 ROLLED_BACK。"""
+    manifest = make_prepared(tmp_path, seed=False)
+    write_doc_meta(tmp_path, DOC_ID, {
+        "id": DOC_ID, "status": "compiling", "compile_job_id": manifest.job_id,
+    })
+    index = tmp_path / "wiki" / "index.yaml"
+    index.parent.mkdir(parents=True)
+    index.write_bytes(b"garbage")
+    transition_manifest(
+        manifest.job_dir, expected=PREPARED, target=ROLLBACKING,
+        failure={"original_code": "interrupted", "original_message": "restart"},
+    )
+
+    import api.compile_transactions as transactions
+
+    def boom(path):
+        raise OSError("simulated parent fsync failure")
+
+    monkeypatch.setattr(transactions, "durable_unlink", boom)
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+    assert result.blocked is True
+    assert "wiki/index.yaml" in result.failed_paths
+    reloaded = load_manifest(manifest.job_dir)
+    assert reloaded.state is ROLLBACKING
+    assert "wiki/index.yaml" in reloaded.recovery["failed_paths"]
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 3 (P2-1): 终态清理必须先原子换名 .cleanup-* 隔离区(POSIX
+# 父目录 fsync)再递归删除——rmtree 半失败绝不留下损坏的正式事务目录
+# (否则下次启动把半删除现场误判为 manifest-integrity blocker)。
+# ---------------------------------------------------------------------------
+
+
+def test_cleanup_quarantines_verified_terminal_before_recursive_delete(
+    tmp_path, monkeypatch
+):
+    """P2-1(a): 验证通过的终态目录按 rename → 父目录 fsync → rmtree 顺序
+    清理;清理完成后事务根无任何残留。"""
+    manifest = committed_manifest(tmp_path)
+    config = runtime_config(tmp_path)
+    import api.compile_transactions as transactions
+
+    events = []
+    real_replace = transactions.os.replace
+
+    def spy_replace(src, dst):
+        events.append(("replace", Path(src).name, Path(dst).name))
+        return real_replace(src, dst)
+
+    real_fsync_parent = transactions.fsync_parent_directory
+
+    def spy_fsync_parent(path):
+        events.append(("fsync_parent", Path(path).name))
+        return real_fsync_parent(path)
+
+    real_rmtree = transactions.shutil.rmtree
+
+    def spy_rmtree(path, *args, **kwargs):
+        events.append(("rmtree", Path(path).name))
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(transactions.os, "replace", spy_replace)
+    monkeypatch.setattr(transactions, "fsync_parent_directory", spy_fsync_parent)
+    monkeypatch.setattr(transactions.shutil, "rmtree", spy_rmtree)
+
+    report = cleanup_terminal_transactions(tmp_path, config)
+
+    assert report.cleaned == [manifest.job_id]
+    assert report.blockers == []
+    quarantine_name = f".cleanup-{manifest.job_id}"
+    rename_idx = next(
+        index for index, event in enumerate(events)
+        if event == ("replace", manifest.job_id, quarantine_name)
+    )
+    fsync_idx = next(
+        index for index, event in enumerate(events)
+        if event == ("fsync_parent", quarantine_name)
+    )
+    rmtree_idx = next(
+        index for index, event in enumerate(events)
+        if event == ("rmtree", quarantine_name)
+    )
+    assert rename_idx < fsync_idx < rmtree_idx
+    assert not manifest.job_dir.exists()
+    assert list(config.transaction_dir.iterdir()) == []
+
+
+def test_cleanup_partial_rmtree_failure_leaves_quarantine_residue_not_blocker(
+    tmp_path, monkeypatch
+):
+    """P2-1(b): rmtree 在 manifest 删除后失败 → 残留位于 .cleanup-*,
+    list_transaction_dirs 排除它,下次启动 ready 并 best-effort 重试清除。"""
+    manifest = committed_manifest(tmp_path)
+    config = runtime_config(tmp_path)
+    import api.compile_transactions as transactions
+
+    real_rmtree = transactions.shutil.rmtree
+
+    def partial_rmtree(path, *args, **kwargs):
+        target = Path(path)
+        inner = target / "manifest.yaml"
+        if target.name.startswith(".cleanup-") and inner.exists():
+            # 模拟半删除现场: manifest 已删,目录与其他内容残留
+            inner.unlink()
+            raise OSError("simulated rmtree failure after manifest deletion")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(transactions.shutil, "rmtree", partial_rmtree)
+    report = cleanup_terminal_transactions(tmp_path, config)
+    assert report.cleaned == []
+    assert report.blockers == []
+    assert any(manifest.job_id in warning for warning in report.warnings)
+    residue = config.transaction_dir / f".cleanup-{manifest.job_id}"
+    assert residue.is_dir()
+    assert not manifest.job_dir.exists()
+    monkeypatch.undo()
+
+    # 半删除残留绝不被当作损坏事务: 不被识别为事务目录,启动 ready
+    assert list_transaction_dirs(config) == []
+    startup = recover_startup(tmp_path, config)
+    assert startup.ready is True, startup
+    assert startup.blockers == []
+    assert not residue.exists()
+
+
+def test_cleanup_quarantine_rename_failure_keeps_verified_dir(tmp_path, monkeypatch):
+    """P2-1(c): 隔离换名失败 → 仅警告,已验证目录原样保留(下次重试),
+    证据 manifest 仍可严格加载。"""
+    manifest = committed_manifest(tmp_path)
+    import api.compile_transactions as transactions
+
+    real_replace = transactions.os.replace
+
+    def flaky_replace(src, dst):
+        if Path(src).name == manifest.job_id:
+            raise OSError("simulated rename failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(transactions.os, "replace", flaky_replace)
+    report = cleanup_terminal_transactions(tmp_path, runtime_config(tmp_path))
+
+    assert report.cleaned == []
+    assert report.blockers == []
+    assert any(manifest.job_id in warning for warning in report.warnings)
+    assert manifest.job_dir.exists()
+    assert load_manifest(manifest.job_dir).cleanup_verified is True
+
+
+def test_startup_recovery_cleans_committed_via_quarantine_without_residue(tmp_path):
+    """P2-1(d): 启动恢复端到端——COMMITTED 经隔离清理,无 blocker 无残留。"""
+    manifest = committed_manifest(tmp_path)
+    config = runtime_config(tmp_path)
+    report = recover_startup(tmp_path, config)
+    assert report.ready is True
+    assert report.blockers == []
+    assert manifest.job_id in report.cleaned
+    assert not manifest.job_dir.exists()
+    assert list(config.transaction_dir.iterdir()) == []
+
+
+def test_prepared_unbound_recovery_completes_when_quarantine_rmtree_fails(
+    tmp_path, monkeypatch
+):
+    """P2-1(e): PREPARED 未绑定清理——隔离换名成功后,隔离区 rmtree 失败
+    绝不阻断恢复完成(仅警告),残留由启动清理重试。"""
+    manifest = make_prepared(tmp_path)
+    write_doc_meta(tmp_path, DOC_ID, {"id": DOC_ID, "status": "compiled"})
+    import api.compile_transactions as transactions
+
+    def boom(path, *args, **kwargs):
+        raise OSError("simulated quarantine rmtree failure")
+
+    monkeypatch.setattr(transactions.shutil, "rmtree", boom)
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+    assert result.completed is True
+    assert result.reason == "prepared_unbound_cleaned"
+    assert not manifest.job_dir.exists()
+    residue = (
+        runtime_config(tmp_path).transaction_dir / f".cleanup-{manifest.job_id}"
+    )
+    assert residue.is_dir()

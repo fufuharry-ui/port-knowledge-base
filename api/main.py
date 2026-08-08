@@ -885,6 +885,9 @@ def _remove_doc_exclusively(doc_id: str, runtime: AppRuntime | None) -> dict:
     存在任一活动 Manifest(PREPARED/SCHEDULED/RUNNING/ROLLBACKING)同样拒绝
     ——同文档 409 compile_in_progress,其他文档 409 knowledge_base_busy——
     封住调度窗口与恢复窗口。runtime 缺失时 fail-closed(生产路径门禁已 503)。
+    Codex R3 P2-2:锁内必须重检 readiness——门禁通过与锁获取之间后台编译
+    线程可能已把 readiness 翻转为 recovery_required,此时删除会改写正是
+    验证失败来源的产物(TOCTOU);与 _schedule_compile 同一模式 fail-closed。
     """
     if runtime is None:
         logger.error("delete %s rejected: runtime absent", doc_id)
@@ -896,6 +899,12 @@ def _remove_doc_exclusively(doc_id: str, runtime: AppRuntime | None) -> dict:
                 detail={"code": "knowledge_base_busy"},
             )
         try:
+            try:
+                runtime.readiness.require_ready()
+            except RuntimeError:
+                raise HTTPException(
+                    status_code=503, detail={"code": "recovery_required"}
+                ) from None
             active = _list_active_manifests_guarded(runtime)
             if active:
                 same_doc = any(manifest.doc_id == doc_id for manifest in active)

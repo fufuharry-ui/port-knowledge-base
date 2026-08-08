@@ -456,6 +456,62 @@ def test_delete_holds_both_locks_while_removing(tmp_path, monkeypatch):
     assert not COMPILE_EXECUTION_LOCK.locked()
 
 
+# ─── Codex Round 3 (P2-2):删除 readiness TOCTOU ─────────────────────────────
+
+def test_delete_gated_returns_recovery_required(managed_client):
+    """P2-2: readiness 进入 recovery_required 时,删除 503(精确响应体),
+    remove_doc 绝不被调用。"""
+    _repo_runtime(managed_client).readiness.mark_recovery_required("rollback_failed")
+    with patch("scripts.doc_admin.remove_doc") as mock_remove:
+        response = managed_client.delete("/api/v1/docs/doc_1")
+    assert response.status_code == 503
+    assert response.json() == {"detail": {"code": "recovery_required"}}
+    mock_remove.assert_not_called()
+
+
+def test_remove_doc_exclusively_rechecks_readiness_inside_locks(tmp_path, monkeypatch):
+    """P2-2 核心: 门禁通过后、锁内 readiness 已翻转为 recovery_required
+    (后台编译线程在窗口内标记)→ 删除必须 503 recovery_required,
+    remove_doc 绝不被调用,两把锁均正确释放(封住 TOCTOU 窗口)。"""
+    import api.main as api_mod
+    from api.compile_jobs import COMPILE_EXECUTION_LOCK
+    from api.runtime_guard import ServiceReadiness, load_compile_runtime_config
+    from fastapi import HTTPException
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    doc_id = "doc_20260806_060"
+    (raw / f"{doc_id}.meta.yaml").write_text(
+        yaml.safe_dump({"id": doc_id, "status": "compiled"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(api_mod, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(api_mod, "RAW_DIR", raw)
+
+    readiness = ServiceReadiness()
+    readiness.mark_recovery_required("rollback_failed")
+    runtime = api_mod.AppRuntime(
+        config=load_compile_runtime_config(tmp_path, env={}),
+        readiness=readiness,
+        instance_lock=None,
+        resolved_base=tmp_path,
+    )
+    remove_calls = []
+    monkeypatch.setattr(
+        "scripts.doc_admin.remove_doc",
+        lambda *args, **kwargs: remove_calls.append(args) or {"removed": True},
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        api_mod._remove_doc_exclusively(doc_id, runtime)
+
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.detail == {"code": "recovery_required"}
+    assert remove_calls == []
+    assert not api_mod.COMPILE_SCHEDULE_LOCK.locked()
+    assert not COMPILE_EXECUTION_LOCK.locked()
+
+
 def test_document_catalog_never_exposes_backend_error_message(tmp_path, monkeypatch):
     """E004-FIX-02:公共 catalog 只投影 error_code,绝不返回 error_message;
     raw 元数据中的脱敏诊断信息必须保留供后端排查。"""

@@ -940,12 +940,26 @@ def test_run_compile_task_corrupt_manifest_marks_recovery_required(
 # ---------------------------------------------------------------------------
 
 
-def test_run_compile_task_unknown_job_returns_without_touching_readiness(tmp_path):
+def test_run_compile_task_missing_transaction_dir_marks_recovery_required(tmp_path):
+    """Codex R3 P2-3: well-formed job_id 但事务目录丢失 = 已接受任务丢失
+    耐久证据(完整性失败)→ readiness 进入 recovery_required
+    (transaction_evidence_missing),业务证据(meta)字节不变,绝不伪造
+    终态、绝不静默返回。"""
+    seed_compiled_business_tree(tmp_path)
+    job_id = "20260806T120000000000Z-deadbeef"
+    write_doc_meta(tmp_path, DOC_ID, {
+        "id": DOC_ID, "status": "compiling", "compile_job_id": job_id,
+    })
+    meta_path = tmp_path / "raw" / f"{DOC_ID}.meta.yaml"
+    meta_before = meta_path.read_bytes()
+
     readiness = ServiceReadiness()
-    run_compile_task(
-        "no-such-job", tmp_path, runtime_config(tmp_path), readiness
-    )
-    assert readiness.snapshot() == ("ready", None)
+    run_compile_task(job_id, tmp_path, runtime_config(tmp_path), readiness)
+
+    mode, reason = readiness.snapshot()
+    assert mode == "recovery_required"
+    assert reason == "transaction_evidence_missing"
+    assert meta_path.read_bytes() == meta_before
 
 
 def test_run_compile_task_rejects_unsafe_job_id(tmp_path):

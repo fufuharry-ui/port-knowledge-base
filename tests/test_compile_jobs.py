@@ -1127,7 +1127,9 @@ def test_running_transition_failure_persists_recoverable_process_evidence(
         assert (tmp_path / rel).read_bytes() == payload
     meta = read_doc_meta(manifest.doc_id, tmp_path)
     assert meta["status"] == "error"
-    assert meta["error_code"] == "running_transition_failed"
+    # R4-P2-3: 内部码 running_transition_failed 映射为公开合同码
+    # compile_failed;Manifest 证据保留原始码(见上方 evidence 断言)。
+    assert meta["error_code"] == "compile_failed"
 
 
 def test_running_transition_failure_clean_exit_keeps_scheduled(

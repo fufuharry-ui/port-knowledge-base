@@ -865,6 +865,23 @@ def test_cli_recover_refuses_when_other_manifest_unreadable(tmp_path, capsys):
     assert hash_tree(tmp_path) == before
 
 
+def test_cli_inspect_excludes_active_docs_from_orphan_report(tmp_path, capsys):
+    """R4-P2-2: 携带合法活动事务的 compiling 文档只报 ACTIVE,不再重复报
+    orphan_compiling;真正孤立(无事务)的 compiling 文档仍报告。"""
+    manifest = scheduled_manifest(tmp_path)
+    orphan_id = "doc_20260806_099"
+    write_doc_meta(tmp_path, orphan_id, {"id": orphan_id, "status": "compiling"})
+
+    exit_code = cli_main(["inspect", "--base-dir", str(tmp_path)])
+
+    assert exit_code == 1
+    out = capsys.readouterr().out
+    assert f"transaction {manifest.job_id}" in out
+    assert "ACTIVE" in out
+    assert f"orphan_compiling: {DOC_ID}" not in out
+    assert f"orphan_compiling: {orphan_id}" in out
+
+
 # ---------------------------------------------------------------------------
 # Codex 修复(F3b):ROLLBACKING 携带进程记录时,恢复必须先验证并终止
 # 记录进程、确认记录树无幸存后代,才允许继续回滚
@@ -910,10 +927,15 @@ def test_rollbacking_with_recorded_process_terminates_before_restore(
     )
     assert result.completed is True
     assert calls == [("terminate", 4321)]
-    # 回滚完成: 原始失败原因保留,文档终态按原始原因
+    # 回滚完成: 原始失败原因保留在 Manifest(running_transition_failed),
+    # 文档终态按公开合同码(R4-P2-3: 内部码映射为 compile_failed)
     meta = read_meta(tmp_path, DOC_ID)
     assert meta["status"] == "error"
-    assert meta["error_code"] == "running_transition_failed"
+    assert meta["error_code"] == "compile_failed"
+    assert (
+        load_manifest(manifest.job_dir).failure["original_code"]
+        == "running_transition_failed"
+    )
     for record in manifest.artifacts:
         restored = (tmp_path / record.path).read_bytes()
         assert restored == (manifest.job_dir / record.snapshot).read_bytes()
@@ -1495,3 +1517,264 @@ def test_prepared_unbound_recovery_completes_when_quarantine_rmtree_fails(
         runtime_config(tmp_path).transaction_dir / f".cleanup-{manifest.job_id}"
     )
     assert residue.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 4 (R4-P1-1): spawn→RUNNING 身份窗口——服务在 spawn 之后、
+# RUNNING 持久化之前死亡时,Manifest 停留无进程记录的 SCHEDULED,孤儿编译器
+# 可能仍在写产物。SCHEDULED 回滚前必须扫描活进程(指纹 + cwd 匹配即阻断,
+# 绝不自动 kill);扫描失败同样失败关闭。
+# ---------------------------------------------------------------------------
+
+
+class _FakeLiveProc:
+    """最小活进程替身: 仅暴露 pid/cmdline()/cwd()。"""
+
+    def __init__(self, pid, cmdline, cwd):
+        self.pid = pid
+        self._cmdline = cmdline
+        self._cwd = cwd
+
+    def cmdline(self):
+        return self._cmdline
+
+    def cwd(self):
+        return self._cwd
+
+
+def test_scheduled_recovery_blocks_on_live_orphan_compiler(tmp_path, monkeypatch):
+    """R4-P1-1(a): SCHEDULED + 指纹与 cwd 均匹配的活进程 → 恢复阻断,
+    Manifest 保持 SCHEDULED,业务文件字节不变,reason 指出 pid 供运维定位。"""
+    manifest = scheduled_manifest(tmp_path)
+    import api.compile_transactions as transactions
+
+    orphan = _FakeLiveProc(
+        pid=55501,
+        cmdline=["python", "-m", "scripts.compile", DOC_ID],
+        cwd=str(tmp_path),
+    )
+    monkeypatch.setattr(transactions.psutil, "process_iter", lambda: [orphan])
+    before = hash_tree(tmp_path)
+
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+
+    assert result.blocked is True
+    assert "55501" in (result.reason or "")
+    assert load_manifest(manifest.job_dir).state is SCHEDULED
+    assert hash_tree(tmp_path) == before
+
+
+def test_scheduled_recovery_proceeds_when_match_has_different_cwd(
+    tmp_path, monkeypatch
+):
+    """R4-P1-1(b): 指纹匹配但 cwd 不同的活进程(其他知识库的编译)→
+    不属于本事务,正常回滚。"""
+    manifest = scheduled_manifest(tmp_path)
+    import api.compile_transactions as transactions
+
+    other = _FakeLiveProc(
+        pid=55502,
+        cmdline=["python", "-m", "scripts.compile", DOC_ID],
+        cwd="/elsewhere",
+    )
+    monkeypatch.setattr(transactions.psutil, "process_iter", lambda: [other])
+
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+    assert result.completed is True
+
+
+def test_scheduled_recovery_proceeds_without_matching_process(
+    tmp_path, monkeypatch
+):
+    """R4-P1-1(c): 无匹配活进程 → 正常回滚(既有行为不变)。"""
+    manifest = scheduled_manifest(tmp_path)
+    import api.compile_transactions as transactions
+
+    unrelated = _FakeLiveProc(
+        pid=55503, cmdline=["/usr/sbin/cron", "-f"], cwd=str(tmp_path)
+    )
+    monkeypatch.setattr(transactions.psutil, "process_iter", lambda: [unrelated])
+
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+    assert result.completed is True
+    assert read_meta(tmp_path, DOC_ID)["error_code"] == "interrupted"
+
+
+def test_scheduled_recovery_blocks_when_orphan_scan_fails(tmp_path, monkeypatch):
+    """R4-P1-1(d): 活进程扫描自身失败 → 失败关闭阻断,Manifest 保持
+    SCHEDULED,业务文件字节不变。"""
+    manifest = scheduled_manifest(tmp_path)
+    import api.compile_transactions as transactions
+
+    def boom():
+        raise transactions.psutil.Error("scan failed")
+
+    monkeypatch.setattr(transactions.psutil, "process_iter", boom)
+    before = hash_tree(tmp_path)
+
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+
+    assert result.blocked is True
+    assert load_manifest(manifest.job_dir).state is SCHEDULED
+    assert hash_tree(tmp_path) == before
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 4 (R4-P1-3): doc_admin 的终态 meta 写入只有文件级 fsync +
+# os.replace,无父目录 fsync;ROLLED_BACK 提交点前必须 fsync raw/ 父目录,
+# fsync 失败失败关闭(保持 ROLLBACKING 证据)。
+# ---------------------------------------------------------------------------
+
+
+def test_rollback_fsyncs_raw_parent_after_error_terminal_before_rolled_back(
+    tmp_path, monkeypatch
+):
+    """R4-P1-3: 错误终态 meta 写入之后、ROLLED_BACK 提交点之前必须
+    fsync raw/ 父目录(顺序可证)。"""
+    manifest = scheduled_manifest(tmp_path)
+    import api.compile_transactions as transactions
+
+    events = []
+    real_write_result = transactions.write_doc_compile_result
+
+    def spy_write_result(*args, **kwargs):
+        events.append(("meta_write",))
+        return real_write_result(*args, **kwargs)
+
+    real_fsync_parent = transactions.fsync_parent_directory
+
+    def spy_fsync_parent(path):
+        events.append(("fsync_parent", Path(path).parent.name, Path(path).name))
+        return real_fsync_parent(path)
+
+    real_transition = transactions.transition_manifest
+
+    def spy_transition(job_dir, expected, target, **changes):
+        events.append(("transition", target))
+        return real_transition(job_dir, expected, target, **changes)
+
+    monkeypatch.setattr(transactions, "write_doc_compile_result", spy_write_result)
+    monkeypatch.setattr(transactions, "fsync_parent_directory", spy_fsync_parent)
+    monkeypatch.setattr(transactions, "transition_manifest", spy_transition)
+
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+
+    assert result.completed is True
+    write_idx = next(i for i, e in enumerate(events) if e == ("meta_write",))
+    fsync_idx = next(
+        i for i, e in enumerate(events)
+        if e == ("fsync_parent", "raw", f"{DOC_ID}.meta.yaml")
+    )
+    rolled_back_idx = next(
+        i for i, e in enumerate(events) if e == ("transition", ROLLED_BACK)
+    )
+    assert write_idx < fsync_idx < rolled_back_idx
+
+
+def test_rollback_blocks_when_raw_parent_fsync_fails(tmp_path, monkeypatch):
+    """R4-P1-3: raw/ 父目录 fsync 失败 → 阻断,保持 ROLLBACKING,
+    meta 终态证据保留(绝不进入 ROLLED_BACK)。"""
+    manifest = scheduled_manifest(tmp_path)
+    import api.compile_transactions as transactions
+
+    def boom(path):
+        raise OSError("simulated parent fsync failure")
+
+    monkeypatch.setattr(transactions, "fsync_parent_directory", boom)
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+
+    assert result.blocked is True
+    reloaded = load_manifest(manifest.job_dir)
+    assert reloaded.state is ROLLBACKING
+    assert reloaded.recovery["failed_paths"]
+    meta = read_meta(tmp_path, DOC_ID)
+    assert meta["status"] == "error"
+    assert meta["error_code"] == "interrupted"
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 4 (R4-P2-3): 内部失败原因码(如 running_transition_failed)
+# 绝不直接进入公开 meta error_code(设计 §20.1 + 前端 DocumentCompileErrorCode
+# 合同);合同之外的内部码一律映射为 compile_failed,Manifest 保留原始码。
+# ---------------------------------------------------------------------------
+
+
+def _rollbacking_manifest_with_code(tmp_path, code):
+    manifest = scheduled_manifest(tmp_path)
+    return transition_manifest(
+        manifest.job_dir, expected=SCHEDULED, target=ROLLBACKING,
+        failure={"original_code": code, "original_message": "diag"},
+    )
+
+
+def test_rollback_maps_running_transition_failed_to_compile_failed(tmp_path):
+    """R4-P2-3: original_code=running_transition_failed 回滚后 meta
+    error_code 必须是公开合同码 compile_failed,终态验证通过,
+    Manifest 保留内部码供运维诊断。"""
+    manifest = _rollbacking_manifest_with_code(tmp_path, "running_transition_failed")
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+    assert result.completed is True
+    meta = read_meta(tmp_path, DOC_ID)
+    assert meta["status"] == "error"
+    assert meta["error_code"] == "compile_failed"
+    reloaded = load_manifest(manifest.job_dir)
+    assert reloaded.failure["original_code"] == "running_transition_failed"
+    verification = verify_terminal_transaction(tmp_path, reloaded)
+    assert verification.ok is True, verification.failures
+
+
+def test_rollback_unknown_internal_code_maps_to_compile_failed(tmp_path):
+    """R4-P2-3 结构性护栏: 任何合同之外的内部码(含未来新增)一律
+    compile_failed,绝不渗透公开合同。"""
+    manifest = _rollbacking_manifest_with_code(tmp_path, "future_internal_code")
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+    assert result.completed is True
+    assert read_meta(tmp_path, DOC_ID)["error_code"] == "compile_failed"
+    verification = verify_terminal_transaction(
+        tmp_path, load_manifest(manifest.job_dir)
+    )
+    assert verification.ok is True, verification.failures
+
+
+@pytest.mark.parametrize(
+    "public_code",
+    ["interrupted", "timeout", "compile_failed", "llm_configuration",
+     "service_unavailable", "document_processing", "rollback_failed"],
+)
+def test_rollback_public_contract_codes_pass_through(tmp_path, public_code):
+    """R4-P2-3: 公开合同集合内的错误码原样透传,终态验证通过。"""
+    manifest = _rollbacking_manifest_with_code(tmp_path, public_code)
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+    assert result.completed is True
+    assert read_meta(tmp_path, DOC_ID)["error_code"] == public_code
+    verification = verify_terminal_transaction(
+        tmp_path, load_manifest(manifest.job_dir)
+    )
+    assert verification.ok is True, verification.failures

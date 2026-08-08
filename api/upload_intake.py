@@ -301,6 +301,9 @@ def publish_upload_intake(
     - 每个目标按 intent-first 顺序: 先落 pending journal(耐久)→ 耐久
       发布目标 → 翻转 completed(耐久);任一时刻崩溃,journal 都覆盖
       已发布目标,绝不留下无归属文件;
+    - original 目标经 durable_stream_to_file 流式发布(1MB 分块 + 增量
+      sha256,R4-P1-2),绝不整文件读入内存;raw text/meta 为
+      PreparedIngest 内存对象,保持 bytes/yaml 原语;
     - 全部完成后经原子 Manifest 写入翻转 published_intake.published=True。
     """
     base_dir = Path(base_dir)
@@ -326,9 +329,8 @@ def publish_upload_intake(
             f"staged upload targets {expected!r}"
         )
 
-    original_payload = staged.staged_file.read_bytes()
     steps = (
-        (intake.original_path, "bytes", original_payload),
+        (intake.original_path, "stream", None),
         (intake.raw_text_path, "bytes", prepared.text_bytes),
         (intake.raw_meta_path, "yaml", prepared.meta),
     )
@@ -343,7 +345,12 @@ def publish_upload_intake(
                 f"intake publish target already exists: {relative_path}"
             )
         _append_journal_pending(manifest.job_dir, relative_path)
-        if mode == "bytes":
+        if mode == "stream":
+            # R4-P1-2: 原始文件流式发布(分块 + 增量 sha256),绝不整文件
+            # 读入内存;staging 文件以二进制流打开。
+            with open(staged.staged_file, "rb") as stream:
+                durable_stream_to_file(target, stream)
+        elif mode == "bytes":
             durable_write_bytes(target, payload)
         else:
             durable_write_yaml(target, payload)

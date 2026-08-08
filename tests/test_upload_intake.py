@@ -370,6 +370,57 @@ def test_rollback_published_intake_unlink_failure_is_failure(tmp_path, monkeypat
 
 
 # ---------------------------------------------------------------------------
+# Codex Round 4 (R4-P1-2): original 目标必须经 durable_stream_to_file
+# 流式发布(1MB 分块 + 增量 sha256),绝不整文件读入内存;raw text/meta
+# 仍为内存对象(PreparedIngest 设计);journal intent-first 协议不变。
+# ---------------------------------------------------------------------------
+
+
+def test_publish_original_streams_staged_file(tmp_path, monkeypatch):
+    """R4-P1-2: original 经流式原语发布(绝不 durable_write_bytes 整文件
+    payload),发布后字节一致,journal 条目顺序与完成态不变。"""
+    manifest, staged, prepared = prepared_upload_transaction(tmp_path, "report.txt")
+
+    import api.upload_intake as intake_mod
+
+    events = []
+    real_stream = intake_mod.durable_stream_to_file
+    real_write_bytes = intake_mod.durable_write_bytes
+
+    def spy_stream(path, stream):
+        events.append(("stream", Path(path).name))
+        return real_stream(path, stream)
+
+    def spy_write_bytes(path, payload):
+        events.append(("write_bytes", Path(path).name))
+        return real_write_bytes(path, payload)
+
+    monkeypatch.setattr(intake_mod, "durable_stream_to_file", spy_stream)
+    monkeypatch.setattr(intake_mod, "durable_write_bytes", spy_write_bytes)
+
+    published = publish_upload_intake(manifest, staged, prepared, tmp_path)
+
+    # original 只经流式原语;raw text 仍是 bytes 路径(内存对象)
+    assert ("stream", "report.txt") in events
+    assert ("write_bytes", "report.txt") not in events
+    assert ("write_bytes", f"{prepared.doc_id}.txt") in events
+    # 发布后字节一致
+    assert (tmp_path / "originals" / "report.txt").read_bytes() == (
+        b"port upload text"
+    )
+    assert published.published_intake.published is True
+    # journal intent-first 协议不变: 固定顺序 + 全部 completed
+    entries = read_journal(manifest.job_dir)
+    assert [entry["path"] for entry in entries] == [
+        "originals/report.txt",
+        f"raw/{prepared.doc_id}.txt",
+        f"raw/{prepared.doc_id}.meta.yaml",
+    ]
+    assert all(entry["completed"] is True for entry in entries)
+    assert all(entry["created_by_this_request"] is True for entry in entries)
+
+
+# ---------------------------------------------------------------------------
 # 不安全 journal 路径: 失败关闭, 绝不删除
 # ---------------------------------------------------------------------------
 

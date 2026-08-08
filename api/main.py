@@ -331,6 +331,9 @@ def _schedule_compile(
     E005 Task 9:调度迁移为持久化事务(设计 §11)。COMPILE_SCHEDULE_LOCK 覆盖
     readiness 校验 → 活动事务检查 → PREPARED 准备 → meta 绑定 → SCHEDULED
     持久迁移 → add_task 整个临界区:并发请求中恰一个能进入编译,其余得 409。
+    Codex R4-P2-1:活动事务检查之后还须非阻塞持有 COMPILE_EXECUTION_LOCK
+    (锁序 SCHEDULE → EXECUTION,与删除路径一致)——无活动事务时后台线程
+    可能正处于终态验证/清理窗口,此时绑定 meta 会被旧验证器误判为损坏。
     请求只有在事务正式发布、meta 绑定、Manifest 持久化 SCHEDULED 且后台任务
     登记完成后才被接受;准备/绑定/登记失败时请求线程立即经恢复库回滚,
     绝不留下活动事务或半绑定 meta。detail 只含稳定错误码,不泄露内部技术细节。
@@ -358,122 +361,136 @@ def _schedule_compile(
                     "code": "compile_in_progress" if same_doc else "knowledge_base_busy"
                 },
             )
-        meta = read_doc_meta(doc_id, base_dir=base)
-        if meta is None:
-            raise HTTPException(status_code=404, detail="Document metadata not found")
-        if meta.get("status") == "compiling":
+        # Codex R4-P2-1: 无活动事务时仍可能处于后台终态验证/清理窗口
+        # (执行锁被 run_compile_task 持有);此时绑定同文档 meta 会让旧
+        # 验证器把合法新状态误判为损坏而永久 recovery_required。活动检查
+        # 之后非阻塞获取执行锁并持有到 add_task 返回(锁序恒为
+        # SCHEDULE → EXECUTION,与删除路径一致);被占用即 409 busy——
+        # 无活动事务却持锁的唯一场景正是该清理窗口。
+        if not COMPILE_EXECUTION_LOCK.acquire(blocking=False):
             raise HTTPException(
-                status_code=409, detail={"code": "compile_in_progress"}
+                status_code=409,
+                detail={"code": "knowledge_base_busy"},
             )
         try:
-            manifest = prepare_recompile_transaction(doc_id, base, config)
-        except Exception as exc:
-            logger.error(
-                "compile transaction preparation failed for %s: %s", doc_id, exc
-            )
-            raise HTTPException(
-                status_code=503, detail={"code": "compile_transaction_unavailable"}
-            ) from None
-
-        scheduled_at = datetime.now(timezone.utc)
-        deadline = scheduled_at + timedelta(seconds=manifest.timeout_seconds)
-        bound = False
-        try:
-            bound = bind_doc_compile_job(
-                doc_id,
-                manifest.job_id,
-                scheduled_at.isoformat(),
-                deadline.isoformat(),
-                base_dir=base,
-            )
-        except Exception as exc:
-            logger.error(
-                "compile binding raised for %s (job %s): %s",
-                doc_id, manifest.job_id, exc,
-            )
-        if bound:
+            meta = read_doc_meta(doc_id, base_dir=base)
+            if meta is None:
+                raise HTTPException(status_code=404, detail="Document metadata not found")
+            if meta.get("status") == "compiling":
+                raise HTTPException(
+                    status_code=409, detail={"code": "compile_in_progress"}
+                )
             try:
-                manifest = transition_manifest(
-                    manifest.job_dir,
-                    expected=TransactionState.PREPARED,
-                    target=TransactionState.SCHEDULED,
-                    scheduled_at=scheduled_at.isoformat(),
+                manifest = prepare_recompile_transaction(doc_id, base, config)
+            except Exception as exc:
+                logger.error(
+                    "compile transaction preparation failed for %s: %s", doc_id, exc
+                )
+                raise HTTPException(
+                    status_code=503, detail={"code": "compile_transaction_unavailable"}
+                ) from None
+
+            scheduled_at = datetime.now(timezone.utc)
+            deadline = scheduled_at + timedelta(seconds=manifest.timeout_seconds)
+            bound = False
+            try:
+                bound = bind_doc_compile_job(
+                    doc_id,
+                    manifest.job_id,
+                    scheduled_at.isoformat(),
+                    deadline.isoformat(),
+                    base_dir=base,
                 )
             except Exception as exc:
                 logger.error(
-                    "SCHEDULED transition failed for job %s: %s",
-                    manifest.job_id, exc,
+                    "compile binding raised for %s (job %s): %s",
+                    doc_id, manifest.job_id, exc,
                 )
-                # bind 已生效但请求未被接受:回滚恢复绑定前 meta(绝不制造
-                # error 终态);响应恒为 503——回滚后无任何编译在进行,
-                # 不得按绑定中的 meta 报 409(评审修复)。
+            if bound:
+                try:
+                    manifest = transition_manifest(
+                        manifest.job_dir,
+                        expected=TransactionState.PREPARED,
+                        target=TransactionState.SCHEDULED,
+                        scheduled_at=scheduled_at.isoformat(),
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "SCHEDULED transition failed for job %s: %s",
+                        manifest.job_id, exc,
+                    )
+                    # bind 已生效但请求未被接受:回滚恢复绑定前 meta(绝不制造
+                    # error 终态);响应恒为 503——回滚后无任何编译在进行,
+                    # 不得按绑定中的 meta 报 409(评审修复)。
+                    if not _rollback_unaccepted_transaction(
+                        runtime,
+                        manifest,
+                        reason_code=ERROR_CODE_UNACCEPTED,
+                        reason_message=(
+                            f"schedule transition failed before acceptance: {exc}"
+                        ),
+                    ):
+                        raise HTTPException(
+                            status_code=503, detail={"code": "recovery_required"}
+                        ) from None
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"code": "compile_transaction_unavailable"},
+                    ) from None
+            else:
+                logger.error(
+                    "compile binding refused for %s (job %s)", doc_id, manifest.job_id
+                )
+                # 先按绑定前 meta 分类响应码,再回滚(回滚可能改写 meta)。
+                meta_after = read_doc_meta(doc_id, base_dir=base)
+                status_after = (
+                    meta_after.get("status") if isinstance(meta_after, dict) else None
+                )
                 if not _rollback_unaccepted_transaction(
                     runtime,
                     manifest,
                     reason_code=ERROR_CODE_UNACCEPTED,
-                    reason_message=(
-                        f"schedule transition failed before acceptance: {exc}"
-                    ),
+                    reason_message="doc binding refused before acceptance",
+                ):
+                    raise HTTPException(
+                        status_code=503, detail={"code": "recovery_required"}
+                    )
+                if meta_after is None:
+                    raise HTTPException(
+                        status_code=404, detail="Document metadata not found"
+                    )
+                if status_after == "compiling":
+                    raise HTTPException(
+                        status_code=409, detail={"code": "compile_in_progress"}
+                    )
+                raise HTTPException(
+                    status_code=503, detail={"code": "compile_transaction_unavailable"}
+                )
+            try:
+                background_tasks.add_task(
+                    run_compile_task, manifest.job_id, base, config, readiness
+                )
+            except Exception as exc:
+                logger.error(
+                    "background task registration failed for job %s: %s",
+                    manifest.job_id, exc,
+                )
+                # add_task 失败 = 请求未被接受:立即回滚并恢复绑定前 meta,
+                # 绝不留下 SCHEDULED 事务或制造的 error 终态(设计 §11)。
+                if not _rollback_unaccepted_transaction(
+                    runtime,
+                    manifest,
+                    reason_code=ERROR_CODE_UNACCEPTED,
+                    reason_message=f"background task registration failed: {exc}",
                 ):
                     raise HTTPException(
                         status_code=503, detail={"code": "recovery_required"}
                     ) from None
                 raise HTTPException(
-                    status_code=503,
-                    detail={"code": "compile_transaction_unavailable"},
+                    status_code=503, detail={"code": "compile_transaction_unavailable"}
                 ) from None
-        else:
-            logger.error(
-                "compile binding refused for %s (job %s)", doc_id, manifest.job_id
-            )
-            # 先按绑定前 meta 分类响应码,再回滚(回滚可能改写 meta)。
-            meta_after = read_doc_meta(doc_id, base_dir=base)
-            status_after = (
-                meta_after.get("status") if isinstance(meta_after, dict) else None
-            )
-            if not _rollback_unaccepted_transaction(
-                runtime,
-                manifest,
-                reason_code=ERROR_CODE_UNACCEPTED,
-                reason_message="doc binding refused before acceptance",
-            ):
-                raise HTTPException(
-                    status_code=503, detail={"code": "recovery_required"}
-                )
-            if meta_after is None:
-                raise HTTPException(
-                    status_code=404, detail="Document metadata not found"
-                )
-            if status_after == "compiling":
-                raise HTTPException(
-                    status_code=409, detail={"code": "compile_in_progress"}
-                )
-            raise HTTPException(
-                status_code=503, detail={"code": "compile_transaction_unavailable"}
-            )
-        try:
-            background_tasks.add_task(
-                run_compile_task, manifest.job_id, base, config, readiness
-            )
-        except Exception as exc:
-            logger.error(
-                "background task registration failed for job %s: %s",
-                manifest.job_id, exc,
-            )
-            # add_task 失败 = 请求未被接受:立即回滚并恢复绑定前 meta,
-            # 绝不留下 SCHEDULED 事务或制造的 error 终态(设计 §11)。
-            if not _rollback_unaccepted_transaction(
-                runtime,
-                manifest,
-                reason_code=ERROR_CODE_UNACCEPTED,
-                reason_message=f"background task registration failed: {exc}",
-            ):
-                raise HTTPException(
-                    status_code=503, detail={"code": "recovery_required"}
-                ) from None
-            raise HTTPException(
-                status_code=503, detail={"code": "compile_transaction_unavailable"}
-            ) from None
+        finally:
+            COMPILE_EXECUTION_LOCK.release()
 
 
 def _accept_upload(
@@ -505,6 +522,10 @@ def _accept_upload(
     请求线程丢弃;此前任何退出(去重/422/准备或发布失败/异常)由 finally
     丢弃未接受的 staging;进程真实崩溃时由 recover_startup 的
     .staging-* 清理兜底。staging 绝不参与回滚判定。
+
+    Codex R4-P2-1 说明:上传路径不持有 COMPILE_EXECUTION_LOCK——上传只
+    发布新文档的 original/raw 文件,后台终态验证器只读取既有文档产物,
+    绝不读取新上传目标,清理窗口与上传发布不存在交错风险。
     """
     if runtime is None:
         logger.error("upload rejected: runtime absent")

@@ -1265,6 +1265,93 @@ def test_recompile_gated_returns_recovery_required(managed_client):
     assert response.json() == {"detail": {"code": "recovery_required"}}
 
 
+# ─── Codex Round 4 (R4-P2-1):调度与后台终态验证/清理串行化 ──────────────────
+
+def test_recompile_rejected_during_terminal_cleanup_window(
+    managed_client, tmp_repo
+):
+    """R4-P2-1(a): 无活动事务但后台线程持有执行锁(终态验证/清理窗口)→
+    重编译必须 409 knowledge_base_busy,meta 字节不变,绝不登记后台任务。"""
+    from api.compile_jobs import COMPILE_EXECUTION_LOCK
+
+    before = _read_meta_bytes(tmp_repo, "doc_1")
+    COMPILE_EXECUTION_LOCK.acquire()
+    try:
+        with patch("api.main.run_compile_task") as mock_run:
+            response = managed_client.post("/api/v1/docs/doc_1/recompile")
+    finally:
+        COMPILE_EXECUTION_LOCK.release()
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": {"code": "knowledge_base_busy"}}
+    mock_run.assert_not_called()
+    assert _read_meta_bytes(tmp_repo, "doc_1") == before
+    assert not COMPILE_EXECUTION_LOCK.locked()
+
+
+def test_recompile_rejected_while_committed_cleanup_in_progress(
+    managed_client, tmp_repo
+):
+    """R4-P2-1(e) 端到端竞态回归: COMMITTED 事务目录存在(不再活动)+
+    执行锁被后台清理持有 → 新调度被拒绝,meta 不绑定,readiness 不被
+    旧验证器绊倒(合法新状态不再被误判为损坏)。"""
+    from api.compile_jobs import COMPILE_EXECUTION_LOCK
+    from api.compile_transactions import (
+        TransactionKind,
+        TransactionState,
+        create_prepared_transaction,
+        transition_manifest,
+    )
+    from scripts.doc_admin import read_doc_meta
+
+    runtime = _repo_runtime(managed_client)
+    manifest = create_prepared_transaction(
+        base_dir=tmp_repo,
+        config=runtime.config,
+        doc_id="doc_1",
+        kind=TransactionKind.RECOMPILE,
+        previous_meta=read_doc_meta("doc_1", tmp_repo),
+    )
+    transition_manifest(manifest.job_dir, expected=TransactionState.PREPARED,
+                        target=TransactionState.SCHEDULED)
+    transition_manifest(manifest.job_dir, expected=TransactionState.SCHEDULED,
+                        target=TransactionState.RUNNING)
+    transition_manifest(manifest.job_dir, expected=TransactionState.RUNNING,
+                        target=TransactionState.COMMITTED)
+
+    before = _read_meta_bytes(tmp_repo, "doc_1")
+    COMPILE_EXECUTION_LOCK.acquire()
+    try:
+        with patch("api.main.run_compile_task") as mock_run:
+            response = managed_client.post("/api/v1/docs/doc_1/recompile")
+    finally:
+        COMPILE_EXECUTION_LOCK.release()
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": {"code": "knowledge_base_busy"}}
+    mock_run.assert_not_called()
+    assert _read_meta_bytes(tmp_repo, "doc_1") == before
+    mode, _reason = runtime.readiness.snapshot()
+    assert mode == "ready"
+    assert not COMPILE_EXECUTION_LOCK.locked()
+
+
+def test_recompile_success_releases_execution_lock_for_background_task(
+    managed_client, tmp_repo
+):
+    """R4-P2-1(d): 正常调度成功后执行锁已释放,后台任务可立即获取
+    (请求线程绝不把执行锁带过响应)。"""
+    from api.compile_jobs import COMPILE_EXECUTION_LOCK
+
+    with patch("api.main.run_compile_task"):
+        response = managed_client.post("/api/v1/docs/doc_2/recompile")
+
+    assert response.status_code == 200
+    assert not COMPILE_EXECUTION_LOCK.locked()
+    assert COMPILE_EXECUTION_LOCK.acquire(blocking=False)
+    COMPILE_EXECUTION_LOCK.release()
+
+
 def test_recompile_success_schedules_background_task_by_job_id(
     managed_client, tmp_repo
 ):

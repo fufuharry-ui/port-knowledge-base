@@ -31,6 +31,7 @@ from enum import Enum
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Mapping
 
+import psutil
 import yaml
 
 from api.durable_fs import (
@@ -45,6 +46,9 @@ from api.process_tree import (
     STATUS_IDENTITY_MISMATCH,
     STATUS_PROCESS_GONE,
     ProcessIdentity,
+    _is_recorded_tree_fingerprint,
+    _normalize_path,
+    command_fingerprint,
     terminate_process_tree,
     verify_process_identity,
 )
@@ -836,6 +840,33 @@ META_ACTIVE_JOB_FIELDS = (
 ERROR_CODE_INTERRUPTED = "interrupted"
 ERROR_CODE_ROLLBACK_FAILED = "rollback_failed"
 
+#: 文档终态公开错误码合同(设计 §20.1 与前端 DocumentCompileErrorCode);
+#: 内部原因码(如 running_transition_failed)绝不直接进入 meta error_code。
+PUBLIC_DOC_ERROR_CODES = frozenset({
+    "llm_configuration",
+    "service_unavailable",
+    "timeout",
+    "document_processing",
+    "compile_failed",
+    "interrupted",
+    "rollback_failed",
+})
+
+
+def public_doc_error_code(internal_code: str | None) -> str | None:
+    """把内部失败原因码映射为文档终态公开错误码(R4-P2-3)。
+
+    合同集合之外的内部码一律映射为 compile_failed(结构性护栏):
+    running_transition_failed 是基础设施失败而非服务生命周期中断,
+    不得映射为 interrupted。Manifest 的 original_code 保持原样供运维
+    诊断;None 原样返回(调用方另有缺省)。
+    """
+    if internal_code is None:
+        return None
+    if internal_code in PUBLIC_DOC_ERROR_CODES:
+        return internal_code
+    return "compile_failed"
+
 #: 请求未被接受的同步回滚原由(设计 §11):请求线程在事务被接受前
 #: (bind/SCHEDULED 迁移/add_task 失败)立即回滚时使用;回滚必须把文档
 #: meta 恢复为 source-meta-before.yaml 快照,绝不制造文档错误终态。
@@ -980,6 +1011,48 @@ def _record_recovery_failure(
         },
     )
     durable_write_yaml(Path(job_dir) / MANIFEST_FILENAME, _manifest_to_dict(updated))
+
+
+def _scan_orphan_compile_processes(
+    base_dir: Path, doc_id: str
+) -> tuple[int, ...] | None:
+    """R4-P1-1: spawn→RUNNING 身份窗口的孤儿编译器扫描(SCHEDULED 专用)。
+
+    服务在 spawn 之后、RUNNING 持久化之前死亡时,Manifest 停留无进程记录的
+    SCHEDULED,而孤儿编译器可能仍在改写产物;此时直接回滚会与存活写入交错。
+    扫描与本事务预期业务指纹(scripts.compile|<doc_id> 或 compile.py 派生
+    的 relate 子进程形式)且 cwd == base_dir 的活进程;只扫描、绝不终止
+    (无身份记录,设计 §13 禁止 kill);扫描自身失败返回 None(失败关闭)。
+    """
+    probe = ProcessIdentity(
+        pid=0,
+        create_time=0.0,
+        executable="",
+        cwd=str(base_dir),
+        command_fingerprint=f"scripts.compile|{doc_id}",
+        process_group_id=0,
+        platform="",
+    )
+    expected_cwd = _normalize_path(str(base_dir))
+    matches: list[int] = []
+    try:
+        for proc in psutil.process_iter():
+            try:
+                fingerprint = command_fingerprint(proc.cmdline() or [])
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            if not _is_recorded_tree_fingerprint(probe, fingerprint):
+                continue
+            try:
+                if _normalize_path(proc.cwd()) != expected_cwd:
+                    continue
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            matches.append(proc.pid)
+    except psutil.Error as exc:
+        logger.warning("orphan compiler scan failed for %s: %s", doc_id, exc)
+        return None
+    return tuple(matches)
 
 
 def _terminate_leftover_process(
@@ -1181,7 +1254,13 @@ def _execute_rollback(
                 if key not in META_ACTIVE_JOB_FIELDS
             }
             durable_write_yaml(base_dir / "raw" / f"{doc_id}.meta.yaml", cleaned_meta)
-            code = manifest.failure.get("original_code") or ERROR_CODE_INTERRUPTED
+            # R4-P2-3: meta error_code 只写公开合同码;内部码(如
+            # running_transition_failed)映射为 compile_failed,Manifest
+            # 保留原始码供运维诊断。
+            code = (
+                public_doc_error_code(manifest.failure.get("original_code"))
+                or ERROR_CODE_INTERRUPTED
+            )
             message = _sanitize_error_message(
                 manifest.failure.get("original_message") or "编译任务被中断"
             )
@@ -1191,6 +1270,25 @@ def _execute_rollback(
             ):
                 _record_recovery_failure(
                     job_dir, "failed to write doc error terminal", [meta_rel]
+                )
+                return RecoveryResult(
+                    job_id=manifest.job_id,
+                    blocked=True,
+                    reason=ERROR_CODE_ROLLBACK_FAILED,
+                    failed_paths=(meta_rel,),
+                )
+            # R4-P1-3: doc_admin 的终态 meta 写入只有文件级 fsync +
+            # os.replace,无父目录 fsync;ROLLED_BACK 提交点前必须耐久化
+            # raw/ 父目录(POSIX),否则掉电可能丢失终态 meta 而恢复证据
+            # 已被清除。fsync 失败失败关闭(保持 ROLLBACKING 证据)。
+            try:
+                fsync_parent_directory(base_dir / "raw" / f"{doc_id}.meta.yaml")
+            except OSError as exc:
+                _record_recovery_failure(
+                    job_dir,
+                    "doc meta parent fsync failed: "
+                    f"{_sanitize_error_message(exc)}",
+                    [meta_rel],
                 )
                 return RecoveryResult(
                     job_id=manifest.job_id,
@@ -1297,6 +1395,28 @@ def recover_transaction(
                 job_id=manifest.job_id, blocked=True, reason=blocked_reason
             )
 
+    if manifest.state is TransactionState.SCHEDULED:
+        # R4-P1-1: spawn→RUNNING 身份窗口——SCHEDULED 无进程记录,但孤儿
+        # 编译器可能仍存活并改写产物。回滚前扫描活进程;匹配或扫描失败
+        # 一律阻断(失败关闭,绝不自动 kill,绝不猜测)。
+        orphans = _scan_orphan_compile_processes(base_dir, manifest.doc_id)
+        if orphans is None:
+            return RecoveryResult(
+                job_id=manifest.job_id,
+                blocked=True,
+                reason="orphan compiler scan failed; fail closed",
+            )
+        if orphans:
+            return RecoveryResult(
+                job_id=manifest.job_id,
+                blocked=True,
+                reason=(
+                    f"live compile process(es) {list(orphans)} match this "
+                    "transaction's fingerprint and cwd; refusing to roll "
+                    "back under a live compiler"
+                ),
+            )
+
     if manifest.state is not TransactionState.ROLLBACKING:
         changes: dict[str, Any] = {}
         if not manifest.failure.get("original_code"):
@@ -1401,12 +1521,15 @@ def _verify_rolled_back_terminal(
                     failures.append(f"upload published file not revoked: {path.name}")
     else:
         meta, meta_error = _read_doc_meta_safe(base_dir, manifest.doc_id)
-        expected_code = manifest.failure.get("original_code")
+        raw_code = manifest.failure.get("original_code")
+        # R4-P2-3: meta 只携带公开合同码;验证必须与映射后的公开码比较
+        # (内部码如 running_transition_failed 在 meta 中为 compile_failed)。
+        expected_code = public_doc_error_code(raw_code)
         if meta_error is not None:
             failures.append(meta_error)
         elif meta is None:
             failures.append("recompile doc meta missing after rollback")
-        elif expected_code == ERROR_CODE_UNACCEPTED:
+        elif raw_code == ERROR_CODE_UNACCEPTED:
             # 未接受请求的回滚(设计 §11):meta 必须与绑定前快照字节一致,
             # 不携带活动字段,不得出现制造的错误终态。
             meta_path = base_dir / "raw" / f"{manifest.doc_id}.meta.yaml"

@@ -104,6 +104,7 @@ def _cmd_inspect(base_dir: Path, config) -> int:
     job_dirs = list_transaction_dirs(config)
     if not job_dirs:
         print("transactions: none")
+    active_doc_ids: set[str] = set()
     for job_dir in job_dirs:
         try:
             manifest = load_manifest(job_dir)
@@ -120,8 +121,13 @@ def _cmd_inspect(base_dir: Path, config) -> int:
         )
         if manifest.state in ACTIVE_STATES:
             print(f"transaction {manifest.job_id}: ACTIVE, recovery required")
+            # R4-P2-2: 携带合法活动事务的 compiling 文档不是孤儿,
+            # 从孤立扫描中排除(否则同一文档被重复报告为 ACTIVE + orphan)。
+            active_doc_ids.add(manifest.doc_id)
             exit_code = 1
-    orphans, unreadable = find_orphan_compiling_docs(base_dir)
+    orphans, unreadable = find_orphan_compiling_docs(
+        base_dir, exclude_doc_ids=frozenset(active_doc_ids)
+    )
     for doc_id in unreadable:
         print(f"unreadable_doc_meta: {doc_id}")
         exit_code = 1

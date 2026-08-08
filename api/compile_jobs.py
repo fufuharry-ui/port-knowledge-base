@@ -52,6 +52,7 @@ from api.process_tree import (
     STATUS_TIMED_OUT,
     ProcessResult,
     SpawnedProcess,
+    TerminationResult,
     spawn_compile_process,
     terminate_process_tree,
     wait_for_process,
@@ -175,12 +176,18 @@ def prepare_recompile_transaction(
     """
     base = Path(base_dir)
     previous_meta = read_doc_meta(doc_id, base)
+    # F5: 快照原 meta 文件字节(注释/格式不丢失);未接受回滚逐字节恢复。
+    meta_path = base / "raw" / f"{doc_id}.meta.yaml"
+    previous_meta_bytes = (
+        meta_path.read_bytes() if meta_path.is_file() else None
+    )
     return create_prepared_transaction(
         base_dir=base,
         config=config,
         doc_id=doc_id,
         kind=TransactionKind.RECOMPILE,
         previous_meta=previous_meta,
+        previous_meta_bytes=previous_meta_bytes,
     )
 
 
@@ -429,14 +436,25 @@ def _terminate_timed_out_job(
 
 def _terminate_spawned_best_effort(
     spawned: SpawnedProcess, grace_seconds: int
-) -> None:
-    """RUNNING 迁移失败后的 best-effort 清理;任何异常只记录日志。"""
+) -> TerminationResult | None:
+    """RUNNING/ROLLBACKING 迁移失败后的 best-effort 清理;任何异常只记录日志。
+
+    返回终止结果(无身份或终止本身抛异常时返回 None);调用方据以决定
+    是否把进程身份持久化为可恢复证据。
+    """
     try:
         if spawned.identity is not None:
-            terminate_process_tree(spawned.identity, grace_seconds)
+            return terminate_process_tree(spawned.identity, grace_seconds)
     except Exception as exc:
         logger.error("best-effort tree termination failed: %s", exc)
-    _reap_popen(spawned, grace_seconds)
+    finally:
+        _reap_popen(spawned, grace_seconds)
+    return None
+
+
+#: RUNNING 迁移失败且进程退出未确认时持久化的失败原因码;
+#: 启动恢复据此在回滚前先验证并终止记录进程。
+ERROR_CODE_RUNNING_TRANSITION_FAILED = "running_transition_failed"
 
 
 def _execute_scheduled_job(
@@ -502,8 +520,34 @@ def _execute_scheduled_job(
             manifest.job_id,
             exc,
         )
-        _terminate_spawned_best_effort(spawned, grace_seconds)
-        readiness.mark_recovery_required("running_transition_failed")
+        termination = _terminate_spawned_best_effort(spawned, grace_seconds)
+        if termination is None or not termination.success:
+            # 退出未确认(身份不匹配/幸存者/终止异常):Manifest 不能停留
+            # 无进程记录的 SCHEDULED——否则重启恢复会在不终止可能存活的
+            # 编译进程的情况下直接回滚。持久化 SCHEDULED→ROLLBACKING
+            # (合法迁移)携带进程身份与失败原因;证据写入也失败时响亮
+            # 记录并保持 recovery_required。
+            try:
+                transition_manifest(
+                    job_dir,
+                    expected=TransactionState.SCHEDULED,
+                    target=TransactionState.ROLLBACKING,
+                    failure={
+                        "original_code": ERROR_CODE_RUNNING_TRANSITION_FAILED,
+                        "original_message": sanitize_compile_error(
+                            f"running transition failed: "
+                            f"{type(exc).__name__}: {exc}"
+                        ),
+                    },
+                    process=_process_record(spawned.identity),
+                )
+            except Exception as persist_exc:
+                logger.error(
+                    "failed to persist rollback evidence for job %s: %s",
+                    manifest.job_id,
+                    persist_exc,
+                )
+        readiness.mark_recovery_required(ERROR_CODE_RUNNING_TRANSITION_FAILED)
         return
 
     try:

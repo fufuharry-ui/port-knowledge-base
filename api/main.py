@@ -5,7 +5,7 @@ import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import AsyncIterable
 from fastapi import FastAPI, Request, UploadFile, File, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -60,11 +60,23 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class AppRuntime:
-    """lifespan 启动成功后挂接到 app.state.runtime 的运行时容器。"""
+    """lifespan 启动成功后挂接到 app.state.runtime 的运行时容器。
+
+    resolved_base:lifespan 解析的知识库根;缺省 None 表示按调用时的模块级
+    BASE_DIR 解析(测试经 monkeypatch 重绑定模块常量后仍一致)。不得用导入期
+    BASE_DIR 快照作默认值——那会在 monkeypatch 之后错误地指向真实仓库。
+    """
 
     config: CompileRuntimeConfig
     readiness: ServiceReadiness
     instance_lock: ApiInstanceLock
+    resolved_base: Path | None = None
+
+
+def _runtime_base_dir(runtime: AppRuntime) -> Path:
+    """事务面向调用的知识库根: 优先 runtime 解析根,缺省回退模块 BASE_DIR。"""
+    base = getattr(runtime, "resolved_base", None)
+    return Path(base) if base is not None else BASE_DIR
 
 
 #: 门禁豁免路径(设计 §19):仅 liveness 与 readiness 探针。
@@ -198,9 +210,15 @@ def _find_duplicate_doc(file_hash: str) -> dict | None:
 
 
 def _safe_upload_name(filename: str | None) -> str:
-    """只取 basename(剥离路径分量),并校验扩展名在 PARSERS 内,否则 422。"""
+    """只取 basename(剥离路径分量),并校验扩展名在 PARSERS 内,否则 422。
+
+    multipart 文件名可能携带 Windows 客户端路径(C:\\fakepath\\x.pdf);
+    POSIX 宿主上 Path.name 不把反斜杠当分隔符,必须先经 PureWindowsPath
+    归一(其同时识别 \\ 与 /),保证唯一性检查、staging 与响应构造使用
+    同一安全名。
+    """
     supplied = filename or ""
-    safe = Path(supplied).name
+    safe = Path(PureWindowsPath(supplied).name).name
     suffix = Path(safe).suffix.lower()
     if not safe or suffix not in PARSERS:
         raise HTTPException(status_code=422, detail=f"不支持的文件格式 '{suffix or supplied}'")
@@ -280,7 +298,7 @@ def _rollback_unaccepted_transaction(
     撤销本轮发布的 original/raw(绝不保留孤儿 doc)。"""
     try:
         result = recover_transaction(
-            BASE_DIR,
+            _runtime_base_dir(runtime),
             runtime.config,
             manifest.job_dir,
             reason_code=reason_code,
@@ -323,6 +341,7 @@ def _schedule_compile(
         raise HTTPException(status_code=503, detail={"code": "recovery_required"})
     config = runtime.config
     readiness = runtime.readiness
+    base = _runtime_base_dir(runtime)
     with COMPILE_SCHEDULE_LOCK:
         try:
             readiness.require_ready()
@@ -339,7 +358,7 @@ def _schedule_compile(
                     "code": "compile_in_progress" if same_doc else "knowledge_base_busy"
                 },
             )
-        meta = read_doc_meta(doc_id, base_dir=BASE_DIR)
+        meta = read_doc_meta(doc_id, base_dir=base)
         if meta is None:
             raise HTTPException(status_code=404, detail="Document metadata not found")
         if meta.get("status") == "compiling":
@@ -347,7 +366,7 @@ def _schedule_compile(
                 status_code=409, detail={"code": "compile_in_progress"}
             )
         try:
-            manifest = prepare_recompile_transaction(doc_id, BASE_DIR, config)
+            manifest = prepare_recompile_transaction(doc_id, base, config)
         except Exception as exc:
             logger.error(
                 "compile transaction preparation failed for %s: %s", doc_id, exc
@@ -365,7 +384,7 @@ def _schedule_compile(
                 manifest.job_id,
                 scheduled_at.isoformat(),
                 deadline.isoformat(),
-                base_dir=BASE_DIR,
+                base_dir=base,
             )
         except Exception as exc:
             logger.error(
@@ -408,7 +427,7 @@ def _schedule_compile(
                 "compile binding refused for %s (job %s)", doc_id, manifest.job_id
             )
             # 先按绑定前 meta 分类响应码,再回滚(回滚可能改写 meta)。
-            meta_after = read_doc_meta(doc_id, base_dir=BASE_DIR)
+            meta_after = read_doc_meta(doc_id, base_dir=base)
             status_after = (
                 meta_after.get("status") if isinstance(meta_after, dict) else None
             )
@@ -434,7 +453,7 @@ def _schedule_compile(
             )
         try:
             background_tasks.add_task(
-                run_compile_task, manifest.job_id, BASE_DIR, config, readiness
+                run_compile_task, manifest.job_id, base, config, readiness
             )
         except Exception as exc:
             logger.error(
@@ -493,6 +512,7 @@ def _accept_upload(
     safe_name = _safe_upload_name(file.filename)
     config = runtime.config
     readiness = runtime.readiness
+    base = _runtime_base_dir(runtime)
     staged = None
     with COMPILE_SCHEDULE_LOCK:
         try:
@@ -523,7 +543,7 @@ def _accept_upload(
             try:
                 prepared = prepare_ingest(
                     staged.staged_file,
-                    base_dir=BASE_DIR,
+                    base_dir=base,
                     existing_doc_ids={
                         doc["id"]
                         for doc in _load_document_catalog()
@@ -544,7 +564,7 @@ def _accept_upload(
             _r8_boundary_after_prepare_ingest(prepared)
             try:
                 manifest = prepare_upload_transaction(
-                    staged, prepared, BASE_DIR, config
+                    staged, prepared, base, config
                 )
             except Exception as exc:
                 logger.error(
@@ -557,7 +577,7 @@ def _accept_upload(
                 ) from None
             _r8_boundary_after_prepared_manifest(manifest)
             try:
-                publish_upload_intake(manifest, staged, prepared, BASE_DIR)
+                publish_upload_intake(manifest, staged, prepared, base)
             except Exception as exc:
                 logger.error(
                     "upload intake publish failed for job %s: %s",
@@ -590,7 +610,7 @@ def _accept_upload(
                     manifest.job_id,
                     scheduled_at.isoformat(),
                     deadline.isoformat(),
-                    base_dir=BASE_DIR,
+                    base_dir=base,
                 )
             except Exception as exc:
                 logger.error(
@@ -645,7 +665,7 @@ def _accept_upload(
             _r8_boundary_after_scheduled(manifest)
             try:
                 background_tasks.add_task(
-                    run_compile_task, manifest.job_id, BASE_DIR, config, readiness
+                    run_compile_task, manifest.job_id, base, config, readiness
                 )
             except Exception as exc:
                 logger.error(
@@ -887,14 +907,15 @@ def _remove_doc_exclusively(doc_id: str, runtime: AppRuntime | None) -> dict:
                         )
                     },
                 )
-            meta = read_doc_meta(doc_id, base_dir=BASE_DIR)
+            base = _runtime_base_dir(runtime)
+            meta = read_doc_meta(doc_id, base_dir=base)
             if meta and meta.get("status") == "compiling":
                 raise HTTPException(
                     status_code=409,
                     detail={"code": "compile_in_progress"},
                 )
             from scripts.doc_admin import remove_doc
-            return remove_doc(doc_id, base_dir=BASE_DIR)
+            return remove_doc(doc_id, base_dir=base)
         finally:
             COMPILE_EXECUTION_LOCK.release()
 
@@ -1193,6 +1214,7 @@ def _build_lifespan(base_dir: Path):
                 config=config,
                 readiness=ServiceReadiness(),
                 instance_lock=lock,
+                resolved_base=base_dir,
             )
             yield
         finally:
@@ -1206,6 +1228,7 @@ def create_app(
     base_dir: Path | str | None = None,
     *,
     allow_unmanaged: bool = False,
+    allow_path_override: bool = False,
 ) -> FastAPI:
     """应用工厂。
 
@@ -1215,8 +1238,23 @@ def create_app(
       管理器)不执行 lifespan,app.state.runtime 不存在;设 True 时该情形
       按 ready 放行,设 False(默认,生产语义)时 fail-closed 返回 503。
       生产 ASGI 服务器必经 lifespan,此旗标不得用于生产实例。
+    - allow_path_override: 仅测试使用的显式 opt-in。路由处理器依赖模块级
+      路径常量(BASE_DIR/RAW_DIR/ORIGINALS_DIR/INDEX_FILE 等,单实例
+      合同),lifespan 的 base_dir 只作用于 config/实例锁/启动恢复;
+      base_dir 与模块 BASE_DIR 不一致而未 opt-in 时直接拒绝(fail-closed),
+      避免 app 对仓库 X 报 ready 却在默认仓库上读写。仅当测试已同步
+      monkeypatch 重绑定模块路径常量时才允许设 True。
     """
     resolved_base = Path(base_dir) if base_dir is not None else BASE_DIR
+    if (
+        resolved_base.resolve() != BASE_DIR.resolve()
+        and not allow_path_override
+    ):
+        raise ValueError(
+            "create_app base_dir 与模块 BASE_DIR 不一致:路由处理器依赖模块级 "
+            "路径常量(单实例合同),仅测试可在显式 allow_path_override=True "
+            "并同步重绑定模块常量后覆盖"
+        )
 
     app = FastAPI(
         title="Karpathy-Style LLM Wiki API",

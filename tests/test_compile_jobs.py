@@ -54,6 +54,10 @@ ROLLBACKING = TransactionState.ROLLBACKING
 
 ACTIVE_JOB_FIELDS = ("compile_job_id", "compile_started_at", "compile_deadline")
 
+#: 假进程 pid: Windows pid 恒为 4 的倍数(奇数不可能存在),POSIX 默认
+#: pid_max=2^22(该值越界);恢复路径的真实 psutil 查询必然判定 process_gone。
+FAKE_PID = 2**22 + 54321
+
 STARTED_AT = "2026-08-06T14:30:01+00:00"
 DEADLINE = "2026-08-06T15:00:01+00:00"
 
@@ -161,7 +165,7 @@ def scheduled_transaction(base, doc_id=DOC_ID):
 class FakePopen:
     """假 Popen: 支持 communicate/wait/kill,绝不指向真实进程。"""
 
-    def __init__(self, pid=4321):
+    def __init__(self, pid=FAKE_PID):
         self.pid = pid
         self.returncode = 0
         self.communicate_calls = 0
@@ -179,7 +183,7 @@ class FakePopen:
         self.returncode = -9
 
 
-def make_spawned(base, doc_id, pid=4321):
+def make_spawned(base, doc_id, pid=FAKE_PID):
     popen = FakePopen(pid=pid)
     identity = ProcessIdentity(
         pid=pid,
@@ -204,7 +208,7 @@ def install_fake_process(
     *,
     result=None,
     on_wait=None,
-    pid=4321,
+    pid=FAKE_PID,
 ):
     """把 spawn/wait 边界替换为假进程;on_wait 在等待时模拟子进程写产物。"""
     spawned = make_spawned(base, doc_id, pid=pid)
@@ -509,7 +513,7 @@ def test_run_compile_task_records_deadline_and_process_identity(
     assert running.deadline is not None
     assert running.deadline > running.started_at
     assert running.process is not None
-    assert running.process.pid == 4321
+    assert running.process.pid == FAKE_PID
     assert running.process.command_fingerprint == (
         f"scripts.compile|{manifest.doc_id}"
     )
@@ -767,7 +771,7 @@ def test_timeout_transition_failure_terminates_tree_best_effort(
     )
 
     # best-effort 终止已尝试且 Popen 已回收
-    assert terminate_calls == [4321]
+    assert terminate_calls == [FAKE_PID]
     assert spawned.popen.communicate_calls >= 1 or spawned.popen.wait_calls >= 1
     # 失败关闭: readiness 进入 recovery_required,不回滚、不写文档终态
     assert readiness.snapshot()[0] == "recovery_required"
@@ -1025,3 +1029,166 @@ def test_run_compile_task_serializes_concurrent_jobs(tmp_path, monkeypatch):
     assert peak == 1
     for doc_id in (DOC_ID, DOC_B_ID):
         assert read_doc_meta(doc_id, tmp_path)["status"] == "compiled"
+
+
+# ---------------------------------------------------------------------------
+# Codex 修复(F3):RUNNING 迁移失败且退出未确认时,必须持久化可恢复的
+# 进程证据(ROLLBACKING + process + failure),供启动恢复先终止再回滚
+# ---------------------------------------------------------------------------
+
+
+def _flaky_transition_raising_on(target_state):
+    real_transition = compile_jobs.transition_manifest
+
+    def flaky(job_dir, expected, target, **changes):
+        if target is target_state:
+            raise OSError(f"manifest io failed on {target_state.value}")
+        return real_transition(job_dir, expected, target, **changes)
+
+    return flaky
+
+
+def test_running_transition_failure_persists_recoverable_process_evidence(
+    tmp_path, monkeypatch
+):
+    """F3(a): RUNNING 迁移失败且 best-effort 终止未确认退出(幸存者)时,
+    必须把进程身份与失败原因持久化为 ROLLBACKING 证据;随后启动恢复先验证
+    并终止记录进程,再完成回滚。"""
+    manifest, old_payloads = scheduled_transaction(tmp_path)
+
+    spawned = install_fake_process(monkeypatch, tmp_path, manifest.doc_id)
+    monkeypatch.setattr(
+        "api.compile_jobs.transition_manifest",
+        _flaky_transition_raising_on(RUNNING),
+    )
+    monkeypatch.setattr(
+        "api.compile_jobs.terminate_process_tree",
+        lambda identity, grace_seconds: TerminationResult(
+            status=STATUS_SURVIVORS_REMAINING, survivors=(9999,)
+        ),
+    )
+
+    readiness = ServiceReadiness()
+    run_compile_task(
+        manifest.job_id, tmp_path, runtime_config(tmp_path), readiness
+    )
+
+    # 失败关闭: readiness 进入 recovery_required,不回滚、不写文档终态
+    assert readiness.snapshot()[0] == "recovery_required"
+    meta = read_doc_meta(manifest.doc_id, tmp_path)
+    assert meta["status"] == "compiling"
+    # Popen 已回收
+    assert spawned.popen.communicate_calls >= 1 or spawned.popen.wait_calls >= 1
+    # 关键合同: Manifest 携带可恢复证据(ROLLBACKING + 进程身份 + 失败原因)
+    evidence = load_manifest(manifest.job_dir)
+    assert evidence.state is ROLLBACKING
+    assert evidence.failure["original_code"] == "running_transition_failed"
+    assert evidence.process is not None
+    assert evidence.process.pid == FAKE_PID
+    assert evidence.process.command_fingerprint == (
+        f"scripts.compile|{manifest.doc_id}"
+    )
+
+    # 模拟重启: 启动恢复必须先终止记录进程,再逐字节回滚。
+    import api.compile_transactions as transactions
+    from api.compile_transactions import recover_startup
+    from api.process_tree import IdentityStatus
+
+    terminate_calls = []
+    monkeypatch.setattr(
+        transactions,
+        "verify_process_identity",
+        lambda identity: IdentityStatus(status="verified"),
+    )
+    monkeypatch.setattr(
+        transactions,
+        "terminate_process_tree",
+        lambda identity, grace: terminate_calls.append(identity.pid)
+        or TerminationResult(status="terminated"),
+    )
+    report = recover_startup(tmp_path, runtime_config(tmp_path))
+    assert report.ready is True, report
+    assert terminate_calls == [FAKE_PID]
+    for rel, payload in old_payloads.items():
+        assert (tmp_path / rel).read_bytes() == payload
+    meta = read_doc_meta(manifest.doc_id, tmp_path)
+    assert meta["status"] == "error"
+    assert meta["error_code"] == "running_transition_failed"
+
+
+def test_running_transition_failure_clean_exit_keeps_scheduled(
+    tmp_path, monkeypatch
+):
+    """F3(a) 对照: RUNNING 迁移失败但进程树已确认退出(terminated)时,
+    Manifest 保持 SCHEDULED(无存活进程证据),启动恢复按 SCHEDULED 回滚。"""
+    manifest, old_payloads = scheduled_transaction(tmp_path)
+    install_fake_process(monkeypatch, tmp_path, manifest.doc_id)
+    monkeypatch.setattr(
+        "api.compile_jobs.transition_manifest",
+        _flaky_transition_raising_on(RUNNING),
+    )
+    monkeypatch.setattr(
+        "api.compile_jobs.terminate_process_tree",
+        lambda identity, grace_seconds: TerminationResult(status=STATUS_TERMINATED),
+    )
+
+    readiness = ServiceReadiness()
+    run_compile_task(
+        manifest.job_id, tmp_path, runtime_config(tmp_path), readiness
+    )
+
+    assert readiness.snapshot()[0] == "recovery_required"
+    evidence = load_manifest(manifest.job_dir)
+    assert evidence.state is SCHEDULED
+    assert evidence.process is None
+
+    # 模拟重启: SCHEDULED 恢复直接回滚(无进程需要终止)。
+    from api.compile_transactions import recover_startup
+
+    report = recover_startup(tmp_path, runtime_config(tmp_path))
+    assert report.ready is True, report
+    for rel, payload in old_payloads.items():
+        assert (tmp_path / rel).read_bytes() == payload
+    assert read_doc_meta(manifest.doc_id, tmp_path)["error_code"] == "interrupted"
+
+
+def test_running_transition_failure_evidence_persist_failure_keeps_scheduled(
+    tmp_path, monkeypatch, caplog
+):
+    """F3(a) 兜底: RUNNING 迁移失败、退出未确认、证据持久化也失败时,
+    必须响亮记录并仍失败关闭(recovery_required),Manifest 保持 SCHEDULED。"""
+    manifest, _old = scheduled_transaction(tmp_path)
+    install_fake_process(monkeypatch, tmp_path, manifest.doc_id)
+    monkeypatch.setattr(
+        "api.compile_jobs.transition_manifest",
+        _flaky_transition_raising_on(RUNNING),
+    )
+    monkeypatch.setattr(
+        "api.compile_jobs.terminate_process_tree",
+        lambda identity, grace_seconds: TerminationResult(
+            status=STATUS_SURVIVORS_REMAINING, survivors=(9999,)
+        ),
+    )
+    # 证据持久化(第二次 transition 调用)同样失败
+    real_transition = compile_jobs.transition_manifest
+    calls = {"count": 0}
+
+    def always_flaky(job_dir, expected, target, **changes):
+        calls["count"] += 1
+        raise OSError("manifest io permanently failed")
+
+    monkeypatch.setattr("api.compile_jobs.transition_manifest", always_flaky)
+
+    readiness = ServiceReadiness()
+    with caplog.at_level("ERROR", logger="api.compile_jobs"):
+        run_compile_task(
+            manifest.job_id, tmp_path, runtime_config(tmp_path), readiness
+        )
+
+    assert readiness.snapshot()[0] == "recovery_required"
+    assert load_manifest(manifest.job_dir).state is SCHEDULED
+    assert calls["count"] == 2  # RUNNING 迁移 + 证据持久化各尝试一次
+    assert any(
+        "rollback evidence" in record.getMessage()
+        for record in caplog.records
+    )

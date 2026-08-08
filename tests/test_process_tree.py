@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
+from unittest.mock import Mock
 
 import psutil
 import pytest
@@ -287,3 +289,293 @@ def test_verify_and_terminate_real_process_tree(tmp_path):
         _cleanup_pids(child_pid, popen.pid)
         popen.stdout.close()
         popen.stderr.close()
+
+
+# ---------------------------------------------------------------------------
+# Codex 修复(F1/F2/F6/F7):管道解码、身份捕获失败清理、
+# already-gone 幸存者确认、检查中途退出分类
+# ---------------------------------------------------------------------------
+
+
+class _RecordingPopen:
+    """记录终止/回收调用的假 Popen;绝不指向真实进程。"""
+
+    def __init__(self, pid=4321):
+        self.pid = pid
+        self.killed = False
+        self.terminated = False
+        self.waited = False
+
+    def kill(self):
+        self.killed = True
+
+    def terminate(self):
+        self.terminated = True
+
+    def wait(self, timeout=None):
+        self.waited = True
+        return -9
+
+
+def test_spawn_pipes_use_utf8_decoding_with_replacement(tmp_path, monkeypatch):
+    """F1: Popen 管道必须显式 encoding="utf-8" + errors="replace",
+    且子进程输出非 locale 字节时 communicate 不得抛 UnicodeDecodeError。"""
+    captured = {}
+    real_popen = subprocess.Popen
+
+    def spy_popen(argv, **kwargs):
+        captured.update(kwargs)
+        # 替换为受控子进程: 直接向 stdout 写入非 UTF-8/非 locale 原始字节。
+        return real_popen(
+            [sys.executable, "-c", "import os;os.write(1,b'\\xff\\xfe')"],
+            **kwargs,
+        )
+
+    monkeypatch.setattr(subprocess, "Popen", spy_popen)
+    env = (
+        {"SystemRoot": os.environ.get("SystemRoot", r"C:\Windows")}
+        if IS_WINDOWS
+        else {}
+    )
+    spawned = spawn_compile_process(tmp_path, "doc_enc", env)
+    try:
+        result = wait_for_process(spawned, timeout_seconds=30)
+    finally:
+        if spawned.popen.returncode is None:
+            spawned.popen.kill()
+            spawned.popen.wait()
+    assert captured.get("encoding") == "utf-8"
+    assert captured.get("errors") == "replace"
+    # 原始字节经 replacement 解码而非抛出
+    assert result.status == "completed"
+    assert "" in result.stdout
+
+
+def test_spawn_identity_capture_failure_kills_and_reaps_child(
+    tmp_path, monkeypatch
+):
+    """F2: Popen 成功后、身份捕获阶段任何异常(如 AccessDenied)都必须
+    best-effort 终止并回收不可跟踪的子进程,再重抛;绝不留存孤儿编译进程。"""
+    fake = _RecordingPopen(pid=4321)
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: fake)
+    monkeypatch.setattr(
+        psutil, "Process", Mock(side_effect=psutil.AccessDenied(pid=4321))
+    )
+
+    with pytest.raises(psutil.AccessDenied):
+        spawn_compile_process(tmp_path, "doc_x", {})
+
+    assert fake.killed or fake.terminated
+    assert fake.waited
+
+
+def test_identity_read_no_such_process_mid_check_is_process_gone(monkeypatch):
+    """F7: exe()/cwd()/cmdline() 读取时进程刚好退出(NoSuchProcess)是
+    process_gone,不是 identity_mismatch;AccessDenied 仍为不匹配证据。"""
+    for attr in ("exe", "cwd", "cmdline"):
+        identity = _fake_identity()
+        fake = _matching_fake(identity)
+
+        def gone(pid=identity.pid):
+            raise psutil.NoSuchProcess(pid)
+
+        setattr(fake, attr, gone)
+        monkeypatch.setattr(psutil, "Process", lambda _pid, f=fake: f)
+        status = verify_process_identity(identity)
+        assert status.status == "process_gone", attr
+
+
+def test_identity_read_access_denied_remains_mismatch_evidence(monkeypatch):
+    identity = _fake_identity()
+    fake = _matching_fake(identity)
+
+    def denied(pid=identity.pid):
+        raise psutil.AccessDenied(pid=pid)
+
+    fake.exe = denied
+    monkeypatch.setattr(psutil, "Process", lambda _pid: fake)
+    status = verify_process_identity(identity)
+    assert status.status == "identity_mismatch"
+    assert "executable" in status.mismatched_fields
+
+
+def _survivor_fake(pid, identity, log=None, children=()):
+    """与记录树匹配(同指纹、同 cwd)的伪幸存进程。"""
+    return _FakeProcess(
+        pid=pid,
+        create_time=identity.create_time,
+        executable=identity.executable,
+        cwd=identity.cwd,
+        cmdline=["python", "-m", "scripts.compile", "doc_1"],
+        children=children,
+        log=log,
+    )
+
+
+@pytest.mark.skipif(not IS_WINDOWS, reason="Windows 幸存者扫描分支")
+def test_already_gone_with_matching_survivor_terminates_then_succeeds(
+    monkeypatch,
+):
+    """F6: 根进程已退出但存在同指纹同 cwd 的幸存后代时,必须先终止该幸存
+    进程并复查干净,才允许返回 already_gone。"""
+    identity = _fake_identity(pid=424242)
+    log = []
+    survivor = _survivor_fake(434343, identity, log=log)
+    scan_pool = [survivor]
+
+    def fake_process(pid):
+        if pid == identity.pid:
+            raise psutil.NoSuchProcess(pid)
+        return survivor
+
+    def fake_kill():
+        log.append(("kill", survivor.pid))
+        scan_pool.clear()
+
+    survivor.kill = fake_kill
+    monkeypatch.setattr(psutil, "Process", fake_process)
+    monkeypatch.setattr(psutil, "process_iter", lambda: list(scan_pool))
+
+    result = terminate_process_tree(identity, grace_seconds=1)
+
+    assert result.status == "already_gone", result
+    assert result.success
+    assert ("kill", 434343) in log
+
+
+@pytest.mark.skipif(not IS_WINDOWS, reason="Windows 幸存者扫描分支")
+def test_already_gone_with_persistent_survivor_fails_closed(monkeypatch):
+    """F6: 幸存进程终止无效(复查仍在)时必须 survivors_remaining,绝不
+    返回 already_gone。"""
+    identity = _fake_identity(pid=424242)
+    survivor = _survivor_fake(434343, identity)
+    # kill 无效: 进程仍在扫描结果中
+    monkeypatch.setattr(
+        psutil,
+        "Process",
+        lambda pid: (_ for _ in ()).throw(psutil.NoSuchProcess(pid))
+        if pid == identity.pid
+        else survivor,
+    )
+    monkeypatch.setattr(psutil, "process_iter", lambda: [survivor])
+
+    result = terminate_process_tree(identity, grace_seconds=1)
+
+    assert result.status == "survivors_remaining"
+    assert not result.success
+    assert result.survivors == (434343,)
+
+
+@pytest.mark.skipif(not IS_WINDOWS, reason="Windows 幸存者扫描分支")
+def test_already_gone_pid_reuse_is_never_killed(monkeypatch):
+    """F6 + 身份安全合同: 终止前指纹/cwd 复核无法证明身份(PID 复用或
+    进程已退出)时绝不 kill。"""
+    identity = _fake_identity(pid=424242)
+    log = []
+    # 第一次扫描: 指纹匹配(判为幸存);终止前复核 psutil.Process 抛
+    # NoSuchProcess(进程已退出/无法证明身份)→ 绝不 kill。
+    reused = _survivor_fake(434343, identity, log=log)
+    scans = [[reused], []]
+
+    def fake_process(pid):
+        raise psutil.NoSuchProcess(pid)
+
+    def fake_scan():
+        return scans.pop(0) if scans else []
+
+    monkeypatch.setattr(psutil, "Process", fake_process)
+    monkeypatch.setattr(psutil, "process_iter", fake_scan)
+
+    result = terminate_process_tree(identity, grace_seconds=1)
+
+    assert ("kill", 434343) not in log
+    assert result.status == "already_gone"
+
+
+@pytest.mark.skipif(not IS_WINDOWS, reason="Windows 幸存者扫描分支")
+def test_already_gone_survivor_check_error_is_uncertain(monkeypatch):
+    """F6: 幸存者检查自身失败时不得返回 already_gone;返回非成功的不确定
+    状态(失败关闭)。"""
+    identity = _fake_identity(pid=424242)
+    monkeypatch.setattr(
+        psutil,
+        "Process",
+        Mock(side_effect=psutil.NoSuchProcess(identity.pid)),
+    )
+
+    def boom():
+        raise psutil.Error("scan failed")
+
+    monkeypatch.setattr(psutil, "process_iter", boom)
+
+    result = terminate_process_tree(identity, grace_seconds=1)
+
+    assert result.status != "already_gone"
+    assert not result.success
+
+
+def test_already_gone_posix_group_alive_terminates_group(monkeypatch):
+    """F6(POSIX 分支): 根进程退出但进程组仍存活 → SIGTERM 终止组,
+    组消失后才允许 already_gone。"""
+    identity = _fake_identity(pid=424245)
+    calls = []
+
+    def fake_killpg(pgid, sig):
+        calls.append(sig)
+        if sig == 0 and signal.SIGTERM not in calls:
+            return  # 组仍存活
+        if sig == 0:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(os, "killpg", fake_killpg, raising=False)
+    monkeypatch.setattr(
+        psutil,
+        "Process",
+        Mock(side_effect=psutil.NoSuchProcess(identity.pid)),
+    )
+
+    result = terminate_process_tree(identity, grace_seconds=1)
+
+    assert result.status == "already_gone", result
+    assert signal.SIGTERM in calls
+
+
+def test_already_gone_posix_group_empty_returns_already_gone(monkeypatch):
+    identity = _fake_identity(pid=424245)
+
+    def fake_killpg(pgid, sig):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(os, "killpg", fake_killpg, raising=False)
+    monkeypatch.setattr(
+        psutil,
+        "Process",
+        Mock(side_effect=psutil.NoSuchProcess(identity.pid)),
+    )
+
+    result = terminate_process_tree(identity, grace_seconds=1)
+
+    assert result.status == "already_gone"
+    assert result.success
+
+
+def test_already_gone_posix_group_check_error_is_uncertain(monkeypatch):
+    identity = _fake_identity(pid=424245)
+
+    def fake_killpg(pgid, sig):
+        raise OSError("unexpected killpg failure")
+
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(os, "killpg", fake_killpg, raising=False)
+    monkeypatch.setattr(
+        psutil,
+        "Process",
+        Mock(side_effect=psutil.NoSuchProcess(identity.pid)),
+    )
+
+    result = terminate_process_tree(identity, grace_seconds=1)
+
+    assert result.status != "already_gone"
+    assert not result.success

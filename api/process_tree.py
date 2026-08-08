@@ -19,6 +19,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -42,6 +43,11 @@ STATUS_TIMED_OUT = "timed_out"
 STATUS_TERMINATED = "terminated"
 STATUS_ALREADY_GONE = "already_gone"
 STATUS_SURVIVORS_REMAINING = "survivors_remaining"
+#: 幸存者检查自身失败: 无法证明记录树已退出,非成功状态(失败关闭)。
+STATUS_EXIT_UNCONFIRMED = "exit_unconfirmed"
+
+#: compile.py 以子进程派生 relate 的脚本后缀(指纹含脚本绝对路径)。
+_RELATE_SCRIPT_SUFFIX = "scripts/relate.py"
 
 
 @dataclass(frozen=True)
@@ -80,7 +86,7 @@ class ProcessResult:
 
 @dataclass(frozen=True)
 class TerminationResult:
-    status: str  # terminated | already_gone | identity_mismatch | survivors_remaining
+    status: str  # terminated | already_gone | identity_mismatch | survivors_remaining | exit_unconfirmed
     survivors: tuple[int, ...] = ()
     mismatched_fields: tuple[str, ...] = ()
 
@@ -111,7 +117,15 @@ def _normalize_path(value: str) -> str:
 def spawn_compile_process(
     base_dir: Path, doc_id: str, env: Mapping[str, str] | None
 ) -> SpawnedProcess:
-    """以独立进程组启动 `sys.executable -m scripts.compile <doc_id>` 并记录身份。"""
+    """以独立进程组启动 `sys.executable -m scripts.compile <doc_id>` 并记录身份。
+
+    - 管道显式 encoding="utf-8" + errors="replace": 子进程按 PYTHONUTF8
+      输出 UTF-8,宿主 locale(cp936/cp1252)不得导致 communicate 抛出
+      UnicodeDecodeError 而回滚一次成功的编译;
+    - Popen 成功后、SpawnedProcess 返回前的身份捕获阶段任何异常:
+      该子进程对调用方不可见(无身份、无 Manifest 记录),必须 best-effort
+      终止并回收后重抛,绝不留存不可跟踪的编译进程。
+    """
     base_dir = Path(base_dir)
     argv = [sys.executable, "-m", "scripts.compile", doc_id]
     creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
@@ -123,20 +137,42 @@ def spawn_compile_process(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         creationflags=creationflags,
         start_new_session=(os.name != "nt"),
     )
     fingerprint = command_fingerprint(argv)
-    identity = ProcessIdentity(
-        pid=popen.pid,
-        create_time=_read_create_time(popen.pid),
-        executable=_read_attr(popen.pid, "exe", fallback=sys.executable),
-        cwd=_read_attr(popen.pid, "cwd", fallback=str(base_dir)),
-        command_fingerprint=fingerprint,
-        process_group_id=_read_process_group_id(popen.pid),
-        platform=PLATFORM,
-    )
+    try:
+        identity = ProcessIdentity(
+            pid=popen.pid,
+            create_time=_read_create_time(popen.pid),
+            executable=_read_attr(popen.pid, "exe", fallback=sys.executable),
+            cwd=_read_attr(popen.pid, "cwd", fallback=str(base_dir)),
+            command_fingerprint=fingerprint,
+            process_group_id=_read_process_group_id(popen.pid),
+            platform=PLATFORM,
+        )
+    except BaseException:
+        _terminate_untracked_child(popen)
+        raise
     return SpawnedProcess(popen=popen, identity=identity, command_fingerprint=fingerprint)
+
+
+def _terminate_untracked_child(popen: subprocess.Popen) -> None:
+    """best-effort 终止并回收身份捕获失败的不可跟踪子进程(不得抛出)。"""
+    try:
+        popen.kill()
+    except Exception as exc:
+        logger.error(
+            "failed to kill untracked compile process pid=%s: %s", popen.pid, exc
+        )
+    try:
+        popen.wait(timeout=5)
+    except Exception as exc:
+        logger.error(
+            "failed to reap untracked compile process pid=%s: %s", popen.pid, exc
+        )
 
 
 def _read_create_time(pid: int) -> float:
@@ -167,7 +203,11 @@ def _read_process_group_id(pid: int) -> int:
 
 
 def verify_process_identity(identity: ProcessIdentity) -> IdentityStatus:
-    """五要素身份验证:pid 存在、create_time、executable、cwd、命令指纹。"""
+    """五要素身份验证:pid 存在、create_time、executable、cwd、命令指纹。
+
+    任一身份读取阶段抛出 NoSuchProcess 表示进程在检查中途退出:分类为
+    process_gone(不是不匹配);AccessDenied 仍是身份不匹配证据。
+    """
     try:
         proc = psutil.Process(identity.pid)
         create_time = proc.create_time()
@@ -180,17 +220,23 @@ def verify_process_identity(identity: ProcessIdentity) -> IdentityStatus:
     try:
         if _normalize_path(proc.exe()) != _normalize_path(identity.executable):
             mismatched.append("executable")
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
+    except psutil.NoSuchProcess:
+        return IdentityStatus(status=STATUS_PROCESS_GONE)
+    except psutil.AccessDenied:
         mismatched.append("executable")
     try:
         if _normalize_path(proc.cwd()) != _normalize_path(identity.cwd):
             mismatched.append("cwd")
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
+    except psutil.NoSuchProcess:
+        return IdentityStatus(status=STATUS_PROCESS_GONE)
+    except psutil.AccessDenied:
         mismatched.append("cwd")
     try:
         if command_fingerprint(proc.cmdline()) != identity.command_fingerprint:
             mismatched.append("command_fingerprint")
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
+    except psutil.NoSuchProcess:
+        return IdentityStatus(status=STATUS_PROCESS_GONE)
+    except psutil.AccessDenied:
         mismatched.append("command_fingerprint")
 
     if mismatched:
@@ -240,13 +286,13 @@ def terminate_process_tree(
             mismatched_fields=status.mismatched_fields,
         )
     if status.status == STATUS_PROCESS_GONE:
-        return TerminationResult(status=STATUS_ALREADY_GONE)
+        return _settle_already_gone(identity, grace_seconds)
 
     try:
         root = psutil.Process(identity.pid)
         descendants = root.children(recursive=True)
     except psutil.NoSuchProcess:
-        return TerminationResult(status=STATUS_ALREADY_GONE)
+        return _settle_already_gone(identity, grace_seconds)
 
     _cooperative_terminate(root, identity)
 
@@ -304,3 +350,152 @@ def _still_running(proc: psutil.Process) -> bool:
             return False
     except psutil.NoSuchProcess:
         return False
+
+
+# ---------------------------------------------------------------------------
+# already-gone 幸存者确认(根进程已退出不代表记录树已退出)
+# ---------------------------------------------------------------------------
+
+
+def _settle_already_gone(
+    identity: ProcessIdentity, grace_seconds: int
+) -> TerminationResult:
+    """根进程已退出: 确认记录树无幸存后代后才允许 already_gone。
+
+    - 幸存者检查自身失败 → exit_unconfirmed(无法证明,失败关闭);
+    - 发现幸存者 → 只终止经指纹 + cwd 复核的确切进程,再复查;
+      仍有幸存 → survivors_remaining(失败关闭);
+    - 无幸存 → already_gone。
+    """
+    survivors = _recorded_tree_survivors(identity)
+    if survivors is None:
+        return TerminationResult(status=STATUS_EXIT_UNCONFIRMED)
+    if survivors:
+        _terminate_verified_survivors(identity, survivors, grace_seconds)
+        survivors = _recorded_tree_survivors(identity)
+        if survivors is None:
+            return TerminationResult(status=STATUS_EXIT_UNCONFIRMED)
+        if survivors:
+            return TerminationResult(
+                status=STATUS_SURVIVORS_REMAINING, survivors=survivors
+            )
+    return TerminationResult(status=STATUS_ALREADY_GONE)
+
+
+def _recorded_tree_survivors(identity: ProcessIdentity) -> tuple[int, ...] | None:
+    """返回记录树的幸存后代标识;检查本身失败返回 None(不确定,失败关闭)。"""
+    if os.name != "nt":
+        try:
+            os.killpg(identity.process_group_id, 0)
+        except ProcessLookupError:
+            return ()
+        except PermissionError:
+            # 组存在但无权发信号 → 组内存活进程,以 pgid 为幸存标识。
+            return (identity.process_group_id,)
+        except OSError as exc:
+            logger.warning(
+                "process group %d survivor check failed: %s",
+                identity.process_group_id,
+                exc,
+            )
+            return None
+        return (identity.process_group_id,)
+    return _scan_business_command_survivors(identity)
+
+
+def _is_recorded_tree_fingerprint(
+    identity: ProcessIdentity, fingerprint: str
+) -> bool:
+    """判断命令指纹是否属于记录树: 编译根命令或 compile.py 派生的 relate
+    子进程(指纹 "<…>/scripts/relate.py|<doc_id>",含脚本绝对路径)。"""
+    if fingerprint == identity.command_fingerprint:
+        return True
+    script, sep, doc = fingerprint.rpartition("|")
+    if not sep or not doc:
+        return False
+    identity_doc = identity.command_fingerprint.rpartition("|")[2]
+    return (
+        doc == identity_doc
+        and script.replace("\\", "/").endswith(_RELATE_SCRIPT_SUFFIX)
+    )
+
+
+def _scan_business_command_survivors(
+    identity: ProcessIdentity,
+) -> tuple[int, ...] | None:
+    """Windows: 扫描与记录树同业务命令指纹且同 cwd 的存活进程。"""
+    expected_cwd = _normalize_path(identity.cwd)
+    survivors: list[int] = []
+    try:
+        for proc in psutil.process_iter():
+            try:
+                fingerprint = command_fingerprint(proc.cmdline() or [])
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            if not _is_recorded_tree_fingerprint(identity, fingerprint):
+                continue
+            try:
+                if _normalize_path(proc.cwd()) != expected_cwd:
+                    continue
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            survivors.append(proc.pid)
+    except psutil.Error as exc:
+        logger.warning("survivor scan failed: %s", exc)
+        return None
+    return tuple(survivors)
+
+
+def _terminate_verified_survivors(
+    identity: ProcessIdentity, survivors: tuple[int, ...], grace_seconds: int
+) -> None:
+    """只终止经指纹 + cwd 复核的确切幸存进程(身份不匹配绝不 kill)。"""
+    if os.name != "nt":
+        try:
+            os.killpg(identity.process_group_id, signal.SIGTERM)
+        except OSError as exc:
+            logger.warning(
+                "killpg(%d, SIGTERM) for survivors failed: %s",
+                identity.process_group_id,
+                exc,
+            )
+            return
+        deadline = time.monotonic() + max(grace_seconds, 0)
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(identity.process_group_id, 0)
+            except OSError:
+                return
+            time.sleep(0.05)
+        try:
+            os.killpg(
+                identity.process_group_id,
+                getattr(signal, "SIGKILL", signal.SIGTERM),
+            )
+        except OSError as exc:
+            logger.warning(
+                "killpg(%d, SIGKILL) for survivors failed: %s",
+                identity.process_group_id,
+                exc,
+            )
+        return
+    expected_cwd = _normalize_path(identity.cwd)
+    for pid in survivors:
+        try:
+            proc = psutil.Process(pid)
+            fingerprint = command_fingerprint(proc.cmdline() or [])
+            if not _is_recorded_tree_fingerprint(identity, fingerprint):
+                # PID 复用: 无法证明属于记录树,绝不 kill。
+                logger.warning(
+                    "survivor pid %d fingerprint mismatch at kill time; skipped",
+                    pid,
+                )
+                continue
+            if _normalize_path(proc.cwd()) != expected_cwd:
+                logger.warning(
+                    "survivor pid %d cwd mismatch at kill time; skipped", pid
+                )
+                continue
+            proc.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
+            logger.warning("survivor pid %d termination skipped: %s", pid, exc)

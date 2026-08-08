@@ -333,8 +333,11 @@ def rollback_published_intake(
     - journal 缺失: 本轮未发布任何目标,no-op;
     - journal 不可解析或结构非法: 失败关闭,不删除任何文件;
     - created_by_this_request 非 True 的条目跳过(绝不触碰既有文件);
-    - 路径重算不安全(raw 非本 doc_id 精确目标、originals 非直接子文件、
-      越界等): 计入 failures 并保留文件;
+    - 路径必须与 Manifest 声明的三项 intake 目标(published_intake 的
+      original_path/raw_text_path/raw_meta_path)精确一致;任何其他路径
+      (含 originals/ 合法直接子文件)计入 failures 并保留文件(失败关闭);
+    - 重算安全校验作为第二道防线(raw 非本 doc_id 精确目标、originals
+      非直接子文件、越界等): 计入 failures 并保留文件;
     - 幂等: 目标已不存在视为成功,第二次调用为 no-op。
     """
     base_dir = Path(base_dir)
@@ -349,6 +352,12 @@ def rollback_published_intake(
     if not isinstance(entries, list):
         return [INTAKE_JOURNAL_FILENAME]
 
+    intake = manifest.published_intake
+    declared = (
+        {intake.original_path, intake.raw_text_path, intake.raw_meta_path}
+        if intake is not None
+        else frozenset()
+    )
     failures: list[str] = []
     for entry in entries:
         if not isinstance(entry, Mapping):
@@ -356,6 +365,9 @@ def rollback_published_intake(
             continue
         relative_path = entry.get("path")
         if entry.get("created_by_this_request") is not True:
+            continue
+        if relative_path not in declared:
+            failures.append(str(relative_path))
             continue
         target = _recompute_safe_intake_target(
             base_dir, manifest.doc_id, relative_path

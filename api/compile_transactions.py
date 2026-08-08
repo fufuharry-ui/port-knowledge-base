@@ -581,6 +581,7 @@ def create_prepared_transaction(
     kind: TransactionKind,
     previous_meta: dict[str, object] | None,
     published_intake: PublishedIntake | None = None,
+    previous_meta_bytes: bytes | None = None,
 ) -> CompileManifest:
     """在 config.transaction_dir 下创建 PREPARED 事务。
 
@@ -588,6 +589,10 @@ def create_prepared_transaction(
         staging 目录 → 七项快照(耐久写入)→ 快照大小与 SHA-256 验证
         → 保存 source-meta-before.yaml → 原子写 PREPARED Manifest
         → durable_publish_directory 原子发布为正式目录。
+
+    source-meta-before.yaml 优先保存 previous_meta_bytes(原 meta 文件
+    字节快照,注释/格式不丢失,未接受回滚逐字节恢复);仅在旧调用方
+    未提供字节时回退为 previous_meta 的序列化形式(legacy)。
 
     正式发布前任何失败删除 staging,业务目录保持不变。
     """
@@ -644,7 +649,9 @@ def create_prepared_transaction(
                     original_sha256=None,
                 ))
 
-        if previous_meta is not None:
+        if previous_meta_bytes is not None:
+            durable_write_bytes(staging / SOURCE_META_FILENAME, previous_meta_bytes)
+        elif previous_meta is not None:
             durable_write_yaml(staging / SOURCE_META_FILENAME, previous_meta)
 
         manifest = CompileManifest(
@@ -933,7 +940,9 @@ def _record_recovery_failure(
 def _terminate_leftover_process(
     manifest: CompileManifest, config: CompileRuntimeConfig
 ) -> str | None:
-    """RUNNING 遗留进程处理;返回 None 表示可继续回滚,否则为阻断原因。"""
+    """RUNNING/ROLLBACKING 遗留进程处理;返回 None 表示可继续回滚,
+    否则为阻断原因。进程身份验证优先;根进程已退出时仍须确认记录树
+    无幸存后代(F6 幸存者确认),再允许回滚。"""
     record = manifest.process
     if record is None:
         return None
@@ -950,6 +959,7 @@ def _terminate_leftover_process(
         ),
         platform=record.platform,
     )
+    grace = manifest.termination_grace_seconds or config.termination_grace_seconds
     status = verify_process_identity(identity)
     if status.status == STATUS_IDENTITY_MISMATCH:
         fields = ",".join(status.mismatched_fields)
@@ -958,8 +968,16 @@ def _terminate_leftover_process(
             "evidence preserved, nothing killed"
         )
     if status.status == STATUS_PROCESS_GONE:
-        return None
-    grace = manifest.termination_grace_seconds or config.termination_grace_seconds
+        # 根进程已退出:经 terminate_process_tree 的 already-gone 路径确认
+        # 记录树无幸存后代(孤立的 relate 子进程不得在回滚期间继续写共享
+        # YAML);幸存或无法确认一律阻断。
+        sweep = terminate_process_tree(identity, grace)
+        if sweep.success:
+            return None
+        return (
+            "recorded process tree exit unconfirmed: "
+            f"{sweep.status} {list(sweep.survivors)}"
+        )
     result = terminate_process_tree(identity, grace)
     if result.status == STATUS_IDENTITY_MISMATCH:
         return "process identity mismatch during termination; evidence preserved"
@@ -1148,7 +1166,8 @@ def recover_transaction(
       reason_code=ERROR_CODE_UNACCEPTED(仅请求线程在事务被接受前)时,
       不写错误终态,而是把 meta 字节级恢复为 source-meta-before.yaml;
     - RUNNING: 验证进程身份并终止遗留树,确认退出后才回滚;
-    - ROLLBACKING: 继续幂等回滚;
+    - ROLLBACKING: 继续幂等回滚;携带进程记录时(如 RUNNING 迁移失败后
+      持久化的可恢复证据)同样先验证并终止遗留树、确认无幸存后代才回滚;
     - ManifestIntegrityError: 硬阻断,不触碰业务文件。
     """
     base_dir = Path(base_dir)
@@ -1202,7 +1221,7 @@ def recover_transaction(
                 reason="prepared_unbound_cleaned",
             )
 
-    if manifest.state is TransactionState.RUNNING:
+    if manifest.state in (TransactionState.RUNNING, TransactionState.ROLLBACKING):
         blocked_reason = _terminate_leftover_process(manifest, config)
         if blocked_reason is not None:
             return RecoveryResult(

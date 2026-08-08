@@ -340,10 +340,12 @@ def test_unpublished_staging_dirs_are_cleaned_first(tmp_path):
 
 
 def test_running_with_gone_process_is_rolled_back(tmp_path, monkeypatch):
+    """RUNNING 且根进程已退出: 恢复先经 already-gone 路径确认记录树无幸存
+    后代(幸存者清扫),再回滚为 interrupted。"""
     manifest = running_manifest(tmp_path)
     import api.compile_transactions as transactions
 
-    terminate = Mock()
+    terminate = Mock(return_value=TerminationResult(status="already_gone"))
     monkeypatch.setattr(
         transactions, "verify_process_identity",
         lambda identity: IdentityStatus(status="process_gone"),
@@ -351,7 +353,8 @@ def test_running_with_gone_process_is_rolled_back(tmp_path, monkeypatch):
     monkeypatch.setattr(transactions, "terminate_process_tree", terminate)
     report = recover_startup(tmp_path, runtime_config(tmp_path))
     assert report.ready is True
-    terminate.assert_not_called()
+    # 根进程 gone ≠ 树已退出: 必须调用一次 already-gone 幸存者确认
+    terminate.assert_called_once()
     assert read_meta(tmp_path, DOC_ID)["error_code"] == "interrupted"
 
 
@@ -793,3 +796,222 @@ def test_cli_cleanup_terminal(tmp_path, capsys):
 def test_cli_rejects_unsafe_job_id(tmp_path, capsys):
     exit_code = cli_main(["verify", "../escape", "--base-dir", str(tmp_path)])
     assert exit_code == 1
+
+
+# ---------------------------------------------------------------------------
+# Codex 修复(F3b):ROLLBACKING 携带进程记录时,恢复必须先验证并终止
+# 记录进程、确认记录树无幸存后代,才允许继续回滚
+# ---------------------------------------------------------------------------
+
+
+def rollbacking_manifest_with_process(tmp_path):
+    """ROLLBACKING + 进程记录现场(如 RUNNING 迁移失败后持久化的证据)。"""
+    manifest = running_manifest(tmp_path)
+    return transition_manifest(
+        manifest.job_dir,
+        expected=RUNNING,
+        target=ROLLBACKING,
+        failure={
+            "original_code": "running_transition_failed",
+            "original_message": "manifest io failed",
+        },
+    )
+
+
+def test_rollbacking_with_recorded_process_terminates_before_restore(
+    tmp_path, monkeypatch
+):
+    """F3(b): ROLLBACKING 携带进程记录 → 先验证身份并终止,再幂等回滚。"""
+    manifest = rollbacking_manifest_with_process(tmp_path)
+    import api.compile_transactions as transactions
+
+    calls = []
+    monkeypatch.setattr(
+        transactions,
+        "verify_process_identity",
+        lambda identity: IdentityStatus(status="verified"),
+    )
+    monkeypatch.setattr(
+        transactions,
+        "terminate_process_tree",
+        lambda identity, grace: calls.append(("terminate", identity.pid))
+        or TerminationResult(status="terminated"),
+    )
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+    assert result.completed is True
+    assert calls == [("terminate", 4321)]
+    # 回滚完成: 原始失败原因保留,文档终态按原始原因
+    meta = read_meta(tmp_path, DOC_ID)
+    assert meta["status"] == "error"
+    assert meta["error_code"] == "running_transition_failed"
+    for record in manifest.artifacts:
+        restored = (tmp_path / record.path).read_bytes()
+        assert restored == (manifest.job_dir / record.snapshot).read_bytes()
+
+
+def test_rollbacking_identity_mismatch_blocks_without_kill(tmp_path, monkeypatch):
+    """F3(b): ROLLBACKING 进程记录身份不匹配 → 绝不 kill、绝不回滚,
+    保留 ROLLBACKING 证据阻断。"""
+    manifest = rollbacking_manifest_with_process(tmp_path)
+    import api.compile_transactions as transactions
+
+    terminate = Mock()
+    monkeypatch.setattr(
+        transactions,
+        "verify_process_identity",
+        lambda identity: IdentityStatus(
+            status="identity_mismatch", mismatched_fields=("create_time",)
+        ),
+    )
+    monkeypatch.setattr(transactions, "terminate_process_tree", terminate)
+    before = hash_tree(tmp_path)
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+    assert result.blocked is True
+    assert "identity" in (result.reason or "")
+    terminate.assert_not_called()
+    assert load_manifest(manifest.job_dir).state is ROLLBACKING
+    assert hash_tree(tmp_path) == before
+
+
+def test_rollbacking_gone_process_sweeps_survivors_then_rolls_back(
+    tmp_path, monkeypatch
+):
+    """F3(b)+F6: ROLLBACKING 根进程已退出 → already-gone 幸存者确认干净后
+    才回滚。"""
+    manifest = rollbacking_manifest_with_process(tmp_path)
+    import api.compile_transactions as transactions
+
+    terminate = Mock(return_value=TerminationResult(status="already_gone"))
+    monkeypatch.setattr(
+        transactions,
+        "verify_process_identity",
+        lambda identity: IdentityStatus(status="process_gone"),
+    )
+    monkeypatch.setattr(transactions, "terminate_process_tree", terminate)
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+    assert result.completed is True
+    terminate.assert_called_once()
+
+
+def test_rollbacking_gone_process_with_survivors_blocks_rollback(
+    tmp_path, monkeypatch
+):
+    """F3(b)+F6: 根进程已退出但记录树有幸存者 → 绝不回滚。"""
+    manifest = rollbacking_manifest_with_process(tmp_path)
+    import api.compile_transactions as transactions
+
+    monkeypatch.setattr(
+        transactions,
+        "verify_process_identity",
+        lambda identity: IdentityStatus(status="process_gone"),
+    )
+    monkeypatch.setattr(
+        transactions,
+        "terminate_process_tree",
+        lambda identity, grace: TerminationResult(
+            status="survivors_remaining", survivors=(4322,)
+        ),
+    )
+    before = hash_tree(tmp_path)
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+    assert result.blocked is True
+    assert "unconfirmed" in (result.reason or "")
+    assert load_manifest(manifest.job_dir).state is ROLLBACKING
+    assert hash_tree(tmp_path) == before
+
+
+# ---------------------------------------------------------------------------
+# Codex 修复(F5):source-meta-before.yaml 必须是原 meta 文件字节快照,
+# 未接受回滚逐字节恢复(注释/格式不丢失);旧序列化形式仅作 legacy 回退
+# ---------------------------------------------------------------------------
+
+
+def _write_quirky_meta(base, doc_id):
+    """带注释与非常规空白的 meta 字节(解析等价但字节 unique)。"""
+    raw = base / "raw"
+    raw.mkdir(parents=True, exist_ok=True)
+    meta_path = raw / f"{doc_id}.meta.yaml"
+    meta_path.write_text(
+        "# 运维手工注释:不得丢失\n"
+        f"id: {doc_id}\n"
+        "status:   compiled\n"
+        "title: 港口月报\n"
+        "\n",
+        encoding="utf-8",
+    )
+    return meta_path
+
+
+def test_prepare_snapshots_original_meta_bytes_verbatim(tmp_path):
+    """F5: PREPARED 事务的 source-meta-before.yaml 与原 meta 文件字节一致。"""
+    from api.compile_jobs import prepare_recompile_transaction
+
+    seed_business_tree(tmp_path)
+    meta_path = _write_quirky_meta(tmp_path, DOC_ID)
+    original_bytes = meta_path.read_bytes()
+    manifest = prepare_recompile_transaction(
+        DOC_ID, tmp_path, runtime_config(tmp_path)
+    )
+    snapshot = (manifest.job_dir / "source-meta-before.yaml").read_bytes()
+    assert snapshot == original_bytes
+    assert b"# " in snapshot  # 注释字节保留(序列化形式必然丢失)
+
+
+def test_unaccepted_rollback_restores_meta_bytes_verbatim(tmp_path):
+    """F5: 未接受请求的回滚把 meta 逐字节恢复为绑定前文件(含注释/格式),
+    且终态验证一致通过。"""
+    from api.compile_jobs import prepare_recompile_transaction
+
+    seed_business_tree(tmp_path)
+    meta_path = _write_quirky_meta(tmp_path, DOC_ID)
+    original_bytes = meta_path.read_bytes()
+    manifest = prepare_recompile_transaction(
+        DOC_ID, tmp_path, runtime_config(tmp_path)
+    )
+    # 模拟请求线程绑定(改写 meta)后未被接受
+    write_doc_meta(tmp_path, DOC_ID, {
+        "id": DOC_ID, "status": "compiling", "compile_job_id": manifest.job_id,
+    })
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="unaccepted",
+        reason_message="schedule transition failed before acceptance",
+    )
+    assert result.completed is True
+    assert meta_path.read_bytes() == original_bytes
+    verification = verify_terminal_transaction(
+        tmp_path, load_manifest(manifest.job_dir)
+    )
+    assert verification.ok is True, verification.failures
+
+
+def test_unaccepted_rollback_legacy_serialized_snapshot_still_verifies(tmp_path):
+    """F5 legacy: 旧格式事务(序列化快照,无原始字节)仍按快照字节恢复并
+    通过终态验证。"""
+    manifest = make_prepared(tmp_path)  # previous_meta 仅 dict → 序列化快照
+    write_doc_meta(tmp_path, DOC_ID, {
+        "id": DOC_ID, "status": "compiling", "compile_job_id": manifest.job_id,
+    })
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="unaccepted", reason_message="add_task failed",
+    )
+    assert result.completed is True
+    snapshot = (manifest.job_dir / "source-meta-before.yaml").read_bytes()
+    assert (tmp_path / "raw" / f"{DOC_ID}.meta.yaml").read_bytes() == snapshot
+    verification = verify_terminal_transaction(
+        tmp_path, load_manifest(manifest.job_dir)
+    )
+    assert verification.ok is True, verification.failures

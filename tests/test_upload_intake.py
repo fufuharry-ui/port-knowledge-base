@@ -396,3 +396,52 @@ def test_recovery_prepared_unbound_revokes_journaled_partial_publish(tmp_path):
     assert preexisting_text.read_bytes() == b"preexisting-text"
     # 事务目录(含 journal)已清理
     assert not manifest.job_dir.exists()
+
+
+# ---------------------------------------------------------------------------
+# Codex 修复(F8):journal 路径必须与 Manifest 声明的三项 intake 目标
+# 精确一致;任何其他路径(含 originals/ 合法直接子文件)失败关闭、保留文件
+# ---------------------------------------------------------------------------
+
+
+def test_rollback_refuses_journal_path_not_declared_in_manifest(tmp_path):
+    """F8: journal 声明 originals/unrelated.pdf(能通过直接子文件重算)
+    但不是本事务 Manifest 声明的 original 目标 → 拒绝删除,计入 failures。"""
+    manifest, _, _ = prepared_upload_transaction(tmp_path, "report.txt")
+    unrelated = tmp_path / "originals" / "unrelated.pdf"
+    unrelated.parent.mkdir(parents=True, exist_ok=True)
+    unrelated.write_bytes(b"unrelated")
+    write_journal(manifest.job_dir, [
+        {"path": "originals/unrelated.pdf", "created_by_this_request": True}
+    ])
+    failures = rollback_published_intake(manifest, tmp_path)
+    assert failures == ["originals/unrelated.pdf"]
+    assert unrelated.read_bytes() == b"unrelated"
+
+
+def test_rollback_refuses_journal_path_of_other_doc_raw_target(tmp_path):
+    """F8: journal 声明 raw/<本 doc>.txt 之外的既有文件路径(raw/keep.txt
+    不是本事务声明目标)→ 拒绝删除。"""
+    manifest, _, prepared = prepared_upload_transaction(tmp_path, "report.txt")
+    keep = tmp_path / "raw" / "keep.txt"
+    keep.parent.mkdir(parents=True, exist_ok=True)
+    keep.write_bytes(b"keep")
+    write_journal(manifest.job_dir, [
+        {"path": "raw/keep.txt", "created_by_this_request": True},
+        {"path": f"raw/{prepared.doc_id}.txt", "created_by_this_request": True},
+    ])
+    # 声明目标不存在(本轮未发布): 幂等成功;非声明目标失败关闭
+    failures = rollback_published_intake(manifest, tmp_path)
+    assert failures == ["raw/keep.txt"]
+    assert keep.read_bytes() == b"keep"
+
+
+def test_rollback_declared_targets_still_removed(tmp_path):
+    """F8 对照: journal 路径恰为 Manifest 声明目标时行为不变(精确撤销)。"""
+    manifest, staged, prepared = prepared_upload_transaction(tmp_path, "report.txt")
+    publish_upload_intake(manifest, staged, prepared, tmp_path)
+    failures = rollback_published_intake(manifest, tmp_path)
+    assert failures == []
+    assert not (tmp_path / "originals" / "report.txt").exists()
+    assert not (tmp_path / "raw" / f"{prepared.doc_id}.txt").exists()
+    assert not (tmp_path / "raw" / f"{prepared.doc_id}.meta.yaml").exists()

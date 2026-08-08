@@ -991,7 +991,7 @@ def test_unmanaged_strict_app_fails_closed(tmp_path):
     生产 uvicorn 必经 lifespan,该分支仅防御 --lifespan off 类误用;
     测试实例必须显式 allow_unmanaged=True 才能绕过。
     """
-    strict_app = create_app(base_dir=tmp_path)
+    strict_app = create_app(base_dir=tmp_path, allow_path_override=True)
     strict_client = TestClient(strict_app)
     assert strict_client.get("/api/v1/health").status_code == 200
     assert strict_client.get("/api/v1/ready").status_code == 503
@@ -1017,7 +1017,7 @@ def test_lifespan_starts_ready_on_clean_tmp_repo(tmp_path):
     import api.main as api_mod
     from api.runtime_guard import ApiInstanceLock, ServiceReadiness
 
-    app = create_app(base_dir=tmp_path)
+    app = create_app(base_dir=tmp_path, allow_path_override=True)
     with TestClient(app) as test_client:
         response = test_client.get("/api/v1/ready")
         assert response.status_code == 200
@@ -1030,7 +1030,7 @@ def test_lifespan_starts_ready_on_clean_tmp_repo(tmp_path):
         business = test_client.get("/api/v1/wiki/index")
         assert business.status_code == 200
     # lifespan 结束后实例锁已释放:第二个实例可在同目录正常启动
-    with TestClient(create_app(base_dir=tmp_path)):
+    with TestClient(create_app(base_dir=tmp_path, allow_path_override=True)):
         pass
 
 
@@ -1038,9 +1038,9 @@ def test_startup_refused_when_instance_lock_held(tmp_path):
     """E005 Task 8(设计 §6.1):实例锁被持有时,第二个实例启动必须失败,不得服务。"""
     import portalocker
 
-    first = create_app(base_dir=tmp_path)
+    first = create_app(base_dir=tmp_path, allow_path_override=True)
     with TestClient(first):
-        second = create_app(base_dir=tmp_path)
+        second = create_app(base_dir=tmp_path, allow_path_override=True)
         with pytest.raises(portalocker.AlreadyLocked):
             _run_lifespan(second)
 
@@ -1055,13 +1055,13 @@ def test_startup_refused_on_orphan_compiling(tmp_path):
         encoding="utf-8",
     )
     with pytest.raises(RuntimeError, match="startup recovery"):
-        _run_lifespan(create_app(base_dir=tmp_path))
+        _run_lifespan(create_app(base_dir=tmp_path, allow_path_override=True))
     # 拒绝启动后实例锁已释放;修复孤儿后同目录可重新启动
     meta_path.write_text(
         yaml.safe_dump({"id": "doc_20260806_900", "status": "compiled"}),
         encoding="utf-8",
     )
-    _run_lifespan(create_app(base_dir=tmp_path))
+    _run_lifespan(create_app(base_dir=tmp_path, allow_path_override=True))
 
 
 # ─── E005 Task 9:重编译/删除的持久化事务合同 ──────────────────────────────────
@@ -1136,7 +1136,7 @@ def tmp_repo(tmp_path, monkeypatch):
 @pytest.fixture()
 def managed_client(tmp_repo):
     """经真实 lifespan 启动的 app(base_dir=tmp_repo):runtime/config/readiness 就位。"""
-    managed_app = create_app(base_dir=tmp_repo)
+    managed_app = create_app(base_dir=tmp_repo, allow_path_override=True)
     with TestClient(managed_app) as test_client:
         yield test_client
 
@@ -1534,3 +1534,69 @@ def test_upload_add_task_failure_fully_revokes_published_upload(
     assert verify_terminal_transaction(tmp_repo, rolled_back).ok is True
     mode, _reason = runtime.readiness.snapshot()
     assert mode == "ready"
+
+
+# ─── Codex 修复(F4/F9):base_dir 覆盖门禁、runtime 解析根、上传名归一 ─────────
+
+def test_create_app_rejects_foreign_base_dir_without_optin(tmp_path):
+    """F4: 路由处理器依赖模块级路径常量(单实例合同);未显式 opt-in 时
+    create_app 必须拒绝与模块 BASE_DIR 不同的 base_dir(fail-closed),
+    避免 app 对仓库 X 报 ready 却在默认仓库上读写。"""
+    with pytest.raises(ValueError):
+        create_app(base_dir=tmp_path / "elsewhere")
+
+
+def test_create_app_allows_foreign_base_dir_with_explicit_optin(tmp_path):
+    """F4: 显式 allow_path_override=True 的测试 opt-in 才允许 base_dir
+    覆盖(调用方负责同步重绑定模块路径常量)。"""
+    app = create_app(base_dir=tmp_path / "elsewhere", allow_path_override=True)
+    assert app.state.base_dir == Path(tmp_path / "elsewhere")
+
+
+def test_schedule_compile_prefers_runtime_resolved_base(tmp_path, monkeypatch):
+    """F4: 事务面向调用(prepare/bind/add_task base)必须使用 runtime
+    解析根,而非原始模块 BASE_DIR。"""
+    import api.main as api_mod
+    from fastapi import BackgroundTasks
+    from api.runtime_guard import (
+        ApiInstanceLock,
+        ServiceReadiness,
+        load_compile_runtime_config,
+    )
+    from scripts.doc_admin import read_doc_meta
+
+    module_base = tmp_path / "module-base"
+    resolved = tmp_path / "resolved"
+    for repo in (module_base, resolved):
+        _write_repo_doc(repo, "doc_1", status="raw")
+    monkeypatch.setattr(api_mod, "BASE_DIR", module_base)
+    config = load_compile_runtime_config(resolved)
+    runtime = api_mod.AppRuntime(
+        config=config,
+        readiness=ServiceReadiness(),
+        instance_lock=ApiInstanceLock(resolved / ".runtime" / "api-instance.lock"),
+        resolved_base=resolved,
+    )
+    background = BackgroundTasks()
+    api_mod._schedule_compile(background, "doc_1", runtime)
+
+    assert len(background.tasks) == 1
+    task = background.tasks[0]
+    assert Path(task.args[1]) == resolved
+    # meta 绑定发生在 resolved 仓库,而非模块 BASE_DIR 仓库
+    assert read_doc_meta("doc_1", base_dir=resolved)["status"] == "compiling"
+    assert read_doc_meta("doc_1", base_dir=module_base)["status"] == "raw"
+
+
+def test_safe_upload_name_normalizes_windows_separators_on_posix(monkeypatch):
+    """F9: POSIX 宿主上 Windows 风格 multipart 文件名(C:\\fakepath\\x.pdf)
+    也必须归一为 basename,保证唯一性检查、staging 与响应使用同一安全名。
+    直接测试归一函数(模拟 POSIX Path 语义),不在 Windows 上跳过。"""
+    from pathlib import PurePosixPath
+
+    import api.main as api_mod
+
+    monkeypatch.setattr(api_mod, "Path", PurePosixPath)
+    assert api_mod._safe_upload_name("C:\\fakepath\\report.pdf") == "report.pdf"
+    assert api_mod._safe_upload_name("/tmp/upload/report.txt") == "report.txt"
+    assert api_mod._safe_upload_name("..\\sub\\report.md") == "report.md"

@@ -523,9 +523,16 @@ def _accept_upload(
     丢弃未接受的 staging;进程真实崩溃时由 recover_startup 的
     .staging-* 清理兜底。staging 绝不参与回滚判定。
 
-    Codex R4-P2-1 说明:上传路径不持有 COMPILE_EXECUTION_LOCK——上传只
-    发布新文档的 original/raw 文件,后台终态验证器只读取既有文档产物,
-    绝不读取新上传目标,清理窗口与上传发布不存在交错风险。
+    Codex R4-P2-1 曾注记上传无需执行锁——该推理只覆盖验证器内容检查
+    (上传只发布新文档文件)。Codex R5-P2-1:旧任务的终态验证器(持有
+    COMPILE_EXECUTION_LOCK)仍可能在接受窗口内把 readiness 翻转为
+    recovery_required,使上传在门禁失效后继续发布并入队一个本应运行的
+    SCHEDULED 任务。因此上传与 _schedule_compile 同模式:活动事务检查后
+    非阻塞持有执行锁直到 add_task 返回(锁序 SCHEDULE → EXECUTION)。
+    释放执行锁到后台任务获取之间不会有 readiness 翻转:运行时只有执行
+    锁持有者(run_compile_task 路径)会翻转 readiness,而此时已存在
+    本事务的 SCHEDULED 活动 Manifest,任何新调度/删除请求都会先被
+    409 拒绝,绝不进入翻转路径。
     """
     if runtime is None:
         logger.error("upload rejected: runtime absent")
@@ -548,173 +555,184 @@ def _accept_upload(
                 raise HTTPException(
                     status_code=409, detail={"code": "knowledge_base_busy"}
                 )
-            # 唯一命名必须在锁内:同名上传串行,绝不覆盖既有 original。
-            final_name = _unique_original_path(safe_name).name
-            staged = stage_upload(file, config, safe_name=final_name)
-            _r8_boundary_after_intake_stage(staged)
-            duplicate = _find_duplicate_doc(get_file_hash(staged.staged_file))
-            if duplicate:
-                return {
-                    "status": "skipped",
-                    "skipped": True,
-                    "doc_id": duplicate["id"],
-                    "filename": file.filename,
-                    "message": "文件已存在，已跳过",
-                }
-            try:
-                prepared = prepare_ingest(
-                    staged.staged_file,
-                    base_dir=base,
-                    existing_doc_ids={
-                        doc["id"]
-                        for doc in _load_document_catalog()
-                        if doc.get("id")
-                    },
-                )
-            except IngestParseError as exc:
-                logger.warning(
-                    "upload parse failed for %s: %s", safe_name, exc.original
-                )
+            # Codex R5-P2-1: 与 _schedule_compile 同模式——无活动事务时后台
+            # 终态验证器可能持有执行锁并随时翻转 readiness;非阻塞获取执行锁
+            # 并持有到 add_task 返回(锁序 SCHEDULE → EXECUTION),被占用即
+            # 409 busy,绝不发布业务文件、绝不离队任务。
+            if not COMPILE_EXECUTION_LOCK.acquire(blocking=False):
                 raise HTTPException(
-                    status_code=422, detail="文件无法解析或内容为空"
-                ) from None
-            if not prepared.text_bytes.strip():
-                raise HTTPException(
-                    status_code=422, detail="文件无法解析或内容为空"
+                    status_code=409, detail={"code": "knowledge_base_busy"}
                 )
-            _r8_boundary_after_prepare_ingest(prepared)
             try:
-                manifest = prepare_upload_transaction(
-                    staged, prepared, base, config
-                )
-            except Exception as exc:
-                logger.error(
-                    "upload transaction preparation failed for %s: %s",
-                    safe_name, exc,
-                )
-                raise HTTPException(
-                    status_code=503,
-                    detail={"code": "compile_transaction_unavailable"},
-                ) from None
-            _r8_boundary_after_prepared_manifest(manifest)
-            try:
-                publish_upload_intake(manifest, staged, prepared, base)
-            except Exception as exc:
-                logger.error(
-                    "upload intake publish failed for job %s: %s",
-                    manifest.job_id, exc,
-                )
-                if not _rollback_unaccepted_transaction(
-                    runtime,
-                    manifest,
-                    reason_code=ERROR_CODE_UNACCEPTED,
-                    reason_message=f"upload intake publish failed: {exc}",
-                ):
-                    raise HTTPException(
-                        status_code=503, detail={"code": "recovery_required"}
-                    ) from None
-                raise HTTPException(
-                    status_code=503,
-                    detail={"code": "compile_transaction_unavailable"},
-                ) from None
-            # 字节已耐久发布、journal 完整、published=True:staging 立即丢弃,
-            # 恢复依据转为 journal + Manifest。
-            discard_staged_upload(staged)
-            staged = None
-
-            scheduled_at = datetime.now(timezone.utc)
-            deadline = scheduled_at + timedelta(seconds=manifest.timeout_seconds)
-            bound = False
-            try:
-                bound = bind_doc_compile_job(
-                    prepared.doc_id,
-                    manifest.job_id,
-                    scheduled_at.isoformat(),
-                    deadline.isoformat(),
-                    base_dir=base,
-                )
-            except Exception as exc:
-                logger.error(
-                    "upload binding raised for %s (job %s): %s",
-                    prepared.doc_id, manifest.job_id, exc,
-                )
-            if not bound:
-                logger.error(
-                    "upload binding refused for %s (job %s)",
-                    prepared.doc_id, manifest.job_id,
-                )
-                if not _rollback_unaccepted_transaction(
-                    runtime,
-                    manifest,
-                    reason_code=ERROR_CODE_UNACCEPTED,
-                    reason_message="upload doc binding failed before acceptance",
-                ):
-                    raise HTTPException(
-                        status_code=503, detail={"code": "recovery_required"}
+                # 唯一命名必须在锁内:同名上传串行,绝不覆盖既有 original。
+                final_name = _unique_original_path(safe_name).name
+                staged = stage_upload(file, config, safe_name=final_name)
+                _r8_boundary_after_intake_stage(staged)
+                duplicate = _find_duplicate_doc(get_file_hash(staged.staged_file))
+                if duplicate:
+                    return {
+                        "status": "skipped",
+                        "skipped": True,
+                        "doc_id": duplicate["id"],
+                        "filename": file.filename,
+                        "message": "文件已存在，已跳过",
+                    }
+                try:
+                    prepared = prepare_ingest(
+                        staged.staged_file,
+                        base_dir=base,
+                        existing_doc_ids={
+                            doc["id"]
+                            for doc in _load_document_catalog()
+                            if doc.get("id")
+                        },
                     )
-                raise HTTPException(
-                    status_code=503,
-                    detail={"code": "compile_transaction_unavailable"},
-                )
-            try:
-                manifest = transition_manifest(
-                    manifest.job_dir,
-                    expected=TransactionState.PREPARED,
-                    target=TransactionState.SCHEDULED,
-                    scheduled_at=scheduled_at.isoformat(),
-                )
-            except Exception as exc:
-                logger.error(
-                    "SCHEDULED transition failed for upload job %s: %s",
-                    manifest.job_id, exc,
-                )
-                if not _rollback_unaccepted_transaction(
-                    runtime,
-                    manifest,
-                    reason_code=ERROR_CODE_UNACCEPTED,
-                    reason_message=(
-                        f"upload schedule transition failed before acceptance: {exc}"
-                    ),
-                ):
+                except IngestParseError as exc:
+                    logger.warning(
+                        "upload parse failed for %s: %s", safe_name, exc.original
+                    )
                     raise HTTPException(
-                        status_code=503, detail={"code": "recovery_required"}
+                        status_code=422, detail="文件无法解析或内容为空"
                     ) from None
-                raise HTTPException(
-                    status_code=503,
-                    detail={"code": "compile_transaction_unavailable"},
-                ) from None
-            _r8_boundary_after_scheduled(manifest)
-            try:
-                background_tasks.add_task(
-                    run_compile_task, manifest.job_id, base, config, readiness
-                )
-            except Exception as exc:
-                logger.error(
-                    "background task registration failed for upload job %s: %s",
-                    manifest.job_id, exc,
-                )
-                # add_task 失败 = 请求未被接受:本轮上传发布完全撤销,
-                # 绝不留下 SCHEDULED 事务或孤儿 doc(设计 §11/§12.4)。
-                if not _rollback_unaccepted_transaction(
-                    runtime,
-                    manifest,
-                    reason_code=ERROR_CODE_UNACCEPTED,
-                    reason_message=f"background task registration failed: {exc}",
-                ):
+                if not prepared.text_bytes.strip():
                     raise HTTPException(
-                        status_code=503, detail={"code": "recovery_required"}
+                        status_code=422, detail="文件无法解析或内容为空"
+                    )
+                _r8_boundary_after_prepare_ingest(prepared)
+                try:
+                    manifest = prepare_upload_transaction(
+                        staged, prepared, base, config
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "upload transaction preparation failed for %s: %s",
+                        safe_name, exc,
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"code": "compile_transaction_unavailable"},
                     ) from None
-                raise HTTPException(
-                    status_code=503,
-                    detail={"code": "compile_transaction_unavailable"},
-                ) from None
-            return {
-                "status": "processing",
-                "skipped": False,
-                "doc_id": prepared.doc_id,
-                "filename": final_name,
-                "message": "摄入成功，后台自动编译中...",
-            }
+                _r8_boundary_after_prepared_manifest(manifest)
+                try:
+                    publish_upload_intake(manifest, staged, prepared, base)
+                except Exception as exc:
+                    logger.error(
+                        "upload intake publish failed for job %s: %s",
+                        manifest.job_id, exc,
+                    )
+                    if not _rollback_unaccepted_transaction(
+                        runtime,
+                        manifest,
+                        reason_code=ERROR_CODE_UNACCEPTED,
+                        reason_message=f"upload intake publish failed: {exc}",
+                    ):
+                        raise HTTPException(
+                            status_code=503, detail={"code": "recovery_required"}
+                        ) from None
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"code": "compile_transaction_unavailable"},
+                    ) from None
+                # 字节已耐久发布、journal 完整、published=True:staging 立即丢弃,
+                # 恢复依据转为 journal + Manifest。
+                discard_staged_upload(staged)
+                staged = None
+
+                scheduled_at = datetime.now(timezone.utc)
+                deadline = scheduled_at + timedelta(seconds=manifest.timeout_seconds)
+                bound = False
+                try:
+                    bound = bind_doc_compile_job(
+                        prepared.doc_id,
+                        manifest.job_id,
+                        scheduled_at.isoformat(),
+                        deadline.isoformat(),
+                        base_dir=base,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "upload binding raised for %s (job %s): %s",
+                        prepared.doc_id, manifest.job_id, exc,
+                    )
+                if not bound:
+                    logger.error(
+                        "upload binding refused for %s (job %s)",
+                        prepared.doc_id, manifest.job_id,
+                    )
+                    if not _rollback_unaccepted_transaction(
+                        runtime,
+                        manifest,
+                        reason_code=ERROR_CODE_UNACCEPTED,
+                        reason_message="upload doc binding failed before acceptance",
+                    ):
+                        raise HTTPException(
+                            status_code=503, detail={"code": "recovery_required"}
+                        )
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"code": "compile_transaction_unavailable"},
+                    )
+                try:
+                    manifest = transition_manifest(
+                        manifest.job_dir,
+                        expected=TransactionState.PREPARED,
+                        target=TransactionState.SCHEDULED,
+                        scheduled_at=scheduled_at.isoformat(),
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "SCHEDULED transition failed for upload job %s: %s",
+                        manifest.job_id, exc,
+                    )
+                    if not _rollback_unaccepted_transaction(
+                        runtime,
+                        manifest,
+                        reason_code=ERROR_CODE_UNACCEPTED,
+                        reason_message=(
+                            f"upload schedule transition failed before acceptance: {exc}"
+                        ),
+                    ):
+                        raise HTTPException(
+                            status_code=503, detail={"code": "recovery_required"}
+                        ) from None
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"code": "compile_transaction_unavailable"},
+                    ) from None
+                _r8_boundary_after_scheduled(manifest)
+                try:
+                    background_tasks.add_task(
+                        run_compile_task, manifest.job_id, base, config, readiness
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "background task registration failed for upload job %s: %s",
+                        manifest.job_id, exc,
+                    )
+                    # add_task 失败 = 请求未被接受:本轮上传发布完全撤销,
+                    # 绝不留下 SCHEDULED 事务或孤儿 doc(设计 §11/§12.4)。
+                    if not _rollback_unaccepted_transaction(
+                        runtime,
+                        manifest,
+                        reason_code=ERROR_CODE_UNACCEPTED,
+                        reason_message=f"background task registration failed: {exc}",
+                    ):
+                        raise HTTPException(
+                            status_code=503, detail={"code": "recovery_required"}
+                        ) from None
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"code": "compile_transaction_unavailable"},
+                    ) from None
+                return {
+                    "status": "processing",
+                    "skipped": False,
+                    "doc_id": prepared.doc_id,
+                    "filename": final_name,
+                    "message": "摄入成功，后台自动编译中...",
+                }
+            finally:
+                COMPILE_EXECUTION_LOCK.release()
         finally:
             if staged is not None:
                 discard_staged_upload(staged)

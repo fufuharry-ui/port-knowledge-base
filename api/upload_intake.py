@@ -49,6 +49,7 @@ from api.compile_transactions import (
     update_published_intake,
 )
 from api.durable_fs import (
+    durable_makedirs,
     durable_stream_to_file,
     durable_unlink,
     durable_write_bytes,
@@ -114,7 +115,9 @@ def stage_upload(
     staging_dir = Path(config.upload_intake_dir) / f"{STAGING_PREFIX}{intake_id}"
     staged_file = staging_dir / original_name
     try:
-        staging_dir.mkdir(parents=True, exist_ok=False)
+        # R5-P1-2: staging 链(含 upload-intake 根)耐久创建——新建层
+        # 父目录 fsync;exist_ok=False 语义保持(staging 绝不复用)。
+        durable_makedirs(staging_dir, exist_ok=False)
         durable_stream_to_file(staged_file, file.file)
     except BaseException:
         shutil.rmtree(staging_dir, ignore_errors=True)

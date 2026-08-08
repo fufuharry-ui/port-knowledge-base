@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import yaml
 
@@ -77,6 +79,19 @@ def read_manifest_yaml(job_dir):
     return yaml.safe_load((job_dir / "manifest.yaml").read_text(encoding="utf-8"))
 
 
+def _running_process_record():
+    """R5-P1-1: RUNNING 迁移必须携带进程记录(状态机不变量)。"""
+    return ProcessRecord(
+        pid=12345,
+        create_time=1786007401.25,
+        executable="C:/Python312/python.exe",
+        cwd="D:/repo",
+        command_fingerprint=f"scripts.compile|{DOC_ID}",
+        process_group_id=12345,
+        platform="windows",
+    )
+
+
 def rewrite_manifest_yaml(job_dir, data):
     (job_dir / "manifest.yaml").write_text(
         yaml.dump(data, allow_unicode=True), encoding="utf-8"
@@ -126,6 +141,27 @@ def test_missing_artifacts_recorded_without_snapshot(tmp_path):
         assert record.snapshot_sha256 is None
         assert record.original_sha256 is None
     assert not any((manifest.job_dir / "snapshots").iterdir())
+
+
+def test_create_prepared_transaction_creates_transaction_root_durably(
+    tmp_path, monkeypatch
+):
+    """R5-P1-2: 事务根目录链必须经 durable_makedirs 耐久创建(新建层
+    父目录 fsync),不得裸 mkdir(parents=True)。"""
+    import api.compile_transactions as transactions
+
+    calls = []
+    real = transactions.durable_makedirs
+
+    def spy(path, *args, **kwargs):
+        calls.append(Path(path))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(transactions, "durable_makedirs", spy)
+    config = runtime_config(tmp_path)
+    manifest = prepared_manifest(tmp_path)
+    assert calls == [config.transaction_dir]
+    assert manifest.job_dir.is_dir()
 
 
 def test_formal_directory_published_and_staging_removed(tmp_path):
@@ -294,7 +330,8 @@ def test_transition_rejects_disallowed_targets(tmp_path, target):
 def test_transition_from_terminal_state_rejected(tmp_path):
     manifest = prepared_manifest(tmp_path)
     transition_manifest(manifest.job_dir, expected=PREPARED, target=SCHEDULED)
-    transition_manifest(manifest.job_dir, expected=SCHEDULED, target=RUNNING)
+    transition_manifest(manifest.job_dir, expected=SCHEDULED, target=RUNNING,
+                        process=_running_process_record())
     transition_manifest(manifest.job_dir, expected=RUNNING, target=COMMITTED)
     with pytest.raises(TransactionStateError):
         transition_manifest(manifest.job_dir, expected=COMMITTED, target=ROLLBACKING)
@@ -303,7 +340,8 @@ def test_transition_from_terminal_state_rejected(tmp_path):
 def test_transition_rollback_chain(tmp_path):
     manifest = prepared_manifest(tmp_path)
     transition_manifest(manifest.job_dir, expected=PREPARED, target=SCHEDULED)
-    transition_manifest(manifest.job_dir, expected=SCHEDULED, target=RUNNING)
+    transition_manifest(manifest.job_dir, expected=SCHEDULED, target=RUNNING,
+                        process=_running_process_record())
     updated = transition_manifest(
         manifest.job_dir,
         expected=RUNNING,
@@ -423,6 +461,37 @@ def _manifest_with_process(data, **process_overrides):
     process.update(process_overrides)
     data["process"] = process
     return data
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 5 (R5-P1-1): RUNNING ⇒ 必须携带进程记录(状态机不变量——
+# RUNNING 只能连同进程身份一起写入);RUNNING + process=null 是损坏/不兼容
+# 证据,加载必须失败关闭(ManifestIntegrityError),绝不按"无遗留进程"回滚。
+# ---------------------------------------------------------------------------
+
+
+def test_load_manifest_rejects_running_state_without_process(tmp_path):
+    """R5-P1-1(a): state=RUNNING 且 process=null → ManifestIntegrityError。"""
+    manifest = prepared_manifest(tmp_path)
+    data = read_manifest_yaml(manifest.job_dir)
+    data["state"] = "RUNNING"
+    data["process"] = None
+    rewrite_manifest_yaml(manifest.job_dir, data)
+    with pytest.raises(ManifestIntegrityError):
+        load_manifest(manifest.job_dir)
+
+
+def test_load_manifest_accepts_rollbacking_without_process(tmp_path):
+    """R5-P1-1 对照: ROLLBACKING + process=null 合法(SCHEDULED→ROLLBACKING
+    的 spawn 失败路径不携带进程记录),不得被不变量误伤。"""
+    manifest = prepared_manifest(tmp_path)
+    data = read_manifest_yaml(manifest.job_dir)
+    data["state"] = "ROLLBACKING"
+    data["process"] = None
+    rewrite_manifest_yaml(manifest.job_dir, data)
+    loaded = load_manifest(manifest.job_dir)
+    assert loaded.state is ROLLBACKING
+    assert loaded.process is None
 
 
 @pytest.mark.parametrize("bad_pid", [0, -1, -9999])
@@ -630,7 +699,8 @@ def test_list_active_manifests_detects_multiple_active(tmp_path):
     assert len(active) == 2
 
     transition_manifest(first.job_dir, expected=PREPARED, target=SCHEDULED)
-    transition_manifest(first.job_dir, expected=SCHEDULED, target=RUNNING)
+    transition_manifest(first.job_dir, expected=SCHEDULED, target=RUNNING,
+                        process=_running_process_record())
     transition_manifest(first.job_dir, expected=RUNNING, target=COMMITTED)
     active = list_active_manifests(runtime_config(tmp_path))
     assert [m.job_id for m in active] == [second.job_id]
@@ -676,7 +746,8 @@ def test_recover_transaction_reports_already_terminal_for_committed(tmp_path):
 
     manifest = prepared_manifest(tmp_path)
     transition_manifest(manifest.job_dir, expected=PREPARED, target=SCHEDULED)
-    transition_manifest(manifest.job_dir, expected=SCHEDULED, target=RUNNING)
+    transition_manifest(manifest.job_dir, expected=SCHEDULED, target=RUNNING,
+                        process=_running_process_record())
     transition_manifest(manifest.job_dir, expected=RUNNING, target=COMMITTED)
     result = recover_transaction(
         tmp_path,

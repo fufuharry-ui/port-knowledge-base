@@ -170,6 +170,21 @@ def rollbacking_manifest_with_three_partially_restored_files(tmp_path):
     return manifest
 
 
+def _committed_process_record():
+    """R5-P1-1: RUNNING 迁移必须携带进程记录(状态机不变量)。"""
+    from api.compile_transactions import ProcessRecord
+
+    return ProcessRecord(
+        pid=4321,
+        create_time=1786007401.25,
+        executable="C:/Python312/python.exe",
+        cwd="D:/repo",
+        command_fingerprint=f"scripts.compile|{DOC_ID}",
+        process_group_id=4321,
+        platform="windows",
+    )
+
+
 def committed_manifest(tmp_path):
     """R4 现场: COMMITTED 后崩溃, 业务产物为语义合法的编译成功结果。"""
     manifest = make_prepared(tmp_path)
@@ -181,7 +196,8 @@ def committed_manifest(tmp_path):
     transition_manifest(manifest.job_dir, expected=PREPARED, target=SCHEDULED,
                         scheduled_at="2026-08-06T14:30:01+00:00")
     transition_manifest(manifest.job_dir, expected=SCHEDULED, target=RUNNING,
-                        started_at="2026-08-06T14:30:02+00:00")
+                        started_at="2026-08-06T14:30:02+00:00",
+                        process=_committed_process_record())
     transition_manifest(manifest.job_dir, expected=RUNNING, target=COMMITTED)
     (tmp_path / "wiki" / f"{DOC_ID}.summary.yaml").write_text(
         yaml.dump({"doc_id": DOC_ID, "abstract": "a"}), encoding="utf-8"
@@ -1110,6 +1126,66 @@ def test_unaccepted_rollback_legacy_serialized_snapshot_still_verifies(tmp_path)
 # Codex Round 2 (N2): 进程身份防御性护栏——即使加载层被绕过,携带非正
 # pid/process_group_id 的记录也绝不允许进入 verify/killpg 路径(失败关闭)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 5 (R5-P1-1): RUNNING + 无进程记录 = 损坏/不兼容证据
+# (RUNNING 只能连同进程身份一起写入);恢复必须失败关闭——绝不回滚、
+# 绝不 kill、保留证据;ROLLBACKING + 无进程记录保持合法(spawn 失败路径)。
+# ---------------------------------------------------------------------------
+
+
+def test_running_without_process_blocks_startup_without_touching_business_files(
+    tmp_path,
+):
+    """R5-P1-1(a): RUNNING + process=null 的事务目录使启动恢复硬阻断
+    (manifest 完整性),业务文件字节不变,事务目录保留。"""
+    manifest = running_manifest(tmp_path)
+    data = yaml.safe_load(
+        (manifest.job_dir / "manifest.yaml").read_text(encoding="utf-8")
+    )
+    data["process"] = None
+    rewrite_manifest_yaml(manifest.job_dir, data)
+    before = hash_tree(tmp_path, subdirs=BUSINESS_SUBDIRS + (".runtime",))
+
+    report = recover_startup(tmp_path, runtime_config(tmp_path))
+
+    assert report.ready is False
+    assert any(manifest.job_id in blocker for blocker in report.blockers)
+    assert hash_tree(tmp_path, subdirs=BUSINESS_SUBDIRS + (".runtime",)) == before
+    assert manifest.job_dir.exists()
+
+
+def test_recovery_blocks_running_with_null_process_even_if_load_bypassed(
+    tmp_path, monkeypatch
+):
+    """R5-P1-1(b) 纵深防御: 即使加载层被绕过,RUNNING + 无进程记录也
+    直接阻断,绝不调用 verify/kill,绝不回滚(镜像 N2 护栏)。"""
+    from dataclasses import replace as dc_replace
+
+    manifest = running_manifest(tmp_path)
+    tampered = dc_replace(manifest, process=None)
+    import api.compile_transactions as transactions
+
+    monkeypatch.setattr(
+        transactions, "load_manifest", lambda _job_dir: tampered
+    )
+    verify = Mock()
+    terminate = Mock()
+    monkeypatch.setattr(transactions, "verify_process_identity", verify)
+    monkeypatch.setattr(transactions, "terminate_process_tree", terminate)
+    before = hash_tree(tmp_path)
+
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+
+    assert result.blocked is True
+    assert "process" in (result.reason or "")
+    verify.assert_not_called()
+    terminate.assert_not_called()
+    assert hash_tree(tmp_path) == before
 
 
 def test_recovery_never_signals_nonpositive_recorded_identity(

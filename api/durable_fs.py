@@ -67,6 +67,37 @@ def durable_unlink(path: Path) -> None:
     _fsync_parent_directory(path)
 
 
+def durable_makedirs(path: Path, exist_ok: bool = True) -> None:
+    """mkdir(parents=True) 的耐久变体(R5-P1-2)。
+
+    创建缺失的目录链后,自底向上对每个新建目录条目 fsync 其父目录
+    (POSIX;Windows 仅创建,不伪造父目录同步承诺,与本模块既有约定一致)。
+    整链已存在时不做任何 fsync。exist_ok=False 时目标已存在即
+    FileExistsError。父目录 fsync 失败原样传播(调用方失败关闭)。
+
+    首次启动时 .runtime/ 与事务/intake 根的创建必须走本原语: 否则掉电
+    可能丢失目录条目,把已绑定 compiling 的 meta 搁浅在无事务目录的
+    现场。
+    """
+    path = Path(path)
+    if path.is_dir():
+        if not exist_ok:
+            raise FileExistsError(f"directory already exists: {path}")
+        return
+    missing: list[Path] = []
+    cursor = path
+    while not cursor.is_dir():
+        missing.append(cursor)
+        if cursor.parent == cursor:
+            break
+        cursor = cursor.parent
+    path.mkdir(parents=True, exist_ok=exist_ok)
+    # missing 自最深层向最浅层排列: 自底向上 fsync 每个新建条目的父目录,
+    # 使该条目在其父目录中耐久。
+    for created in missing:
+        _fsync_parent_directory(created)
+
+
 def durable_write_bytes(path: Path, payload: bytes) -> None:
     """按耐久写入合同把 payload 原子发布到 path 并回读验证。"""
     path = Path(path)
@@ -177,9 +208,10 @@ def probe_durable_directory(path: Path) -> None:
     """启动探针:验证目录可创建、可写、可 fsync、可原子替换、可回读、可删除。
 
     任一环节失败直接抛出原始异常,调用方据此阻止启动。
+    目录链经 durable_makedirs 创建(R5-P1-2:新建层父目录 fsync)。
     """
     path = Path(path)
-    path.mkdir(parents=True, exist_ok=True)
+    durable_makedirs(path)
     probe = path / ".durable-probe"
     payload = b"e005-durable-probe"
     durable_write_bytes(probe, payload)

@@ -443,7 +443,7 @@ def test_r4_post_commit_point_crash_only_verifies_and_cleans(tmp_path):
     scenario.prepare()
     scenario.bind_meta()
     scenario.to_scheduled()
-    scenario.to_running(None)
+    scenario.to_running(_gone_process_record(scenario.doc_id))
     manifest = scenario.to_committed()
     scenario.write_compiled_outputs()
     before = _hash_tree(tmp_path, subdirs=("raw", "wiki", "meta", "originals"))

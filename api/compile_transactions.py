@@ -35,6 +35,7 @@ import psutil
 import yaml
 
 from api.durable_fs import (
+    durable_makedirs,
     durable_publish_directory,
     durable_unlink,
     durable_write_bytes,
@@ -566,6 +567,14 @@ def load_manifest(job_dir: Path) -> CompileManifest:
     if not isinstance(cleanup_verified, bool):
         _reject("manifest cleanup_verified must be a boolean")
 
+    process = _parse_process(data.get("process"))
+    # R5-P1-1: 状态机不变量——RUNNING 只能连同进程记录一起写入
+    # (_execute_scheduled_job 恒携带);RUNNING + process=null 是损坏/
+    # 不兼容证据,失败关闭,绝不按"无遗留进程"回滚(未记录的编译器
+    # 可能仍在写产物)。ROLLBACKING + null 合法(spawn 失败路径无记录)。
+    if state is TransactionState.RUNNING and process is None:
+        _reject("manifest state RUNNING requires a process record")
+
     return CompileManifest(
         schema_version=MANIFEST_SCHEMA_VERSION,
         job_id=job_id,
@@ -580,7 +589,7 @@ def load_manifest(job_dir: Path) -> CompileManifest:
         termination_grace_seconds=grace_seconds,
         previous_document_status=data.get("previous_document_status"),
         published_intake=_parse_intake(data.get("published_intake")),
-        process=_parse_process(data.get("process")),
+        process=process,
         failure=_parse_failure(data.get("failure")),
         recovery=_parse_recovery(data.get("recovery")),
         artifacts=artifacts,
@@ -631,7 +640,9 @@ def create_prepared_transaction(
         kind = TransactionKind(kind)
     _require_safe_token(doc_id, "doc_id")
     transaction_root = Path(config.transaction_dir)
-    transaction_root.mkdir(parents=True, exist_ok=True)
+    # R5-P1-2: 事务根链(含 .runtime)耐久创建——新建层父目录 fsync,
+    # 掉电不得把已绑定 compiling 的 meta 搁浅在无事务目录的现场。
+    durable_makedirs(transaction_root)
 
     job_id = _generate_job_id()
     staging = transaction_root / f"{STAGING_PREFIX}{job_id}"
@@ -1063,6 +1074,15 @@ def _terminate_leftover_process(
     无幸存后代(F6 幸存者确认),再允许回滚。"""
     record = manifest.process
     if record is None:
+        # R5-P1-1 纵深防御: 即使加载层不变量被绕过,RUNNING + 无进程记录
+        # 也是损坏证据——未记录的编译器可能仍在写产物,失败关闭(绝不
+        # 回滚、绝不 kill、保留证据)。ROLLBACKING + 无记录合法(spawn
+        # 失败路径不携带进程记录)。
+        if manifest.state is TransactionState.RUNNING:
+            return (
+                "RUNNING manifest has no process record; damaged evidence, "
+                "fail closed, nothing killed"
+            )
         return None
     # N2 纵深防御: 即使加载层校验被绕过,非正 pid/pgid 也绝不进入
     # verify/killpg 路径——POSIX killpg(0) 目标正是恢复进程自身的进程组。

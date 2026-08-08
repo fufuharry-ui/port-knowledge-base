@@ -100,6 +100,26 @@ def test_stage_upload_writes_only_under_intake_staging(tmp_path):
     assert not (tmp_path / "raw").exists()
 
 
+def test_stage_upload_creates_intake_chain_durably(tmp_path, monkeypatch):
+    """R5-P1-2: intake staging 链(含 upload-intake 根)必须经
+    durable_makedirs 耐久创建(exist_ok=False 语义保持)。"""
+    import api.upload_intake as intake_mod
+
+    calls = []
+    real = intake_mod.durable_makedirs
+
+    def spy(path, *args, **kwargs):
+        calls.append((Path(path), kwargs))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(intake_mod, "durable_makedirs", spy)
+    config = runtime_config(tmp_path)
+    staged = stage_upload(FakeUploadFile("report.txt", b"abc"), config)
+
+    assert calls == [(staged.staging_dir, {"exist_ok": False})]
+    assert staged.staged_file.is_file()
+
+
 def test_stage_upload_strips_path_components_defensively(tmp_path):
     config = runtime_config(tmp_path)
     staged = stage_upload(FakeUploadFile("../sub/report.txt", b"x"), config)

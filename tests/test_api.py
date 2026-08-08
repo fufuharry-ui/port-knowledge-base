@@ -1314,8 +1314,19 @@ def test_recompile_rejected_while_committed_cleanup_in_progress(
     )
     transition_manifest(manifest.job_dir, expected=TransactionState.PREPARED,
                         target=TransactionState.SCHEDULED)
+    # R5-P1-1: RUNNING 迁移必须携带进程记录(状态机不变量)
+    from api.compile_transactions import ProcessRecord
     transition_manifest(manifest.job_dir, expected=TransactionState.SCHEDULED,
-                        target=TransactionState.RUNNING)
+                        target=TransactionState.RUNNING,
+                        process=ProcessRecord(
+                            pid=4321,
+                            create_time=1786007401.25,
+                            executable="python",
+                            cwd="D:/repo",
+                            command_fingerprint="scripts.compile|doc_1",
+                            process_group_id=4321,
+                            platform="windows",
+                        ))
     transition_manifest(manifest.job_dir, expected=TransactionState.RUNNING,
                         target=TransactionState.COMMITTED)
 
@@ -1677,6 +1688,84 @@ def test_upload_add_task_failure_fully_revokes_published_upload(
     assert verify_terminal_transaction(tmp_repo, rolled_back).ok is True
     mode, _reason = runtime.readiness.snapshot()
     assert mode == "ready"
+
+
+# ─── Codex Round 5 (R5-P2-1):上传接受与 readiness 翻转/清理窗口串行化 ────────
+
+def test_upload_rejected_during_terminal_cleanup_window(managed_client, tmp_repo):
+    """R5-P2-1: 无活动事务但后台线程持有执行锁(终态验证/清理窗口)→
+    上传 409 knowledge_base_busy;零业务文件发布、无事务目录、无 intake
+    残留,绝不登记后台任务。"""
+    from api.compile_jobs import COMPILE_EXECUTION_LOCK
+    from api.compile_transactions import list_transaction_dirs
+
+    runtime = _repo_runtime(managed_client)
+    before = _business_manifest(tmp_repo)
+    COMPILE_EXECUTION_LOCK.acquire()
+    try:
+        with patch("api.main.run_compile_task") as mock_run:
+            response = managed_client.post(
+                "/api/v1/upload",
+                files={"file": ("fresh.txt", b"fresh upload content", "text/plain")},
+            )
+    finally:
+        COMPILE_EXECUTION_LOCK.release()
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": {"code": "knowledge_base_busy"}}
+    mock_run.assert_not_called()
+    assert _business_manifest(tmp_repo) == before
+    assert list_transaction_dirs(runtime.config) == []
+    intake_root = runtime.config.upload_intake_dir
+    assert not intake_root.exists() or list(intake_root.iterdir()) == []
+    assert not COMPILE_EXECUTION_LOCK.locked()
+
+
+def test_upload_rejected_when_readiness_flips_during_cleanup_window(
+    managed_client, tmp_repo
+):
+    """R5-P2-1 变体: 清理窗口内旧验证器把 readiness 翻转为
+    recovery_required → 上传被拒绝(503),无 SCHEDULED 任务入队,
+    零业务文件发布。"""
+    from api.compile_jobs import COMPILE_EXECUTION_LOCK
+
+    runtime = _repo_runtime(managed_client)
+    before = _business_manifest(tmp_repo)
+    COMPILE_EXECUTION_LOCK.acquire()
+    runtime.readiness.mark_recovery_required("terminal_verification_failed")
+    try:
+        with patch("api.main.run_compile_task") as mock_run:
+            response = managed_client.post(
+                "/api/v1/upload",
+                files={"file": ("fresh.txt", b"fresh upload content", "text/plain")},
+            )
+    finally:
+        COMPILE_EXECUTION_LOCK.release()
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": {"code": "recovery_required"}}
+    mock_run.assert_not_called()
+    assert _business_manifest(tmp_repo) == before
+
+
+def test_upload_success_releases_execution_lock_for_background_task(
+    managed_client, tmp_repo
+):
+    """R5-P2-1(d): 正常上传接受(200 processing)后执行锁已释放,
+    后台任务可立即获取(请求线程绝不把执行锁带过响应)。"""
+    from api.compile_jobs import COMPILE_EXECUTION_LOCK
+
+    with patch("api.main.run_compile_task"):
+        response = managed_client.post(
+            "/api/v1/upload",
+            files={"file": ("fresh.txt", b"fresh upload content", "text/plain")},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "processing"
+    assert not COMPILE_EXECUTION_LOCK.locked()
+    assert COMPILE_EXECUTION_LOCK.acquire(blocking=False)
+    COMPILE_EXECUTION_LOCK.release()
 
 
 # ─── Codex 修复(F4/F9):base_dir 覆盖门禁、runtime 解析根、上传名归一 ─────────

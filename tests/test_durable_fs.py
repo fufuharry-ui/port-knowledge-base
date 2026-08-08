@@ -12,6 +12,7 @@ import pytest
 import yaml
 
 from api.durable_fs import (
+    durable_makedirs,
     durable_publish_directory,
     durable_unlink,
     durable_write_bytes,
@@ -220,6 +221,92 @@ def test_durable_unlink_deletes_file_on_native_platform(tmp_path):
     target.write_bytes(b"x")
     durable_unlink(target)
     assert not target.exists()
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 5 (R5-P1-2): durable_makedirs —— 新建目录链的每一层都必须
+# 使其父目录条目耐久(POSIX fsync 父目录,自底向上);整链已存在时不 fsync;
+# fsync 失败原样传播(调用方失败关闭)。测试只 spy 内部边界,绝不翻转
+# os.name(对立平台 Path 实例化/派生会崩溃,见 R3 教训)。
+# ---------------------------------------------------------------------------
+
+
+def test_durable_makedirs_fsyncs_each_new_level_bottom_up(tmp_path, monkeypatch):
+    """R5-P1-2: 三层新目录 → 每层父目录恰 fsync 一次,自底向上。"""
+    import api.durable_fs as durable_fs
+
+    events = []
+    monkeypatch.setattr(
+        durable_fs,
+        "_fsync_parent_directory",
+        lambda path: events.append(Path(path)),
+    )
+
+    target = tmp_path / "a" / "b" / "c"
+    durable_makedirs(target)
+
+    assert target.is_dir()
+    assert events == [tmp_path / "a" / "b" / "c", tmp_path / "a" / "b", tmp_path / "a"]
+
+
+def test_durable_makedirs_fsyncs_only_missing_levels(tmp_path, monkeypatch):
+    """R5-P1-2: 部分已存在的链只为新建层 fsync;整链已存在 → 零 fsync。"""
+    import api.durable_fs as durable_fs
+
+    (tmp_path / "x").mkdir()
+    events = []
+    monkeypatch.setattr(
+        durable_fs,
+        "_fsync_parent_directory",
+        lambda path: events.append(Path(path)),
+    )
+
+    durable_makedirs(tmp_path / "x" / "y")
+    assert events == [tmp_path / "x" / "y"]
+
+    events.clear()
+    durable_makedirs(tmp_path / "x" / "y")
+    assert events == []
+
+
+def test_durable_makedirs_propagates_fsync_failure(tmp_path, monkeypatch):
+    """R5-P1-2: 父目录 fsync 失败原样传播(启动/发布路径失败关闭)。"""
+    import api.durable_fs as durable_fs
+
+    def boom(path):
+        raise OSError("simulated parent fsync failure")
+
+    monkeypatch.setattr(durable_fs, "_fsync_parent_directory", boom)
+
+    with pytest.raises(OSError, match="simulated parent fsync failure"):
+        durable_makedirs(tmp_path / "a" / "b")
+
+
+def test_durable_makedirs_exist_ok_false_rejects_existing(tmp_path):
+    """R5-P1-2: exist_ok=False 时目标已存在即 FileExistsError。"""
+    with pytest.raises(FileExistsError):
+        durable_makedirs(tmp_path, exist_ok=False)
+
+
+def test_probe_durable_directory_creates_chain_durably(tmp_path, monkeypatch):
+    """R5-P1-2: 启动探针的目录链创建同样走耐久原语。"""
+    import api.durable_fs as durable_fs
+
+    calls = []
+    real = durable_fs.durable_makedirs
+
+    def spy(path, *args, **kwargs):
+        calls.append(Path(path))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(durable_fs, "durable_makedirs", spy)
+    target = tmp_path / ".runtime" / "compile-transactions"
+
+    probe_durable_directory(target)
+
+    assert calls == [target]
+    assert target.is_dir()
+    assert list(target.iterdir()) == []
 
 
 def test_durable_unlink_propagates_parent_fsync_failure(tmp_path, monkeypatch):

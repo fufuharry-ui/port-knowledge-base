@@ -149,6 +149,10 @@ class CompileManifest:
     recovery: dict[str, Any]
     artifacts: tuple[ArtifactRecord, ...]
     job_dir: Path
+    #: 终态验证已通过的耐久旗标(设计 §18 增补): True 时后续清理只重试
+    #: 目录删除,绝不重新内容验证——避免后续合法编译改变共享产物后被
+    #: 误判为损坏而阻断启动。
+    cleanup_verified: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +188,7 @@ _TOP_LEVEL_KEYS = frozenset({
     "timeout_seconds", "termination_grace_seconds",
     "previous_document_status",
     "published_intake", "process", "failure", "recovery", "artifacts",
+    "cleanup_verified",
 })
 _ARTIFACT_KEYS = frozenset({
     "slot", "path", "existed", "snapshot",
@@ -269,6 +274,7 @@ def _manifest_to_dict(manifest: CompileManifest) -> dict[str, Any]:
             "failed_paths": list(manifest.recovery.get("failed_paths") or []),
         },
         "artifacts": [_artifact_to_dict(item) for item in manifest.artifacts],
+        "cleanup_verified": manifest.cleanup_verified,
     }
 
 
@@ -384,11 +390,17 @@ def _parse_process(raw: Any) -> ProcessRecord | None:
     create_time = raw.get("create_time")
     if not isinstance(pid, int) or isinstance(pid, bool):
         _reject("manifest process.pid must be an integer")
+    # N2: 非正 pid/pgid 失败关闭——POSIX killpg(0) 会把信号发向恢复进程
+    # 自身的进程组,负值语义未定义;绝不加载、绝不进入 kill 路径。
+    if pid <= 0:
+        _reject("manifest process.pid must be positive")
     if not isinstance(create_time, (int, float)) or isinstance(create_time, bool):
         _reject("manifest process.create_time must be a number")
     pgid = raw.get("process_group_id")
     if pgid is not None and (not isinstance(pgid, int) or isinstance(pgid, bool)):
         _reject("manifest process.process_group_id must be an integer or null")
+    if pgid is not None and pgid <= 0:
+        _reject("manifest process.process_group_id must be positive")
     for field in ("executable", "cwd", "command_fingerprint", "platform"):
         if not isinstance(raw.get(field), str):
             _reject(f"manifest process.{field} must be a string")
@@ -537,6 +549,10 @@ def load_manifest(job_dir: Path) -> CompileManifest:
             f"for doc_id {doc_id!r}"
         )
 
+    cleanup_verified = data.get("cleanup_verified", False)
+    if not isinstance(cleanup_verified, bool):
+        _reject("manifest cleanup_verified must be a boolean")
+
     return CompileManifest(
         schema_version=MANIFEST_SCHEMA_VERSION,
         job_id=job_id,
@@ -556,6 +572,7 @@ def load_manifest(job_dir: Path) -> CompileManifest:
         recovery=_parse_recovery(data.get("recovery")),
         artifacts=artifacts,
         job_dir=job_dir,
+        cleanup_verified=cleanup_verified,
     )
 
 
@@ -682,6 +699,13 @@ def create_prepared_transaction(
         durable_publish_directory(staging, final_dir)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
+        # N7: durable_publish_directory 内部 rename(staging → final_dir)已
+        # 完成、但后续步骤(如 POSIX 父目录 fsync)失败时,staging 已不存在;
+        # 必须一并移除本调用创建的正式事务目录,绝不留下无归属的 PREPARED
+        # 孤儿(原请求 503 且后续全部变更把它误判为 busy)。final_dir 名即本
+        # 调用生成的唯一 job_id,只可能是本调用创建。
+        if final_dir.is_dir():
+            shutil.rmtree(final_dir, ignore_errors=True)
         raise
     return manifest
 
@@ -946,17 +970,25 @@ def _terminate_leftover_process(
     record = manifest.process
     if record is None:
         return None
+    # N2 纵深防御: 即使加载层校验被绕过,非正 pid/pgid 也绝不进入
+    # verify/killpg 路径——POSIX killpg(0) 目标正是恢复进程自身的进程组。
+    pgid = (
+        record.process_group_id
+        if record.process_group_id is not None
+        else record.pid
+    )
+    if record.pid <= 0 or pgid <= 0:
+        return (
+            "recorded process identity has nonpositive pid/process_group_id; "
+            "fail closed, nothing killed"
+        )
     identity = ProcessIdentity(
         pid=record.pid,
         create_time=record.create_time,
         executable=record.executable,
         cwd=record.cwd,
         command_fingerprint=record.command_fingerprint,
-        process_group_id=(
-            record.process_group_id
-            if record.process_group_id is not None
-            else record.pid
-        ),
+        process_group_id=pgid,
         platform=record.platform,
     )
     grace = manifest.termination_grace_seconds or config.termination_grace_seconds
@@ -1393,6 +1425,18 @@ def verify_terminal_transaction(
     )
 
 
+def _mark_cleanup_verified(job_dir: Path) -> None:
+    """终态验证通过后、目录删除前,把 cleanup_verified=True 耐久写入 Manifest。
+
+    后续清理(重启/CLI)对该目录只重试删除,绝不重新内容验证(设计 §18
+    增补): 删除失败只是警告,但期间合法编译可能已改变共享产物,重新验证
+    会把合法变化误判为损坏而阻断启动。
+    """
+    manifest = load_manifest(job_dir)
+    updated = replace(manifest, cleanup_verified=True)
+    durable_write_yaml(Path(job_dir) / MANIFEST_FILENAME, _manifest_to_dict(updated))
+
+
 def cleanup_terminal_transactions(
     base_dir: Path, config: CompileRuntimeConfig
 ) -> CleanupReport:
@@ -1400,6 +1444,9 @@ def cleanup_terminal_transactions(
 
     - 非终态事务只报告保留,绝不删除;
     - Manifest 不可读或验证失败: 计入 blockers,保留目录;
+    - 终态验证通过后先把 cleanup_verified=True 耐久写入 Manifest,
+      再尝试删除;cleanup_verified=True 的目录只重试删除,绝不重新
+      内容验证(期间合法编译对共享产物的改变不被误判为损坏);
     - 纯目录删除失败: 仅 warnings,后续启动或 CLI 继续尝试。
     """
     base_dir = Path(base_dir)
@@ -1419,13 +1466,23 @@ def cleanup_terminal_transactions(
         if manifest.state in ACTIVE_STATES:
             kept.append(manifest.job_id)
             continue
-        verification = verify_terminal_transaction(base_dir, manifest)
-        if not verification.ok:
-            blockers.append(
-                f"terminal verification failed for {manifest.job_id}: "
-                f"{list(verification.failures)}"
-            )
-            continue
+        if not manifest.cleanup_verified:
+            verification = verify_terminal_transaction(base_dir, manifest)
+            if not verification.ok:
+                blockers.append(
+                    f"terminal verification failed for {manifest.job_id}: "
+                    f"{list(verification.failures)}"
+                )
+                continue
+            try:
+                _mark_cleanup_verified(job_dir)
+            except OSError as exc:
+                # 旗标写入失败不阻断本轮删除(验证已通过);下次清理将
+                # 重新验证(退化为旧行为,安全但不优)。
+                warnings.append(
+                    f"cleanup_verified marker write failed for "
+                    f"{manifest.job_id}: {_sanitize_error_message(exc)}"
+                )
         try:
             shutil.rmtree(job_dir)
         except OSError as exc:

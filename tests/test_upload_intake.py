@@ -180,10 +180,12 @@ def test_publish_writes_three_targets_in_order_and_flips_published(tmp_path):
 
     entries = read_journal(manifest.job_dir)
     assert entries == [
-        {"path": "originals/report.txt", "created_by_this_request": True},
-        {"path": f"raw/{prepared.doc_id}.txt", "created_by_this_request": True},
+        {"path": "originals/report.txt", "created_by_this_request": True,
+         "completed": True},
+        {"path": f"raw/{prepared.doc_id}.txt", "created_by_this_request": True,
+         "completed": True},
         {"path": f"raw/{prepared.doc_id}.meta.yaml",
-         "created_by_this_request": True},
+         "created_by_this_request": True, "completed": True},
     ]
     assert updated.published_intake.published is True
     assert load_manifest(manifest.job_dir).published_intake.published is True
@@ -210,10 +212,12 @@ def test_publish_never_overwrites_existing_raw_text(tmp_path):
     with pytest.raises(FileExistsError):
         publish_upload_intake(manifest, staged, prepared, tmp_path)
     assert existing.read_bytes() == b"existing-raw"
-    # raw text 不是本请求创建: journal 只记录 original
+    # raw text 不是本请求创建: journal 只记录 original(intent-first:
+    # 存在性冲突在 journal 落笔之前拒绝, 绝不记录非本请求目标)
     entries = read_journal(manifest.job_dir)
     assert entries == [
-        {"path": "originals/report.txt", "created_by_this_request": True}
+        {"path": "originals/report.txt", "created_by_this_request": True,
+         "completed": True}
     ]
 
 
@@ -242,7 +246,8 @@ def test_crash_after_original_publish_rollback_removes_only_original(tmp_path):
         publish_upload_intake(manifest, staged, prepared, tmp_path)
 
     assert read_journal(manifest.job_dir) == [
-        {"path": "originals/report.txt", "created_by_this_request": True}
+        {"path": "originals/report.txt", "created_by_this_request": True,
+         "completed": True}
     ]
     failures = rollback_published_intake(manifest, tmp_path)
     assert failures == []
@@ -445,3 +450,193 @@ def test_rollback_declared_targets_still_removed(tmp_path):
     assert not (tmp_path / "originals" / "report.txt").exists()
     assert not (tmp_path / "raw" / f"{prepared.doc_id}.txt").exists()
     assert not (tmp_path / "raw" / f"{prepared.doc_id}.meta.yaml").exists()
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 2 (N1): intent-first journal — 每个目标先落 pending journal
+# (耐久),再耐久发布,再翻转为 completed(耐久)。发布成功与 journal 追加
+# 之间的崩溃窗口必须仍由 journal 证明归属,rollback 不得留下孤儿发布文件。
+# ---------------------------------------------------------------------------
+
+
+class _InjectedCrash(BaseException):
+    """模拟进程崩溃: 不被 except Exception 捕获,保持崩溃时刻现场。"""
+
+
+def _crash_after_target_publish(monkeypatch, target_suffix):
+    """在指定目标(raw text/raw meta)耐久发布完成后、下一条 journal 写入
+    之前注入崩溃。只挂 durable_fs 命名边界,不触碰生产开关。"""
+    import api.upload_intake as intake_mod
+
+    real_write_bytes = intake_mod.durable_write_bytes
+    real_write_yaml = intake_mod.durable_write_yaml
+    state = {"published": False}
+
+    def spy_write_bytes(path, payload):
+        result = real_write_bytes(path, payload)
+        path = Path(path)
+        if path.parent.name == "raw" and path.name.endswith(target_suffix):
+            state["published"] = True
+        return result
+
+    def spy_write_yaml(path, data):
+        path = Path(path)
+        if path.parent.name == "raw" and path.name.endswith(target_suffix):
+            real_write_yaml(path, data)
+            state["published"] = True
+            return
+        if state["published"] and path.name == JOURNAL_FILENAME:
+            raise _InjectedCrash("crash after publish before journal")
+        real_write_yaml(path, data)
+
+    monkeypatch.setattr(intake_mod, "durable_write_bytes", spy_write_bytes)
+    monkeypatch.setattr(intake_mod, "durable_write_yaml", spy_write_yaml)
+
+
+def test_crash_between_publish_and_journal_leaves_no_orphan(tmp_path, monkeypatch):
+    """N1: raw text 已耐久发布但 journal 翻转前崩溃 → journal 中的 pending
+    条目仍证明归属, rollback 必须撤销 raw text(不得永久孤儿/阻断未来上传)。"""
+    manifest, staged, prepared = prepared_upload_transaction(tmp_path, "report.txt")
+    _crash_after_target_publish(monkeypatch, ".txt")
+    with pytest.raises(_InjectedCrash):
+        publish_upload_intake(manifest, staged, prepared, tmp_path)
+
+    # 崩溃现场: raw text 已发布, journal 含 pending 条目
+    assert (tmp_path / "raw" / f"{prepared.doc_id}.txt").is_file()
+    entries = read_journal(manifest.job_dir)
+    pending = [e for e in entries if e.get("completed") is not True]
+    assert [e["path"] for e in pending] == [f"raw/{prepared.doc_id}.txt"]
+
+    failures = rollback_published_intake(manifest, tmp_path)
+    assert failures == []
+    assert not (tmp_path / "originals" / "report.txt").exists()
+    assert not (tmp_path / "raw" / f"{prepared.doc_id}.txt").exists()
+
+
+def test_crash_between_pending_journal_and_publish_is_idempotent(
+    tmp_path, monkeypatch
+):
+    """N1: pending journal 落笔后、目标发布前崩溃 → 目标不存在, rollback
+    对 pending 条目按幂等成功处理, 仍撤销已发布的 original。"""
+    import api.upload_intake as intake_mod
+
+    manifest, staged, prepared = prepared_upload_transaction(tmp_path, "report.txt")
+    real_write_bytes = intake_mod.durable_write_bytes
+    state = {"pending_seen": False}
+
+    def crash_on_raw_text_publish(path, payload):
+        path = Path(path)
+        if path.parent.name == "raw" and path.suffix == ".txt":
+            raise _InjectedCrash("crash before raw text publish")
+        return real_write_bytes(path, payload)
+
+    real_write_yaml = intake_mod.durable_write_yaml
+
+    def spy_write_yaml(path, data):
+        if Path(path).name == JOURNAL_FILENAME and any(
+            isinstance(e, dict) and e.get("completed") is False
+            for e in (data.get("entries") or [])
+        ):
+            state["pending_seen"] = True
+        return real_write_yaml(path, data)
+
+    monkeypatch.setattr(intake_mod, "durable_write_bytes", crash_on_raw_text_publish)
+    monkeypatch.setattr(intake_mod, "durable_write_yaml", spy_write_yaml)
+    with pytest.raises(_InjectedCrash):
+        publish_upload_intake(manifest, staged, prepared, tmp_path)
+
+    assert state["pending_seen"] is True
+    assert not (tmp_path / "raw" / f"{prepared.doc_id}.txt").exists()
+    failures = rollback_published_intake(manifest, tmp_path)
+    assert failures == []
+    assert not (tmp_path / "originals" / "report.txt").exists()
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 2 (N3): stage_upload 必须流式写入, 不得把整个上传体读入内存
+# (E004 为 shutil.copyfileobj 流式);暂存仍为同目录临时文件 + fsync +
+# os.replace + 父目录 fsync 的耐久合同。
+# ---------------------------------------------------------------------------
+
+
+class ChunkedStream:
+    """按固定小块返回数据的流;read(size) 每次最多返回 chunk_size 字节。"""
+
+    def __init__(self, payload: bytes, chunk_size: int = 3):
+        self._payload = payload
+        self._chunk_size = chunk_size
+        self._offset = 0
+
+    def read(self, _size: int = -1) -> bytes:
+        if self._offset >= len(self._payload):
+            return b""
+        end = min(self._offset + self._chunk_size, len(self._payload))
+        chunk = self._payload[self._offset:end]
+        self._offset = end
+        return chunk
+
+
+def test_stage_upload_streams_without_holding_all_chunks(tmp_path):
+    """N3: 暂存不得同时持有全部上传分块(整体内存复制);流式写入时先前
+    分块在后续 read 前必须已释放(CPython 引用计数语义)。"""
+    import weakref
+
+    payload = b"0123456789ABCDEF"
+    registry = []
+
+    class TrackingStream(ChunkedStream):
+        def read(self, size: int = -1) -> bytes:
+            data = super().read(size)
+            if not data:
+                return data
+            # memoryview 支持 weakref(bytes 不支持),且 join/update/write 兼容
+            chunk = memoryview(data)
+            alive = sum(1 for ref in registry if ref() is not None)
+            # 流式合同: 消费方至多持有 1 个尚未释放的分块(循环变量);
+            # 整体缓冲(read 全部 → join)会同时持有全部分块
+            assert alive <= 1, (
+                f"stage_upload still holds {alive} earlier chunks"
+            )
+            registry.append(weakref.ref(chunk))
+            return chunk
+
+    config = runtime_config(tmp_path)
+    upload = type("U", (), {"filename": "report.txt",
+                            "file": TrackingStream(payload)})()
+    staged = stage_upload(upload, config)
+    assert staged.staged_file.read_bytes() == payload
+    assert len(registry) > 2  # 确实走了多分块路径
+
+
+def test_stage_upload_chunked_stream_content_exact(tmp_path):
+    """N3 合同: 小块流暂存内容逐字节等于上传体。"""
+    payload = b"port streaming payload " * 100
+    upload = type("U", (), {
+        "filename": "report.txt",
+        "file": ChunkedStream(payload, chunk_size=7),
+    })()
+    config = runtime_config(tmp_path)
+    staged = stage_upload(upload, config)
+    assert staged.staged_file.read_bytes() == payload
+    # 无临时文件残留
+    assert list(staged.staging_dir.iterdir()) == [staged.staged_file]
+
+
+def test_stage_upload_mid_stream_failure_cleans_staging(tmp_path):
+    """N3 合同: 流中途失败清理 staging, staging 之外无写入, 无临时残留。"""
+    class FailingStream:
+        def __init__(self):
+            self.calls = 0
+
+        def read(self, _size: int = -1) -> bytes:
+            self.calls += 1
+            if self.calls > 2:
+                raise OSError("simulated stream failure")
+            return b"chunk"
+
+    config = runtime_config(tmp_path)
+    upload = type("U", (), {"filename": "report.txt", "file": FailingStream()})()
+    with pytest.raises(OSError, match="simulated stream failure"):
+        stage_upload(upload, config)
+    root = config.upload_intake_dir
+    assert not root.exists() or list(root.iterdir()) == []

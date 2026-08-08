@@ -1192,3 +1192,105 @@ def test_running_transition_failure_evidence_persist_failure_keeps_scheduled(
         "rollback evidence" in record.getMessage()
         for record in caplog.records
     )
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 2 (N4): COMMITTED 迁移前 wrapper 必须对已存在的七项产物与
+# raw/{doc_id}.meta.yaml 执行 fsync(只读打开,不改写);fsync 失败 → 绝不
+# 提交,按既有失败路径回滚。提交点仍唯一(Manifest 原子迁移)。
+# ---------------------------------------------------------------------------
+
+
+def test_commit_fsyncs_outputs_before_committed_transition(tmp_path, monkeypatch):
+    """N4: 七项产物中存在的文件 + raw meta 全部在 COMMITTED 迁移前 fsync。"""
+    from pathlib import Path as _Path
+
+    manifest, _old = scheduled_transaction(tmp_path)
+    install_fake_process(
+        monkeypatch,
+        tmp_path,
+        manifest.doc_id,
+        on_wait=lambda: write_valid_compile_outputs(tmp_path, manifest.doc_id),
+    )
+    events = []
+    real_fsync = compile_jobs.fsync_existing_file
+
+    def spy_fsync(path):
+        events.append(("fsync", _Path(path).name))
+        return real_fsync(path)
+
+    monkeypatch.setattr("api.compile_jobs.fsync_existing_file", spy_fsync)
+    real_transition = compile_jobs.transition_manifest
+
+    def spy_transition(job_dir, expected, target, **changes):
+        events.append(("transition", target))
+        return real_transition(job_dir, expected, target, **changes)
+
+    monkeypatch.setattr("api.compile_jobs.transition_manifest", spy_transition)
+
+    run_compile_task(
+        manifest.job_id, tmp_path, runtime_config(tmp_path), ServiceReadiness()
+    )
+
+    commit_index = next(
+        i for i, event in enumerate(events) if event == ("transition", COMMITTED)
+    )
+    fsynced_before_commit = {
+        name for kind, name in events[:commit_index] if kind == "fsync"
+    }
+    expected_files = {
+        f"{manifest.doc_id}.summary.yaml",
+        "index.yaml",
+        f"{manifest.doc_id}.ontology.yaml",
+        "global_ontology.yaml",
+        f"{manifest.doc_id}.relations.yaml",
+        "knowledge_graph.yaml",
+        "entity_relations.yaml",
+        f"{manifest.doc_id}.meta.yaml",
+    }
+    assert expected_files <= fsynced_before_commit
+    # COMMITTED 之后不再有任何产物 fsync(提交点仍是唯一原子迁移)
+    assert all(kind != "fsync" for kind, _ in events[commit_index:])
+    # 提交后终态验证通过并清理事务目录
+    assert not manifest.job_dir.exists()
+
+
+def test_commit_aborts_and_rolls_back_when_output_fsync_fails(
+    tmp_path, monkeypatch
+):
+    """N4: 提交前 fsync 失败 → 绝不进入 COMMITTED,按既有失败路径回滚,
+    旧产物逐字节恢复,文档进入 error 终态。"""
+    manifest, old_payloads = scheduled_transaction(tmp_path)
+    install_fake_process(
+        monkeypatch,
+        tmp_path,
+        manifest.doc_id,
+        on_wait=lambda: write_valid_compile_outputs(tmp_path, manifest.doc_id),
+    )
+
+    def broken_fsync(path):
+        raise OSError("simulated fsync failure")
+
+    monkeypatch.setattr("api.compile_jobs.fsync_existing_file", broken_fsync)
+    transitions = []
+    real_transition = compile_jobs.transition_manifest
+
+    def spy_transition(job_dir, expected, target, **changes):
+        transitions.append(target)
+        return real_transition(job_dir, expected, target, **changes)
+
+    monkeypatch.setattr("api.compile_jobs.transition_manifest", spy_transition)
+
+    readiness = ServiceReadiness()
+    run_compile_task(manifest.job_id, tmp_path, runtime_config(tmp_path), readiness)
+
+    assert COMMITTED not in transitions
+    assert ROLLBACKING in transitions
+    for rel, payload in old_payloads.items():
+        assert (tmp_path / rel).read_bytes() == payload
+    meta = read_doc_meta(manifest.doc_id, tmp_path)
+    assert meta["status"] == "error"
+    for field in ACTIVE_JOB_FIELDS:
+        assert field not in meta
+    assert readiness.snapshot()[0] == "ready"
+    assert not manifest.job_dir.exists()

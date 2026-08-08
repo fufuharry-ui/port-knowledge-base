@@ -1015,3 +1015,131 @@ def test_unaccepted_rollback_legacy_serialized_snapshot_still_verifies(tmp_path)
         tmp_path, load_manifest(manifest.job_dir)
     )
     assert verification.ok is True, verification.failures
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 2 (N2): 进程身份防御性护栏——即使加载层被绕过,携带非正
+# pid/process_group_id 的记录也绝不允许进入 verify/killpg 路径(失败关闭)
+# ---------------------------------------------------------------------------
+
+
+def test_recovery_never_signals_nonpositive_recorded_identity(
+    tmp_path, monkeypatch
+):
+    """N2: 纵深防御——_terminate_leftover_process 对非正 pid/pgid 直接
+    阻断,绝不调用 verify_process_identity / terminate_process_tree
+    (POSIX killpg(0) 会把信号发向恢复进程自身的进程组)。"""
+    from dataclasses import replace as dc_replace
+
+    manifest = running_manifest(tmp_path)
+    manifest = transition_manifest(
+        manifest.job_dir,
+        expected=RUNNING,
+        target=ROLLBACKING,
+        failure={"original_code": "interrupted", "original_message": "restart"},
+    )
+    import api.compile_transactions as transactions
+
+    tampered = dc_replace(
+        manifest,
+        process=dc_replace(manifest.process, pid=0, process_group_id=0),
+    )
+    monkeypatch.setattr(
+        transactions, "load_manifest", lambda _job_dir: tampered
+    )
+    verify = Mock()
+    terminate = Mock()
+    monkeypatch.setattr(transactions, "verify_process_identity", verify)
+    monkeypatch.setattr(transactions, "terminate_process_tree", terminate)
+    before = hash_tree(tmp_path)
+
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+    assert result.blocked is True
+    verify.assert_not_called()
+    terminate.assert_not_called()
+    # 绝不回滚、绝不触碰业务文件
+    assert hash_tree(tmp_path) == before
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 2 (N6): 终态验证通过后、目录删除失败时,必须把"已验证"
+# 耐久记录进 Manifest(cleanup_verified);后续清理只重试删除,绝不重新
+# 内容验证——否则后续合法编译改变共享产物会被误判为损坏而阻断启动。
+# ---------------------------------------------------------------------------
+
+
+def test_cleanup_deletion_failure_marks_cleanup_verified(tmp_path, monkeypatch):
+    """N6: 验证通过但 rmtree 失败 → warning 不变,且 Manifest 耐久记录
+    cleanup_verified=True。"""
+    manifest = committed_manifest(tmp_path)
+    import api.compile_transactions as transactions
+
+    def boom(path, *args, **kwargs):
+        raise OSError("simulated rmtree failure")
+
+    monkeypatch.setattr(transactions.shutil, "rmtree", boom)
+    report = cleanup_terminal_transactions(tmp_path, runtime_config(tmp_path))
+    assert report.cleaned == []
+    assert report.blockers == []
+    assert any(manifest.job_id in warning for warning in report.warnings)
+    assert manifest.job_dir.exists()
+    data = yaml.safe_load(
+        (manifest.job_dir / "manifest.yaml").read_text(encoding="utf-8")
+    )
+    assert data["cleanup_verified"] is True
+
+
+def test_cleanup_verified_terminal_deletion_retry_never_reverifies(
+    tmp_path, monkeypatch
+):
+    """N6 核心: ROLLED_BACK 目录删除失败后,后续合法编译改变了共享产物;
+    下一次清理必须只重试删除、绝不重新内容验证(旧行为把合法变化误判为
+    损坏并阻断启动)。"""
+    manifest = scheduled_manifest(tmp_path)
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+    assert result.completed is True
+
+    import api.compile_transactions as transactions
+
+    def boom(path, *args, **kwargs):
+        raise OSError("simulated rmtree failure")
+
+    monkeypatch.setattr(transactions.shutil, "rmtree", boom)
+    first = cleanup_terminal_transactions(tmp_path, runtime_config(tmp_path))
+    assert first.blockers == []
+    assert any(manifest.job_id in warning for warning in first.warnings)
+    monkeypatch.undo()
+    assert load_manifest(manifest.job_dir).cleanup_verified is True
+
+    # 模拟后续合法编译改变共享产物(与事务前 SHA 不再一致)
+    (tmp_path / "wiki" / "index.yaml").write_bytes(b"legitimate new index")
+    (tmp_path / "meta" / "ontology" / "global_ontology.yaml").write_bytes(
+        b"legitimate new ontology"
+    )
+    second = cleanup_terminal_transactions(tmp_path, runtime_config(tmp_path))
+    assert second.blockers == []
+    assert second.cleaned == [manifest.job_id]
+    assert not manifest.job_dir.exists()
+
+
+def test_cleanup_unverified_terminal_still_verifies_before_deletion(tmp_path):
+    """N6 对照: 从未验证过的终态目录仍然先验证;验证失败 → 不清理 + 阻断。"""
+    manifest = committed_manifest(tmp_path)
+    (tmp_path / "wiki" / "index.yaml").write_text(
+        yaml.dump({"documents": []}), encoding="utf-8"
+    )
+    report = cleanup_terminal_transactions(tmp_path, runtime_config(tmp_path))
+    assert report.cleaned == []
+    assert any(manifest.job_id in blocker for blocker in report.blockers)
+    assert manifest.job_dir.exists()
+    # 验证失败的目录绝不落 cleanup_verified
+    data = yaml.safe_load(
+        (manifest.job_dir / "manifest.yaml").read_text(encoding="utf-8")
+    )
+    assert data.get("cleanup_verified") is not True

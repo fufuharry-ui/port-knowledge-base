@@ -78,6 +78,60 @@ def durable_write_yaml(path: Path, data: Mapping[str, Any]) -> None:
     durable_write_bytes(path, text.encode("utf-8"))
 
 
+def durable_stream_to_file(path: Path, stream: Any) -> str:
+    """耐久写入合同的流式变体: 分块复制 stream → 同目录临时文件 → flush →
+    fsync → os.replace → sha256 回读验证 → POSIX fsync(父目录)。
+
+    写入过程中增量计算 SHA-256,全程不把整个流读入内存;返回内容的
+    SHA-256 十六进制摘要。任何失败清理未发布的临时文件。
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".tmp", dir=str(path.parent)
+    )
+    tmp_path = Path(tmp_name)
+    digest = hashlib.sha256()
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            while True:
+                chunk = stream.read(_CHUNK_SIZE)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                handle.write(chunk)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        if sha256_file(path) != digest.hexdigest():
+            raise OSError(f"durable stream verification failed: {path}")
+        _fsync_parent_directory(path)
+    except BaseException:
+        # 清理未发布的临时文件;已 replace 时 tmp_path 不存在,missing_ok 兜底
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return digest.hexdigest()
+
+
+def fsync_existing_file(path: Path) -> None:
+    """对已存在文件执行文件级 fsync 并(POSIX)fsync 其父目录。
+
+    绝不写入任何字节;O_RDWR 仅为满足 Windows 对 fsync 句柄需可写的
+    要求(POSIX 语义相同),不执行任何写调用。供提交点前的产物耐久化
+    确认使用。
+    """
+    path = Path(path)
+    fd = os.open(str(path), os.O_RDWR)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _fsync_parent_directory(path)
+
+
 def durable_publish_directory(staging: Path, target: Path) -> None:
     """把 staging 目录原子发布为同目录下的 target。
 

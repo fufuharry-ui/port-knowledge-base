@@ -243,7 +243,7 @@ describe('Wiki 仪表盘编译轮询与失败 Toast (E004 Task 8)', () => {
 
         await waitFor(() => {
             expect(mockToastPush).toHaveBeenCalledWith(
-                '知识库正在执行编译任务，请稍后再删除',
+                '知识库正在执行编译任务，请稍后重试',
                 'error',
             );
         });

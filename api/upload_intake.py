@@ -9,14 +9,20 @@
 
 - stage_upload 只写 config.upload_intake_dir/.staging-{intake_id}/,
   暂存文件名即最终安全原始文件名(basename,扩展名防御性复检),staging
-  之外不产生任何写入;
+  之外不产生任何写入;上传字节经 durable_stream_to_file 流式暂存,
+  全程不把整个上传体读入内存;
 - publish_upload_intake 按 original → raw text → raw meta 固定顺序耐久
   发布,任一目标已存在即停止并抛 FileExistsError,绝不覆盖既有字节;
-- intake.yaml journal 只在每个目标耐久发布完成后记录该目标的精确相对
-  路径与 created_by_this_request 布尔值,是 rollback 的唯一权威依据;
-- rollback_published_intake 只删除 journal 证明由本请求创建、且按
-  base_dir + doc_id 重算后落在 originals/ 直接子文件或
-  raw/{doc_id}.txt|raw/{doc_id}.meta.yaml 精确匹配的目标(镜像
+- intake.yaml journal 采用 intent-first 协议: 每个目标先落一条
+  pending(completed=False)journal(耐久),再耐久发布该目标,再把该条目
+  翻转为 completed=True(耐久);发布与 journal 之间的崩溃窗口由此仍由
+  journal 证明归属,绝不留下无归属的已发布文件;
+- rollback_published_intake 把 journal 中 created_by_this_request=True 的
+  条目(pending 或 completed)一律视为本请求创建——发布绝不覆盖
+  (FileExistsError)且恢复先于服务(单实例、单事务),journaled 目标
+  若存在只能是本请求发布的;只删除按 base_dir + doc_id 重算后落在
+  originals/ 直接子文件或 raw/{doc_id}.txt|raw/{doc_id}.meta.yaml
+  精确匹配、且与 Manifest 声明三项目标精确一致的目标(镜像
   compile_transactions._recompute_intake_targets 的拒绝规则);幂等;
   journal 缺失视为本轮未发布(no-op),journal 不可解析则失败关闭、
   不删除任何文件;
@@ -42,15 +48,17 @@ from api.compile_transactions import (
     create_prepared_transaction,
     update_published_intake,
 )
-from api.durable_fs import durable_write_bytes, durable_write_yaml
+from api.durable_fs import (
+    durable_stream_to_file,
+    durable_write_bytes,
+    durable_write_yaml,
+)
 from api.runtime_guard import CompileRuntimeConfig
 from scripts.ingest import PARSERS, PreparedIngest
 
 STAGING_PREFIX = ".staging-"
 INTAKE_JOURNAL_FILENAME = "intake.yaml"
 INTAKE_JOURNAL_SCHEMA_VERSION = 1
-
-_CHUNK_SIZE = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -86,24 +94,16 @@ def _generate_intake_id() -> str:
     return f"{now:%Y%m%dT%H%M%S%f}Z-{secrets.token_hex(4)}"
 
 
-def _read_upload_payload(stream: Any) -> bytes:
-    chunks: list[bytes] = []
-    while True:
-        chunk = stream.read(_CHUNK_SIZE)
-        if not chunk:
-            break
-        chunks.append(chunk)
-    return b"".join(chunks)
-
-
 def stage_upload(
     file: Any, config: CompileRuntimeConfig, *, safe_name: str | None = None
 ) -> StagedUpload:
-    """把上传字节流耐久写入 .staging-{intake_id}/ 下的最终安全文件名。
+    """把上传字节流式耐久写入 .staging-{intake_id}/ 下的最终安全文件名。
 
     file 只需暴露 .file(二进制流)与 .filename;API 层在调度锁下选定无冲突
     名称时可经 safe_name 传入,否则由 file.filename 取 basename 派生。
-    扩展名与空文件名在此防御性复检;任何失败清理 staging, staging 之外
+    扩展名与空文件名在此防御性复检;字节经 durable_stream_to_file 分块
+    流式暂存(同目录临时文件 + fsync + os.replace + 父目录 fsync),
+    全程不把整个上传体读入内存;任何失败清理 staging, staging 之外
     不产生写入。
     """
     original_name = _safe_original_name(
@@ -114,7 +114,7 @@ def stage_upload(
     staged_file = staging_dir / original_name
     try:
         staging_dir.mkdir(parents=True, exist_ok=False)
-        durable_write_bytes(staged_file, _read_upload_payload(file.file))
+        durable_stream_to_file(staged_file, file.file)
     except BaseException:
         shutil.rmtree(staging_dir, ignore_errors=True)
         raise
@@ -189,7 +189,7 @@ def prepare_upload_transaction(
 
 
 # ---------------------------------------------------------------------------
-# intake.yaml journal: 只在每个目标耐久发布完成后追加记录
+# intake.yaml journal: intent-first(pending → 发布 → completed)精确记录
 # ---------------------------------------------------------------------------
 
 
@@ -206,12 +206,42 @@ def _read_journal_entries(job_dir: Path) -> list[dict[str, Any]]:
     return list(entries) if isinstance(entries, list) else []
 
 
-def _append_journal_entry(job_dir: Path, relative_path: str) -> None:
-    entries = _read_journal_entries(job_dir)
-    entries.append({"path": relative_path, "created_by_this_request": True})
+def _write_journal_entries(job_dir: Path, entries: list[dict[str, Any]]) -> None:
     durable_write_yaml(
         _journal_path(job_dir),
         {"schema_version": INTAKE_JOURNAL_SCHEMA_VERSION, "entries": entries},
+    )
+
+
+def _append_journal_pending(job_dir: Path, relative_path: str) -> None:
+    """目标发布前落 pending 条目(耐久): 崩溃窗口内 journal 仍证明归属。"""
+    entries = _read_journal_entries(job_dir)
+    entries.append({
+        "path": relative_path,
+        "created_by_this_request": True,
+        "completed": False,
+    })
+    _write_journal_entries(job_dir, entries)
+
+
+def _flip_journal_completed(job_dir: Path, relative_path: str) -> None:
+    """目标耐久发布后把对应 pending 条目翻转为 completed=True(耐久)。
+
+    找不到匹配的 pending 条目说明 journal 内部状态不一致,失败关闭。
+    """
+    entries = _read_journal_entries(job_dir)
+    for entry in reversed(entries):
+        if (
+            isinstance(entry, dict)
+            and entry.get("path") == relative_path
+            and entry.get("created_by_this_request") is True
+            and entry.get("completed") is False
+        ):
+            entry["completed"] = True
+            _write_journal_entries(job_dir, entries)
+            return
+    raise ValueError(
+        f"journal pending entry missing for publish target: {relative_path!r}"
     )
 
 
@@ -267,7 +297,9 @@ def publish_upload_intake(
     - manifest.published_intake 与 staged/prepared 不一致时失败关闭;
     - 任一目标已存在: 停止并抛 FileExistsError,既有字节不动,该目标
       不进入 journal(非本请求创建);
-    - 每个目标耐久发布完成后才追加 intake.yaml 记录;
+    - 每个目标按 intent-first 顺序: 先落 pending journal(耐久)→ 耐久
+      发布目标 → 翻转 completed(耐久);任一时刻崩溃,journal 都覆盖
+      已发布目标,绝不留下无归属文件;
     - 全部完成后经原子 Manifest 写入翻转 published_intake.published=True。
     """
     base_dir = Path(base_dir)
@@ -309,11 +341,12 @@ def publish_upload_intake(
             raise FileExistsError(
                 f"intake publish target already exists: {relative_path}"
             )
+        _append_journal_pending(manifest.job_dir, relative_path)
         if mode == "bytes":
             durable_write_bytes(target, payload)
         else:
             durable_write_yaml(target, payload)
-        _append_journal_entry(manifest.job_dir, relative_path)
+        _flip_journal_completed(manifest.job_dir, relative_path)
 
     return update_published_intake(
         manifest.job_dir, replace(intake, published=True)
@@ -333,6 +366,10 @@ def rollback_published_intake(
     - journal 缺失: 本轮未发布任何目标,no-op;
     - journal 不可解析或结构非法: 失败关闭,不删除任何文件;
     - created_by_this_request 非 True 的条目跳过(绝不触碰既有文件);
+    - pending(completed=False)与 completed 条目一律视为本请求创建:
+      intent-first 协议下 pending 只覆盖"已落 journal、发布未完成"的
+      窗口;发布绝不覆盖(FileExistsError)且恢复先于服务(单实例、
+      单事务),journaled 目标若存在只能是本请求发布的;
     - 路径必须与 Manifest 声明的三项 intake 目标(published_intake 的
       original_path/raw_text_path/raw_meta_path)精确一致;任何其他路径
       (含 originals/ 合法直接子文件)计入 failures 并保留文件(失败关闭);

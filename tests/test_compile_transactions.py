@@ -403,6 +403,129 @@ def test_load_manifest_rejects_unknown_published_intake_key(tmp_path):
         load_manifest(manifest.job_dir)
 
 
+# ---------------------------------------------------------------------------
+# Codex Round 2 (N2): 进程身份数字必须为正——pid/process_group_id 为 0 或
+# 负数时, POSIX killpg 恢复路径会把信号发向恢复进程自身进程组(0)或误解
+# 负值;Manifest 加载必须失败关闭(ManifestIntegrityError),绝不 kill。
+# ---------------------------------------------------------------------------
+
+
+def _manifest_with_process(data, **process_overrides):
+    process = {
+        "pid": 4321,
+        "create_time": 1786007401.25,
+        "executable": "python",
+        "cwd": "D:/repo",
+        "command_fingerprint": f"scripts.compile|{DOC_ID}",
+        "process_group_id": 4321,
+        "platform": "posix",
+    }
+    process.update(process_overrides)
+    data["process"] = process
+    return data
+
+
+@pytest.mark.parametrize("bad_pid", [0, -1, -9999])
+def test_load_manifest_rejects_nonpositive_pid(tmp_path, bad_pid):
+    """N2: 非正 pid 一律 ManifestIntegrityError(失败关闭)。"""
+    manifest = prepared_manifest(tmp_path)
+    data = read_manifest_yaml(manifest.job_dir)
+    rewrite_manifest_yaml(
+        manifest.job_dir, _manifest_with_process(data, pid=bad_pid)
+    )
+    with pytest.raises(ManifestIntegrityError):
+        load_manifest(manifest.job_dir)
+
+
+@pytest.mark.parametrize("bad_pgid", [0, -1, -9999])
+def test_load_manifest_rejects_nonpositive_process_group_id(tmp_path, bad_pgid):
+    """N2: 非正 process_group_id 一律 ManifestIntegrityError(失败关闭);
+    0 在 POSIX 下正是恢复进程自身的进程组。"""
+    manifest = prepared_manifest(tmp_path)
+    data = read_manifest_yaml(manifest.job_dir)
+    rewrite_manifest_yaml(
+        manifest.job_dir, _manifest_with_process(data, process_group_id=bad_pgid)
+    )
+    with pytest.raises(ManifestIntegrityError):
+        load_manifest(manifest.job_dir)
+
+
+def test_load_manifest_accepts_null_process_group_id(tmp_path):
+    """N2 对照: process_group_id=null(Windows 语义)仍然合法。"""
+    manifest = prepared_manifest(tmp_path)
+    data = read_manifest_yaml(manifest.job_dir)
+    rewrite_manifest_yaml(
+        manifest.job_dir, _manifest_with_process(data, process_group_id=None)
+    )
+    loaded = load_manifest(manifest.job_dir)
+    assert loaded.process is not None
+    assert loaded.process.process_group_id is None
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 2 (N7): durable_publish_directory 内部 rename 完成后、
+# 父目录 fsync 失败时,异常处理必须一并移除本调用已发布的正式事务目录,
+# 绝不留下无归属 PREPARED 孤儿(原请求 503 + 后续变更全部 busy)。
+# ---------------------------------------------------------------------------
+
+
+def test_create_failure_after_directory_publish_removes_final_dir(
+    tmp_path, monkeypatch
+):
+    """N7: rename 已完成但发布后续步骤失败 → staging 与 final_dir 均移除。"""
+    seed_business_tree(tmp_path)
+    config = runtime_config(tmp_path)
+
+    import api.compile_transactions as transactions
+
+    real_publish = transactions.durable_publish_directory
+
+    def publish_then_fail(staging, target):
+        real_publish(staging, target)  # rename 已完成
+        raise OSError("simulated post-rename fsync failure")
+
+    monkeypatch.setattr(
+        transactions, "durable_publish_directory", publish_then_fail
+    )
+    with pytest.raises(OSError, match="post-rename fsync failure"):
+        create_prepared_transaction(
+            base_dir=tmp_path,
+            config=config,
+            doc_id=DOC_ID,
+            kind=TransactionKind.RECOMPILE,
+            previous_meta={"id": DOC_ID, "status": "compiled"},
+        )
+    # staging 与已发布的正式事务目录都不残留
+    assert list(config.transaction_dir.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 2 (N6): cleanup_verified 终态清理旗标的 Manifest 合同
+# ---------------------------------------------------------------------------
+
+
+def test_manifest_cleanup_verified_roundtrip(tmp_path):
+    """N6: cleanup_verified 缺省为 False;为 True 时可严格回读。"""
+    manifest = prepared_manifest(tmp_path)
+    loaded = load_manifest(manifest.job_dir)
+    assert loaded.cleanup_verified is False
+
+    data = read_manifest_yaml(manifest.job_dir)
+    data["cleanup_verified"] = True
+    rewrite_manifest_yaml(manifest.job_dir, data)
+    assert load_manifest(manifest.job_dir).cleanup_verified is True
+
+
+def test_load_manifest_rejects_non_boolean_cleanup_verified(tmp_path):
+    """N6: 非布尔 cleanup_verified 失败关闭。"""
+    manifest = prepared_manifest(tmp_path)
+    data = read_manifest_yaml(manifest.job_dir)
+    data["cleanup_verified"] = "yes"
+    rewrite_manifest_yaml(manifest.job_dir, data)
+    with pytest.raises(ManifestIntegrityError):
+        load_manifest(manifest.job_dir)
+
+
 @pytest.mark.parametrize(
     "bad_path",
     [

@@ -31,7 +31,7 @@ export type CompileErrorCode = DocumentCompileErrorCode | CompileRequestErrorCod
 /** 错误码 → 固定中文用户文案(不暴露后端原始 detail) */
 const COMPILE_ERROR_MESSAGES: Record<CompileErrorCode, string> = {
     compile_in_progress: '该文档正在编译，请稍后再试',
-    knowledge_base_busy: '知识库正在执行编译任务，请稍后再删除',
+    knowledge_base_busy: '知识库正在执行编译任务，请稍后重试',
     compile_transaction_unavailable: '编译任务暂时无法创建，请稍后重试或联系管理员',
     recovery_required: '知识库正在恢复或需要管理员处理，暂不可用',
     llm_configuration: '模型服务暂不可用，请联系管理员检查配置',

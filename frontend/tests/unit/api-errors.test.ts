@@ -63,7 +63,7 @@ describe('structured API errors', () => {
         ['document_processing', '文档编译未完成，请检查文件内容后重试'],
         ['compile_failed', '编译失败，请稍后重试或联系管理员'],
         ['rollback_failed', '编译失败，旧版本恢复异常，请联系管理员'],
-        ['knowledge_base_busy', '知识库正在执行编译任务，请稍后再删除'],
+        ['knowledge_base_busy', '知识库正在执行编译任务，请稍后重试'],
         ['interrupted', '编译任务因服务重启中断，旧版本已恢复，请重新编译'],
         ['compile_transaction_unavailable', '编译任务暂时无法创建，请稍后重试或联系管理员'],
         ['recovery_required', '知识库正在恢复或需要管理员处理，暂不可用'],
@@ -178,7 +178,7 @@ describe('structured API errors', () => {
             name: 'ApiError',
             status: 409,
             code: 'knowledge_base_busy',
-            message: '知识库正在执行编译任务，请稍后再删除',
+            message: '知识库正在执行编译任务，请稍后重试',
         });
     });
 

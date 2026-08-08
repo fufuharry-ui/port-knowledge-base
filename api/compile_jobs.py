@@ -47,6 +47,7 @@ from api.compile_transactions import (
     recover_transaction,
     transition_manifest,
 )
+from api.durable_fs import fsync_existing_file
 from api.process_tree import (
     STATUS_COMPLETED,
     STATUS_TIMED_OUT,
@@ -280,6 +281,24 @@ def _validate_compile_outputs(base: Path, doc_id: str) -> list[str]:
         if global_path.exists() and _load_yaml_mapping(global_path) is None:
             failures.append(f"{global_path.name} top-level structure invalid")
     return failures
+
+
+# ---------------------------------------------------------------------------
+# 提交前产物耐久化确认(设计 §15 增补): COMMITTED 迁移前对已存在的七项
+# 产物与 raw meta 执行 fsync,绝不改写内容
+# ---------------------------------------------------------------------------
+
+
+def _fsync_committed_outputs(base: Path, doc_id: str) -> None:
+    """对七项产物中存在的文件与 raw/{doc_id}.meta.yaml 执行 fsync。
+
+    只读打开、绝不改写内容;任一 fsync 失败抛出 OSError,调用方绝不进入
+    COMMITTED,按既有验证/提交失败路径回滚。
+    """
+    for path in artifact_paths(base, doc_id):
+        if path.is_file():
+            fsync_existing_file(path)
+    fsync_existing_file(base / "raw" / f"{doc_id}.meta.yaml")
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +615,25 @@ def _execute_scheduled_job(
             if not write_doc_compile_result(doc_id, "compiled", base_dir=base):
                 readiness.mark_recovery_required(
                     "compiled_meta_normalization_failed"
+                )
+                return
+            # N4: COMMITTED 迁移前对已存在的七项产物与 raw meta 执行
+            # fsync(只读,不改写);fsync 失败绝不提交,按验证/提交失败
+            # 路径回滚。
+            try:
+                _fsync_committed_outputs(base, doc_id)
+            except OSError as exc:
+                sanitized = sanitize_compile_error(
+                    f"commit output fsync failed: {type(exc).__name__}: {exc}"
+                )
+                _rollback_running_job(
+                    base,
+                    config,
+                    readiness,
+                    manifest,
+                    TransactionState.RUNNING,
+                    classify_compile_error(sanitized),
+                    sanitized,
                 )
                 return
             # Manifest 原子进入 COMMITTED: 唯一成功提交点。

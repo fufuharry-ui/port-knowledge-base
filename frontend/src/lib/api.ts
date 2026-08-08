@@ -8,26 +8,38 @@ export const API_BASE =
 
 // ─── 类型定义 ─────────────────────────────────────────────────────────────────
 
-/** 后端编译/回滚失败的稳定机器错误码(见 detail.code) */
-export type CompileErrorCode =
-    | 'compile_in_progress'
-    | 'knowledge_base_busy'
+/** 文档终态编译/回滚失败的稳定机器错误码(见 raw meta error_code) */
+export type DocumentCompileErrorCode =
     | 'llm_configuration'
     | 'service_unavailable'
     | 'timeout'
     | 'document_processing'
     | 'compile_failed'
+    | 'interrupted'
     | 'rollback_failed';
+
+/** 请求级拒绝的稳定机器错误码(见 409/503 detail.code) */
+export type CompileRequestErrorCode =
+    | 'compile_in_progress'
+    | 'knowledge_base_busy'
+    | 'compile_transaction_unavailable'
+    | 'recovery_required';
+
+/** 后端编译/回滚/请求拒绝的稳定机器错误码(见 detail.code) */
+export type CompileErrorCode = DocumentCompileErrorCode | CompileRequestErrorCode;
 
 /** 错误码 → 固定中文用户文案(不暴露后端原始 detail) */
 const COMPILE_ERROR_MESSAGES: Record<CompileErrorCode, string> = {
     compile_in_progress: '该文档正在编译，请稍后再试',
-    knowledge_base_busy: '知识库正在执行编译任务，请稍后再删除',
+    knowledge_base_busy: '知识库正在执行编译任务，请稍后重试',
+    compile_transaction_unavailable: '编译任务暂时无法创建，请稍后重试或联系管理员',
+    recovery_required: '知识库正在恢复或需要管理员处理，暂不可用',
     llm_configuration: '模型服务暂不可用，请联系管理员检查配置',
     service_unavailable: '编译服务暂不可用，请稍后重试',
     timeout: '编译服务响应超时，请稍后重试',
     document_processing: '文档编译未完成，请检查文件内容后重试',
     compile_failed: '编译失败，请稍后重试或联系管理员',
+    interrupted: '编译任务因服务重启中断，旧版本已恢复，请重新编译',
     rollback_failed: '编译失败，旧版本恢复异常，请联系管理员',
 };
 
@@ -78,8 +90,8 @@ export interface DocMeta {
     source_type?: string;
     abstract_short?: string;
     ontology_terms?: string[];
-    /** 编译/回滚失败的稳定机器错误码;展示文案由 getCompileErrorMessage 派生 */
-    error_code?: CompileErrorCode;
+    /** 文档终态编译/回滚失败的稳定机器错误码;展示文案由 getCompileErrorMessage 派生 */
+    error_code?: DocumentCompileErrorCode;
 }
 
 export interface WikiIndexData {

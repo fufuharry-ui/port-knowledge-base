@@ -20,6 +20,9 @@ frontend/.next/
 .worktrees/
 .cache/
 
+# ─── E005 runtime state (instance lock, transactions, upload intake) ──────
+.runtime/
+
 # ─── Test artifacts ───────────────────────────────────────
 frontend/test-results/
 .playwright-mcp/

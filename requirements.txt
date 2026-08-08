@@ -24,6 +24,10 @@ sse-starlette>=2.1.0      # SSE 响应（api/main.py 顶层 import）
 requests>=2.31.0          # HTTP 客户端（scripts/embedding_client.py 顶层 import）
 httpx>=0.27.0             # 异步 HTTP 客户端（TestClient 依赖）
 
+# ─── E005: 编译事务运行时门禁 ──────────────────────────────────────────────
+portalocker>=2.10.0    # 跨平台单API实例排他锁
+psutil>=6.0.0         # 跨平台进程身份与进程树终止
+
 # ─── 测试依赖 ───────────────────────────────────────────
 pytest>=8.2.0             # 测试框架（tests/ 直接 import）
 pytest-asyncio>=0.23.0    # 异步测试支持

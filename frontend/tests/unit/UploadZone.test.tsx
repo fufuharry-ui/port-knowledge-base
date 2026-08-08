@@ -7,6 +7,7 @@ import React from 'react';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import UploadZone from '@/components/UploadZone';
+import { ApiError } from '@/lib/api';
 
 describe('UploadZone', () => {
     test('renders dropzone instruction text', () => {
@@ -119,5 +120,47 @@ describe('UploadZone', () => {
 
         expect(await screen.findByText('上传失败，请稍后重试')).toBeInTheDocument();
         expect(screen.queryByText(/OPENAI_API_KEY|sk-secret|API error 500/)).toBeNull();
+    });
+
+    test('surfaces fixed 503 copy when compile transaction is unavailable', async () => {
+        const onUpload = jest.fn().mockRejectedValue(
+            new ApiError(
+                '编译任务暂时无法创建，请稍后重试或联系管理员',
+                503,
+                'compile_transaction_unavailable',
+            ),
+        );
+        render(<UploadZone onUpload={onUpload} />);
+        const file = new File(['# Test'], 'busy.md', { type: 'text/markdown' });
+
+        fireEvent.drop(screen.getByTestId('dropzone'), {
+            dataTransfer: { files: [file] },
+        });
+
+        expect(
+            await screen.findByText('编译任务暂时无法创建，请稍后重试或联系管理员'),
+        ).toBeInTheDocument();
+        expect(screen.queryByText(/job_?id|\bpid\b|RuntimeError|503|API_KEY/i)).toBeNull();
+    });
+
+    test('surfaces fixed 503 copy when recovery is required', async () => {
+        const onUpload = jest.fn().mockRejectedValue(
+            new ApiError(
+                '知识库正在恢复或需要管理员处理，暂不可用',
+                503,
+                'recovery_required',
+            ),
+        );
+        render(<UploadZone onUpload={onUpload} />);
+        const file = new File(['# Test'], 'gated.md', { type: 'text/markdown' });
+
+        fireEvent.drop(screen.getByTestId('dropzone'), {
+            dataTransfer: { files: [file] },
+        });
+
+        expect(
+            await screen.findByText('知识库正在恢复或需要管理员处理，暂不可用'),
+        ).toBeInTheDocument();
+        expect(screen.queryByText(/job_?id|\bpid\b|RuntimeError|503|API_KEY/i)).toBeNull();
     });
 });

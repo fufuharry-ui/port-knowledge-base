@@ -279,3 +279,187 @@ def test_ingest_audit_log_stays_in_project_dir(
     sandbox_log = project_dir / "wiki" / "log.md"
     assert sandbox_log.exists()
     assert "audit_isolation" in sandbox_log.read_text(encoding="utf-8")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5. E005 Task 6: 纯摄入准备边界 (prepare_ingest / publish_prepared_ingest)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPrepareIngestPurity:
+    """prepare_ingest 是纯准备：解析 + 哈希 + doc_id + 候选 meta，
+    不得写 originals/ raw/ wiki/ meta/ 任何业务目录。"""
+
+    def test_prepare_ingest_returns_candidate_without_writing_business_directories(self, tmp_path):
+        from scripts.ingest import prepare_ingest
+        staged = tmp_path / "upload.txt"
+        staged.write_text("港口数字化测试", encoding="utf-8")
+        prepared = prepare_ingest(staged, base_dir=tmp_path, existing_doc_ids=set())
+        assert prepared.doc_id.startswith("doc_")
+        assert prepared.text_bytes.decode("utf-8") == "港口数字化测试"
+        assert not (tmp_path / "originals").exists()
+        assert not (tmp_path / "raw").exists()
+        assert not (tmp_path / "wiki").exists()
+        assert not (tmp_path / "meta").exists()
+
+    def test_prepared_ingest_is_frozen_dataclass(self, tmp_path):
+        import dataclasses
+        from scripts.ingest import prepare_ingest
+        staged = tmp_path / "frozen.txt"
+        staged.write_text("冻结测试", encoding="utf-8")
+        prepared = prepare_ingest(staged, base_dir=tmp_path, existing_doc_ids=set())
+        assert dataclasses.is_dataclass(prepared)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            prepared.doc_id = "doc_19990101_999"
+
+    def test_prepare_ingest_rejects_unsupported_suffix(self, tmp_path):
+        from scripts.ingest import prepare_ingest
+        staged = tmp_path / "upload.xyz"
+        staged.write_text("data", encoding="utf-8")
+        with pytest.raises(ValueError):
+            prepare_ingest(staged, base_dir=tmp_path, existing_doc_ids=set())
+        assert not (tmp_path / "raw").exists()
+
+
+class TestPrepareIngestDocIdAllocation:
+    """existing_doc_ids 提供时：取今日 max seq + 1，
+    覆盖中间删除号与不连续编号，且不复用。"""
+
+    @staticmethod
+    def _today() -> str:
+        from datetime import datetime
+        from scripts.ingest import TZ_CST
+        return datetime.now(TZ_CST).strftime("%Y%m%d")
+
+    def _prepare(self, tmp_path, existing_doc_ids):
+        from scripts.ingest import prepare_ingest
+        staged = tmp_path / "alloc.txt"
+        staged.write_text("序号分配测试", encoding="utf-8")
+        return prepare_ingest(staged, base_dir=tmp_path,
+                              existing_doc_ids=existing_doc_ids)
+
+    def test_empty_set_starts_at_001(self, tmp_path):
+        today = self._today()
+        prepared = self._prepare(tmp_path, set())
+        assert prepared.doc_id == f"doc_{today}_001"
+
+    def test_allocates_max_seq_plus_one(self, tmp_path):
+        today = self._today()
+        prepared = self._prepare(
+            tmp_path, {f"doc_{today}_001", f"doc_{today}_002"})
+        assert prepared.doc_id == f"doc_{today}_003"
+
+    def test_deleted_middle_number_not_reused(self, tmp_path):
+        """002 已被删除：{001, 003} → 分配 004，不复用 002"""
+        today = self._today()
+        prepared = self._prepare(
+            tmp_path, {f"doc_{today}_001", f"doc_{today}_003"})
+        assert prepared.doc_id == f"doc_{today}_004"
+
+    def test_non_continuous_ids(self, tmp_path):
+        """编号不连续：{005} → 006"""
+        today = self._today()
+        prepared = self._prepare(tmp_path, {f"doc_{today}_005"})
+        assert prepared.doc_id == f"doc_{today}_006"
+
+    def test_other_days_ignored(self, tmp_path):
+        today = self._today()
+        prepared = self._prepare(tmp_path, {"doc_19990101_007"})
+        assert prepared.doc_id == f"doc_{today}_001"
+
+    def test_none_existing_doc_ids_keeps_directory_scan(
+        self, patch_ingest_paths, project_dir, tmp_path
+    ):
+        """existing_doc_ids=None（CLI 路径）保持旧的目录扫描行为：
+        扫描 raw/ 下今日 meta 数量 + 1。"""
+        today = self._today()
+        staged = tmp_path / "scan.txt"
+        staged.write_text("目录扫描测试", encoding="utf-8")
+        p1 = patch_ingest_paths.prepare_ingest(staged)
+        assert p1.doc_id == f"doc_{today}_001"
+        # 模拟已存在的今日 meta（含空洞扫描语义与原有一致：按数量而非 max）
+        raw_dir = project_dir / "raw"
+        (raw_dir / f"{p1.doc_id}.meta.yaml").write_text(
+            "id: " + p1.doc_id, encoding="utf-8")
+        p2 = patch_ingest_paths.prepare_ingest(staged)
+        assert p2.doc_id == f"doc_{today}_002"
+        # 目录扫描不得写入任何文件：raw/ 中只有本测试手动创建的 meta
+        assert [p.name for p in raw_dir.iterdir()] == [f"{p1.doc_id}.meta.yaml"]
+
+
+class TestPublishPreparedIngest:
+    """publish_prepared_ingest 按旧 _write_meta 合同写 raw/{doc_id}.txt
+    与 raw/{doc_id}.meta.yaml。"""
+
+    LEGACY_META_KEYS = {
+        "id", "title", "source_type", "source_original", "source_url",
+        "ingested_at", "file_hash", "char_count", "language",
+        "status", "error_message",
+    }
+
+    def test_prepare_publish_round_trip_matches_legacy_meta_shape(self, tmp_path):
+        from scripts.ingest import prepare_ingest, publish_prepared_ingest
+        content = "岸桥远控 round-trip 测试内容"
+        staged = tmp_path / "roundtrip.txt"
+        staged.write_text(content, encoding="utf-8")
+
+        prepared = prepare_ingest(staged, base_dir=tmp_path, existing_doc_ids=set())
+        # 发布前仍无业务目录
+        assert not (tmp_path / "raw").exists()
+
+        meta = publish_prepared_ingest(prepared, staged, base_dir=tmp_path)
+
+        raw_dir = tmp_path / "raw"
+        txt_path = raw_dir / f"{prepared.doc_id}.txt"
+        meta_path = raw_dir / f"{prepared.doc_id}.meta.yaml"
+        assert txt_path.exists()
+        assert meta_path.exists()
+        assert txt_path.read_text(encoding="utf-8") == content
+
+        with open(meta_path, "r", encoding="utf-8") as f:
+            disk_meta = yaml.safe_load(f)
+        assert set(disk_meta) == self.LEGACY_META_KEYS
+        assert disk_meta == meta
+        for key in self.LEGACY_META_KEYS - {"ingested_at"}:
+            assert disk_meta[key] == prepared.meta[key]
+        assert disk_meta["status"] == "raw"
+        assert disk_meta["error_message"] == ""
+        assert disk_meta["source_url"] == ""
+        assert disk_meta["file_hash"].startswith("sha256:")
+        assert disk_meta["char_count"] == len(content)
+        assert disk_meta["language"] == "zh-CN"
+        assert disk_meta["source_original"] == f"originals/{staged.name}"
+
+
+class TestIngestFileComposition:
+    """ingest_file 由 prepare + publish 组合，保持全部 CLI 可观察行为。"""
+
+    def test_ingest_file_keeps_cli_publish_contract(self, patch_ingest_paths, tmp_path):
+        source = tmp_path / "originals" / "a.txt"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("content", encoding="utf-8")
+        meta = patch_ingest_paths.ingest_file(source, base_dir=tmp_path)
+        assert (tmp_path / "raw" / f"{meta['id']}.txt").exists()
+        assert (tmp_path / "raw" / f"{meta['id']}.meta.yaml").exists()
+
+    def test_ingest_file_empty_text_publishes_nothing(self, patch_ingest_paths, tmp_path):
+        source = tmp_path / "empty.txt"
+        source.write_text("   \n  ", encoding="utf-8")
+        assert patch_ingest_paths.ingest_file(source, base_dir=tmp_path) is None
+        # raw/ 由 project_dir fixture 创建；其中不得有任何摄入产物
+        assert list((tmp_path / "raw").iterdir()) == []
+
+    def test_ingest_file_parse_failure_writes_error_meta(self, patch_ingest_paths, tmp_path):
+        """解析失败：写 error meta 并返回 None（docx 内容损坏可确定性触发）。"""
+        source = tmp_path / "broken.docx"
+        source.write_bytes(b"this is not a real docx file")
+        result = patch_ingest_paths.ingest_file(source, base_dir=tmp_path)
+        assert result is None
+        metas = list((tmp_path / "raw").glob("*.meta.yaml"))
+        assert len(metas) == 1
+        with open(metas[0], "r", encoding="utf-8") as f:
+            disk_meta = yaml.safe_load(f)
+        assert disk_meta["status"] == "error"
+        assert disk_meta["error_message"]
+        assert disk_meta["char_count"] == 0
+        # 失败路径不得留下 txt 产物
+        assert not list((tmp_path / "raw").glob("*.txt"))

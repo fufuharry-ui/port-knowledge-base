@@ -5,10 +5,13 @@
  */
 
 import {
+    ApiError,
     deleteDoc,
+    DocMeta,
     getCompileErrorMessage,
     getUserFacingErrorMessage,
     recompileDoc,
+    uploadFile,
 } from '@/lib/api';
 
 const mockFetch = jest.fn();
@@ -60,9 +63,105 @@ describe('structured API errors', () => {
         ['document_processing', '文档编译未完成，请检查文件内容后重试'],
         ['compile_failed', '编译失败，请稍后重试或联系管理员'],
         ['rollback_failed', '编译失败，旧版本恢复异常，请联系管理员'],
-        ['knowledge_base_busy', '知识库正在执行编译任务，请稍后再删除'],
+        ['knowledge_base_busy', '知识库正在执行编译任务，请稍后重试'],
+        ['interrupted', '编译任务因服务重启中断，旧版本已恢复，请重新编译'],
+        ['compile_transaction_unavailable', '编译任务暂时无法创建，请稍后重试或联系管理员'],
+        ['recovery_required', '知识库正在恢复或需要管理员处理，暂不可用'],
     ])('maps %s to fixed user copy', (code, expected) => {
         expect(getCompileErrorMessage(code)).toBe(expected);
+    });
+
+    test('falls back to generic compile-failed copy for unknown or missing codes', () => {
+        expect(getCompileErrorMessage('some_unknown_backend_code')).toBe(
+            '编译失败，请稍后重试或联系管理员',
+        );
+        expect(getCompileErrorMessage(undefined)).toBe(
+            '编译失败，请稍后重试或联系管理员',
+        );
+    });
+
+    test('DocMeta.error_code accepts document terminal code interrupted', () => {
+        const meta: DocMeta = { id: 'doc_1', status: 'error', error_code: 'interrupted' };
+        expect(getCompileErrorMessage(meta.error_code)).toBe(
+            '编译任务因服务重启中断，旧版本已恢复，请重新编译',
+        );
+    });
+
+    test('maps 503 compile_transaction_unavailable to safe copy via handleResponse', async () => {
+        mockFetch.mockResolvedValue({
+            ok: false,
+            status: 503,
+            statusText: 'Service Unavailable',
+            text: async () => JSON.stringify({
+                detail: {
+                    code: 'compile_transaction_unavailable',
+                    job_id: 'job-9f3',
+                    pid: 4242,
+                    path: 'C:\\kb\\transactions\\job-9f3',
+                },
+            }),
+        } as unknown as Response);
+
+        const file = new File(['# Test'], 'test.md', { type: 'text/markdown' });
+        await expect(uploadFile(file)).rejects.toMatchObject({
+            name: 'ApiError',
+            status: 503,
+            code: 'compile_transaction_unavailable',
+            message: '编译任务暂时无法创建，请稍后重试或联系管理员',
+        });
+    });
+
+    test('maps 503 recovery_required to safe copy via handleResponse', async () => {
+        mockFetch.mockResolvedValue({
+            ok: false,
+            status: 503,
+            statusText: 'Service Unavailable',
+            text: async () => JSON.stringify({
+                detail: { code: 'recovery_required', job_id: 'job-77', pid: 1337 },
+            }),
+        } as unknown as Response);
+
+        await expect(recompileDoc('doc_1')).rejects.toMatchObject({
+            name: 'ApiError',
+            status: 503,
+            code: 'recovery_required',
+            message: '知识库正在恢复或需要管理员处理，暂不可用',
+        });
+    });
+
+    test('fixed copies never leak job_id, PID, paths, RuntimeError, status codes or env names', () => {
+        const codes = [
+            'compile_in_progress',
+            'knowledge_base_busy',
+            'llm_configuration',
+            'service_unavailable',
+            'timeout',
+            'document_processing',
+            'compile_failed',
+            'interrupted',
+            'rollback_failed',
+            'compile_transaction_unavailable',
+            'recovery_required',
+        ];
+        for (const code of codes) {
+            const message = getCompileErrorMessage(code);
+            expect(message).not.toMatch(/job_?id/i);
+            expect(message).not.toMatch(/\bpid\b/i);
+            expect(message).not.toMatch(/[A-Za-z]:[\\/]/); // Windows absolute path
+            expect(message).not.toMatch(/[\\/]/); // any path separator
+            expect(message).not.toMatch(/RuntimeError/i);
+            expect(message).not.toMatch(/\b[45]\d\d\b/); // HTTP status codes
+            expect(message).not.toMatch(/API_KEY|BASE_URL|MODEL_NAME|_MODEL\b/); // env var names
+        }
+        // ApiError passthrough carries only the mapped safe copy, not raw detail
+        const err = new ApiError(
+            getCompileErrorMessage('recovery_required'),
+            503,
+            'recovery_required',
+        );
+        expect(getUserFacingErrorMessage(err, 'fallback')).toBe(
+            '知识库正在恢复或需要管理员处理，暂不可用',
+        );
     });
 
     test('parses knowledge_base_busy on delete without exposing 409 or Conflict', async () => {
@@ -79,7 +178,7 @@ describe('structured API errors', () => {
             name: 'ApiError',
             status: 409,
             code: 'knowledge_base_busy',
-            message: '知识库正在执行编译任务，请稍后再删除',
+            message: '知识库正在执行编译任务，请稍后重试',
         });
     });
 

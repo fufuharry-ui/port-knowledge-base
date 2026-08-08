@@ -1,0 +1,1952 @@
+"""E005 Task 2: 编译事务 Manifest 模型与持久快照存储。
+
+对应设计文档第 7 节(事务目录与 Manifest)、第 9 节(状态机)、
+第 11 节(重编译事务准备顺序)和第 16 节(幂等回滚的恢复依据)。
+
+职责边界:
+
+- 在 config.transaction_dir 下以 .staging-{job_id}  staging 生成七项编译
+  产物快照,验证大小与 SHA-256 后原子发布为正式事务目录 {job_id};
+- Manifest(schema_version=1)原子写入,state=PREPARED;
+- load_manifest 对 schema、state、未知键、路径越界、白名单一致性和
+  快照完整性全部失败关闭(fail closed);
+- transition_manifest 以原子 Manifest 写入作为状态迁移提交点;
+- 恢复目标永远由 base_dir + doc_id + 固定白名单重新计算,不信任
+  Manifest 中存储的路径。
+
+Manifest 不记录 API Key、环境变量值、文档正文或未脱敏输出。
+所有耐久写入复用 api.durable_fs 原语,本模块不自行实现耐久写入。
+"""
+from __future__ import annotations
+
+import hashlib
+import logging
+import math
+import os
+import re
+import secrets
+import shutil
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any, Mapping
+
+import psutil
+import yaml
+
+from api.durable_fs import (
+    durable_makedirs,
+    durable_publish_directory,
+    durable_unlink,
+    durable_write_bytes,
+    durable_write_yaml,
+    fsync_parent_directory,
+    sha256_file,
+)
+from api.process_tree import (
+    STATUS_IDENTITY_MISMATCH,
+    STATUS_PROCESS_GONE,
+    ProcessIdentity,
+    _is_recorded_tree_fingerprint,
+    _normalize_path,
+    command_fingerprint,
+    terminate_process_tree,
+    verify_process_identity,
+)
+from api.runtime_guard import CompileRuntimeConfig
+from scripts.doc_admin import read_doc_meta, write_doc_compile_result
+
+MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_FILENAME = "manifest.yaml"
+SOURCE_META_FILENAME = "source-meta-before.yaml"
+STAGING_PREFIX = ".staging-"
+#: 终态目录删除前的隔离区前缀(P2-1): 先原子换名再递归删除,半删除现场
+#: 绝不以正式事务目录形态存在;残留由启动 staging 清理 best-effort 重试。
+CLEANUP_PREFIX = ".cleanup-"
+
+logger = logging.getLogger(__name__)
+
+_SAFE_TOKEN = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+class TransactionState(str, Enum):
+    PREPARED = "PREPARED"
+    SCHEDULED = "SCHEDULED"
+    RUNNING = "RUNNING"
+    COMMITTED = "COMMITTED"
+    ROLLBACKING = "ROLLBACKING"
+    ROLLED_BACK = "ROLLED_BACK"
+
+
+class TransactionKind(str, Enum):
+    RECOMPILE = "recompile"
+    UPLOAD = "upload"
+
+
+ACTIVE_STATES = frozenset({
+    TransactionState.PREPARED,
+    TransactionState.SCHEDULED,
+    TransactionState.RUNNING,
+    TransactionState.ROLLBACKING,
+})
+
+ALLOWED_TRANSITIONS = {
+    TransactionState.PREPARED: {TransactionState.SCHEDULED, TransactionState.ROLLBACKING},
+    TransactionState.SCHEDULED: {TransactionState.RUNNING, TransactionState.ROLLBACKING},
+    TransactionState.RUNNING: {TransactionState.COMMITTED, TransactionState.ROLLBACKING},
+    TransactionState.ROLLBACKING: {TransactionState.ROLLED_BACK},
+    TransactionState.COMMITTED: set(),
+    TransactionState.ROLLED_BACK: set(),
+}
+
+
+class TransactionError(Exception):
+    """编译事务错误基类。"""
+
+
+class TransactionStateError(TransactionError):
+    """状态机违约:当前状态与 expected 不符,或迁移不在 ALLOWED_TRANSITIONS。"""
+
+
+class ManifestIntegrityError(TransactionError):
+    """Manifest schema、安全校验或快照完整性违约;启动恢复必须严格阻断。"""
+
+
+@dataclass(frozen=True)
+class ArtifactRecord:
+    slot: int
+    path: str
+    existed: bool
+    snapshot: str | None
+    snapshot_size: int | None
+    snapshot_sha256: str | None
+    original_sha256: str | None
+
+
+@dataclass(frozen=True)
+class ProcessRecord:
+    pid: int
+    create_time: float
+    executable: str
+    cwd: str
+    command_fingerprint: str
+    process_group_id: int | None
+    platform: str
+
+
+@dataclass(frozen=True)
+class PublishedIntake:
+    original_path: str
+    raw_text_path: str
+    raw_meta_path: str
+    published: bool
+
+
+@dataclass(frozen=True)
+class CompileManifest:
+    schema_version: int
+    job_id: str
+    doc_id: str
+    kind: TransactionKind
+    state: TransactionState
+    created_at: str
+    scheduled_at: str | None
+    started_at: str | None
+    deadline: str | None
+    timeout_seconds: int
+    termination_grace_seconds: int
+    previous_document_status: str | None
+    published_intake: PublishedIntake | None
+    process: ProcessRecord | None
+    failure: dict[str, Any]
+    recovery: dict[str, Any]
+    artifacts: tuple[ArtifactRecord, ...]
+    job_dir: Path
+    #: 终态验证已通过的耐久旗标(设计 §18 增补): True 时后续清理只重试
+    #: 目录删除,绝不重新内容验证——避免后续合法编译改变共享产物后被
+    #: 误判为损坏而阻断启动。
+    cleanup_verified: bool = False
+
+
+# ---------------------------------------------------------------------------
+# 七项编译产物白名单
+# ---------------------------------------------------------------------------
+
+
+def _artifact_relative_paths(doc_id: str) -> tuple[str, ...]:
+    return (
+        f"wiki/{doc_id}.summary.yaml",
+        "wiki/index.yaml",
+        f"meta/ontology/{doc_id}.ontology.yaml",
+        "meta/ontology/global_ontology.yaml",
+        f"meta/relations/{doc_id}.relations.yaml",
+        "meta/relations/knowledge_graph.yaml",
+        "meta/ontology/entity_relations.yaml",
+    )
+
+
+def artifact_paths(base_dir: Path, doc_id: str) -> tuple[Path, ...]:
+    """返回 base_dir 下 doc_id 的七项编译产物绝对路径(固定白名单)。"""
+    base = Path(base_dir)
+    return tuple(base / rel for rel in _artifact_relative_paths(doc_id))
+
+
+# ---------------------------------------------------------------------------
+# Manifest 序列化
+# ---------------------------------------------------------------------------
+
+_TOP_LEVEL_KEYS = frozenset({
+    "schema_version", "job_id", "doc_id", "kind", "state",
+    "created_at", "scheduled_at", "started_at", "deadline",
+    "timeout_seconds", "termination_grace_seconds",
+    "previous_document_status",
+    "published_intake", "process", "failure", "recovery", "artifacts",
+    "cleanup_verified",
+})
+_ARTIFACT_KEYS = frozenset({
+    "slot", "path", "existed", "snapshot",
+    "snapshot_size", "snapshot_sha256", "original_sha256",
+})
+_PROCESS_KEYS = frozenset({
+    "pid", "create_time", "executable", "cwd",
+    "command_fingerprint", "process_group_id", "platform",
+})
+_INTAKE_KEYS = frozenset({
+    "original_path", "raw_text_path", "raw_meta_path", "published",
+})
+_FAILURE_KEYS = frozenset({"original_code", "original_message"})
+_RECOVERY_KEYS = frozenset({"last_error", "failed_paths"})
+
+# transition_manifest 允许变更的字段;状态机字段与身份字段不可变。
+_TRANSITION_CHANGEABLE_FIELDS = frozenset({
+    "scheduled_at", "started_at", "deadline",
+    "process", "published_intake", "failure", "recovery",
+})
+
+
+def _artifact_to_dict(record: ArtifactRecord) -> dict[str, Any]:
+    return {
+        "slot": record.slot,
+        "path": record.path,
+        "existed": record.existed,
+        "snapshot": record.snapshot,
+        "snapshot_size": record.snapshot_size,
+        "snapshot_sha256": record.snapshot_sha256,
+        "original_sha256": record.original_sha256,
+    }
+
+
+def _process_to_dict(record: ProcessRecord) -> dict[str, Any]:
+    return {
+        "pid": record.pid,
+        "create_time": record.create_time,
+        "executable": record.executable,
+        "cwd": record.cwd,
+        "command_fingerprint": record.command_fingerprint,
+        "process_group_id": record.process_group_id,
+        "platform": record.platform,
+    }
+
+
+def _intake_to_dict(record: PublishedIntake) -> dict[str, Any]:
+    return {
+        "original_path": record.original_path,
+        "raw_text_path": record.raw_text_path,
+        "raw_meta_path": record.raw_meta_path,
+        "published": record.published,
+    }
+
+
+def _manifest_to_dict(manifest: CompileManifest) -> dict[str, Any]:
+    return {
+        "schema_version": manifest.schema_version,
+        "job_id": manifest.job_id,
+        "doc_id": manifest.doc_id,
+        "kind": manifest.kind.value,
+        "state": manifest.state.value,
+        "created_at": manifest.created_at,
+        "scheduled_at": manifest.scheduled_at,
+        "started_at": manifest.started_at,
+        "deadline": manifest.deadline,
+        "timeout_seconds": manifest.timeout_seconds,
+        "termination_grace_seconds": manifest.termination_grace_seconds,
+        "previous_document_status": manifest.previous_document_status,
+        "published_intake": (
+            _intake_to_dict(manifest.published_intake)
+            if manifest.published_intake is not None
+            else None
+        ),
+        "process": (
+            _process_to_dict(manifest.process)
+            if manifest.process is not None
+            else None
+        ),
+        "failure": dict(manifest.failure),
+        "recovery": {
+            "last_error": manifest.recovery.get("last_error"),
+            "failed_paths": list(manifest.recovery.get("failed_paths") or []),
+        },
+        "artifacts": [_artifact_to_dict(item) for item in manifest.artifacts],
+        "cleanup_verified": manifest.cleanup_verified,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Manifest 反序列化与失败关闭校验
+# ---------------------------------------------------------------------------
+
+
+def _reject(message: str) -> None:
+    raise ManifestIntegrityError(message)
+
+
+def _require_keys(data: Mapping[str, Any], allowed: frozenset, section: str) -> None:
+    unknown = set(data) - set(allowed)
+    if unknown:
+        _reject(f"manifest {section} contains unknown keys: {sorted(unknown)}")
+
+
+def _require_safe_relative_path(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        _reject(f"manifest {field} must be a non-empty relative path string")
+    if "\\" in value:
+        _reject(f"manifest {field} must use posix separators: {value!r}")
+    if PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute():
+        _reject(f"manifest {field} must be relative: {value!r}")
+    parts = PurePosixPath(value).parts
+    if any(part == ".." for part in parts):
+        _reject(f"manifest {field} must not escape the transaction root: {value!r}")
+    return PurePosixPath(value).as_posix()
+
+
+def _require_safe_token(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not _SAFE_TOKEN.match(value):
+        _reject(f"manifest {field} is not a safe identifier: {value!r}")
+    return value
+
+
+def _require_sha256(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not _SHA256_HEX.match(value):
+        _reject(f"manifest {field} must be a sha256 hex digest")
+    return value
+
+
+def _parse_artifact(raw: Any, job_dir: Path, index: int) -> ArtifactRecord:
+    if not isinstance(raw, Mapping):
+        _reject(f"manifest artifacts[{index}] must be a mapping")
+    _require_keys(raw, _ARTIFACT_KEYS, f"artifacts[{index}]")
+    slot = raw.get("slot")
+    if not isinstance(slot, int) or isinstance(slot, bool) or slot != index:
+        _reject(f"manifest artifacts[{index}] has invalid slot: {slot!r}")
+    path = _require_safe_relative_path(raw.get("path"), f"artifacts[{index}].path")
+    existed = raw.get("existed")
+    if not isinstance(existed, bool):
+        _reject(f"manifest artifacts[{index}].existed must be a boolean")
+    snapshot = raw.get("snapshot")
+    snapshot_size = raw.get("snapshot_size")
+    snapshot_sha256 = raw.get("snapshot_sha256")
+    original_sha256 = raw.get("original_sha256")
+    if existed:
+        if snapshot is None or snapshot_size is None or original_sha256 is None:
+            _reject(
+                f"manifest artifacts[{index}] existed=true requires snapshot, "
+                "snapshot_size and original_sha256"
+            )
+        snapshot = _require_safe_relative_path(
+            snapshot, f"artifacts[{index}].snapshot"
+        )
+        if not isinstance(snapshot_size, int) or isinstance(snapshot_size, bool):
+            _reject(f"manifest artifacts[{index}].snapshot_size must be an integer")
+        snapshot_sha256 = _require_sha256(
+            snapshot_sha256, f"artifacts[{index}].snapshot_sha256"
+        )
+        original_sha256 = _require_sha256(
+            original_sha256, f"artifacts[{index}].original_sha256"
+        )
+        snapshot_file = job_dir / snapshot
+        if not snapshot_file.is_file():
+            _reject(
+                f"manifest artifacts[{index}] snapshot missing: {snapshot}"
+            )
+        if snapshot_file.stat().st_size != snapshot_size:
+            _reject(
+                f"manifest artifacts[{index}] snapshot size mismatch: {snapshot}"
+            )
+        if sha256_file(snapshot_file) != snapshot_sha256:
+            _reject(
+                f"manifest artifacts[{index}] snapshot sha256 mismatch: {snapshot}"
+            )
+    else:
+        if snapshot is not None or snapshot_size is not None or snapshot_sha256 is not None:
+            _reject(
+                f"manifest artifacts[{index}] existed=false must not reference "
+                "a snapshot"
+            )
+    return ArtifactRecord(
+        slot=slot,
+        path=path,
+        existed=existed,
+        snapshot=snapshot,
+        snapshot_size=snapshot_size,
+        snapshot_sha256=snapshot_sha256,
+        original_sha256=original_sha256,
+    )
+
+
+def _parse_process(raw: Any) -> ProcessRecord | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        _reject("manifest process must be a mapping or null")
+    _require_keys(raw, _PROCESS_KEYS, "process")
+    pid = raw.get("pid")
+    create_time = raw.get("create_time")
+    if not isinstance(pid, int) or isinstance(pid, bool):
+        _reject("manifest process.pid must be an integer")
+    # N2: 非正 pid/pgid 失败关闭——POSIX killpg(0) 会把信号发向恢复进程
+    # 自身的进程组,负值语义未定义;绝不加载、绝不进入 kill 路径。
+    if pid <= 0:
+        _reject("manifest process.pid must be positive")
+    if not isinstance(create_time, (int, float)) or isinstance(create_time, bool):
+        _reject("manifest process.create_time must be a number")
+    # R6-P1-2: create_time 必须有限且为正——nan 使 abs(差值) > tolerance
+    # 恒为 False,create_time 校验被静默绕过,PID 复用的新编译器可能被
+    # 误当作记录进程而遭信号(与 N2 非正 pid 同一防御模式)。
+    # 注: <=0 子句针对退化记录值;R7-P1-1 起 spawn 在 create_time 不可读
+    # 时直接抛出(身份捕获失败),0.0 身份绝不持久化——写者/读者一致,
+    # 不再存在"持久化 0.0 后回读抛出"的窗口。
+    if not math.isfinite(create_time) or create_time <= 0:
+        _reject("manifest process.create_time must be finite and positive")
+    pgid = raw.get("process_group_id")
+    if pgid is not None and (not isinstance(pgid, int) or isinstance(pgid, bool)):
+        _reject("manifest process.process_group_id must be an integer or null")
+    if pgid is not None and pgid <= 0:
+        _reject("manifest process.process_group_id must be positive")
+    for field in ("executable", "cwd", "command_fingerprint", "platform"):
+        if not isinstance(raw.get(field), str):
+            _reject(f"manifest process.{field} must be a string")
+    return ProcessRecord(
+        pid=pid,
+        create_time=float(create_time),
+        executable=raw["executable"],
+        cwd=raw["cwd"],
+        command_fingerprint=raw["command_fingerprint"],
+        process_group_id=pgid,
+        platform=raw["platform"],
+    )
+
+
+def _parse_intake(raw: Any) -> PublishedIntake | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        _reject("manifest published_intake must be a mapping or null")
+    _require_keys(raw, _INTAKE_KEYS, "published_intake")
+    original_path = _require_safe_relative_path(
+        raw.get("original_path"), "published_intake.original_path"
+    )
+    raw_text_path = _require_safe_relative_path(
+        raw.get("raw_text_path"), "published_intake.raw_text_path"
+    )
+    raw_meta_path = _require_safe_relative_path(
+        raw.get("raw_meta_path"), "published_intake.raw_meta_path"
+    )
+    published = raw.get("published")
+    if not isinstance(published, bool):
+        _reject("manifest published_intake.published must be a boolean")
+    return PublishedIntake(
+        original_path=original_path,
+        raw_text_path=raw_text_path,
+        raw_meta_path=raw_meta_path,
+        published=published,
+    )
+
+
+def _parse_failure(raw: Any) -> dict[str, Any]:
+    if raw is None:
+        return {"original_code": None, "original_message": None}
+    if not isinstance(raw, Mapping):
+        _reject("manifest failure must be a mapping or null")
+    _require_keys(raw, _FAILURE_KEYS, "failure")
+    code = raw.get("original_code")
+    message = raw.get("original_message")
+    if code is not None and not isinstance(code, str):
+        _reject("manifest failure.original_code must be a string or null")
+    if message is not None and not isinstance(message, str):
+        _reject("manifest failure.original_message must be a string or null")
+    return {"original_code": code, "original_message": message}
+
+
+def _parse_recovery(raw: Any) -> dict[str, Any]:
+    if raw is None:
+        return {"last_error": None, "failed_paths": []}
+    if not isinstance(raw, Mapping):
+        _reject("manifest recovery must be a mapping or null")
+    _require_keys(raw, _RECOVERY_KEYS, "recovery")
+    last_error = raw.get("last_error")
+    failed_paths = raw.get("failed_paths")
+    if last_error is not None and not isinstance(last_error, str):
+        _reject("manifest recovery.last_error must be a string or null")
+    if failed_paths is None:
+        failed_paths = []
+    if not isinstance(failed_paths, list) or not all(
+        isinstance(item, str) for item in failed_paths
+    ):
+        _reject("manifest recovery.failed_paths must be a list of strings")
+    return {"last_error": last_error, "failed_paths": list(failed_paths)}
+
+
+def load_manifest(job_dir: Path) -> CompileManifest:
+    """读取并严格校验 {job_dir}/manifest.yaml。
+
+    未知 schema_version、未知 state/kind、安全关键区段的未知键、路径越界、
+    白名单不一致以及快照缺失/大小或 SHA-256 不匹配均抛出
+    ManifestIntegrityError,调用方必须失败关闭。
+    """
+    job_dir = Path(job_dir)
+    manifest_path = job_dir / MANIFEST_FILENAME
+    try:
+        raw_text = manifest_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ManifestIntegrityError(
+            f"manifest unreadable: {manifest_path} ({exc})"
+        ) from exc
+    try:
+        data = yaml.safe_load(raw_text)
+    except yaml.YAMLError as exc:
+        raise ManifestIntegrityError(
+            f"manifest is not valid YAML: {manifest_path}"
+        ) from exc
+    if not isinstance(data, Mapping):
+        _reject("manifest root must be a mapping")
+    _require_keys(data, _TOP_LEVEL_KEYS, "top-level")
+
+    if data.get("schema_version") != MANIFEST_SCHEMA_VERSION:
+        _reject(f"unknown manifest schema_version: {data.get('schema_version')!r}")
+
+    job_id = _require_safe_token(data.get("job_id"), "job_id")
+    if job_id != job_dir.name:
+        _reject(
+            f"manifest job_id {job_id!r} does not match directory {job_dir.name!r}"
+        )
+    doc_id = _require_safe_token(data.get("doc_id"), "doc_id")
+
+    try:
+        kind = TransactionKind(data.get("kind"))
+    except ValueError:
+        _reject(f"unknown manifest kind: {data.get('kind')!r}")
+    try:
+        state = TransactionState(data.get("state"))
+    except ValueError:
+        _reject(f"unknown manifest state: {data.get('state')!r}")
+
+    timeout_seconds = data.get("timeout_seconds")
+    grace_seconds = data.get("termination_grace_seconds")
+    if not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool):
+        _reject("manifest timeout_seconds must be an integer")
+    if not isinstance(grace_seconds, int) or isinstance(grace_seconds, bool):
+        _reject("manifest termination_grace_seconds must be an integer")
+
+    for field in ("created_at",):
+        if not isinstance(data.get(field), str):
+            _reject(f"manifest {field} must be a string")
+    for field in ("scheduled_at", "started_at", "deadline", "previous_document_status"):
+        value = data.get(field)
+        if value is not None and not isinstance(value, str):
+            _reject(f"manifest {field} must be a string or null")
+
+    raw_artifacts = data.get("artifacts")
+    if not isinstance(raw_artifacts, list):
+        _reject("manifest artifacts must be a list")
+    artifacts = tuple(
+        _parse_artifact(item, job_dir, index)
+        for index, item in enumerate(raw_artifacts)
+    )
+    expected_paths = _artifact_relative_paths(doc_id)
+    actual_paths = tuple(item.path for item in artifacts)
+    if actual_paths != expected_paths:
+        _reject(
+            "manifest artifacts do not match the seven-artifact whitelist "
+            f"for doc_id {doc_id!r}"
+        )
+
+    cleanup_verified = data.get("cleanup_verified", False)
+    if not isinstance(cleanup_verified, bool):
+        _reject("manifest cleanup_verified must be a boolean")
+
+    process = _parse_process(data.get("process"))
+    # R5-P1-1: 状态机不变量——RUNNING 只能连同进程记录一起写入
+    # (_execute_scheduled_job 恒携带);RUNNING + process=null 是损坏/
+    # 不兼容证据,失败关闭,绝不按"无遗留进程"回滚(未记录的编译器
+    # 可能仍在写产物)。ROLLBACKING + null 合法(spawn 失败路径无记录)。
+    if state is TransactionState.RUNNING and process is None:
+        _reject("manifest state RUNNING requires a process record")
+
+    intake = _parse_intake(data.get("published_intake"))
+    # R6-P2-1: 上传事务的 intake 不变量——prepare_upload_transaction 恒写
+    # 非空 published_intake,且发布完成(published=True)后才迁移
+    # SCHEDULED。kind=upload + intake=null(任意状态)或 PREPARED 之后
+    # published=false 均为损坏证据: 空转回滚会删除证据并搁浅已上传文件,
+    # 必须失败关闭。
+    if kind is TransactionKind.UPLOAD:
+        if intake is None:
+            _reject("upload manifest requires published_intake")
+        if state is not TransactionState.PREPARED and not intake.published:
+            _reject(
+                "upload manifest past PREPARED requires published_intake "
+                "published=true"
+            )
+
+    return CompileManifest(
+        schema_version=MANIFEST_SCHEMA_VERSION,
+        job_id=job_id,
+        doc_id=doc_id,
+        kind=kind,
+        state=state,
+        created_at=data["created_at"],
+        scheduled_at=data.get("scheduled_at"),
+        started_at=data.get("started_at"),
+        deadline=data.get("deadline"),
+        timeout_seconds=timeout_seconds,
+        termination_grace_seconds=grace_seconds,
+        previous_document_status=data.get("previous_document_status"),
+        published_intake=intake,
+        process=process,
+        failure=_parse_failure(data.get("failure")),
+        recovery=_parse_recovery(data.get("recovery")),
+        artifacts=artifacts,
+        job_dir=job_dir,
+        cleanup_verified=cleanup_verified,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 事务创建与状态迁移
+# ---------------------------------------------------------------------------
+
+
+def _generate_job_id() -> str:
+    now = datetime.now(timezone.utc)
+    return f"{now:%Y%m%dT%H%M%S%f}Z-{secrets.token_hex(4)}"
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def create_prepared_transaction(
+    *,
+    base_dir: Path,
+    config: CompileRuntimeConfig,
+    doc_id: str,
+    kind: TransactionKind,
+    previous_meta: dict[str, object] | None,
+    published_intake: PublishedIntake | None = None,
+    previous_meta_bytes: bytes | None = None,
+) -> CompileManifest:
+    """在 config.transaction_dir 下创建 PREPARED 事务。
+
+    顺序(设计 §11):
+        staging 目录 → 七项快照(耐久写入)→ 快照大小与 SHA-256 验证
+        → 保存 source-meta-before.yaml → 原子写 PREPARED Manifest
+        → durable_publish_directory 原子发布为正式目录。
+
+    source-meta-before.yaml 优先保存 previous_meta_bytes(原 meta 文件
+    字节快照,注释/格式不丢失,未接受回滚逐字节恢复);仅在旧调用方
+    未提供字节时回退为 previous_meta 的序列化形式(legacy)。
+
+    正式发布前任何失败删除 staging,业务目录保持不变。
+    """
+    base_dir = Path(base_dir)
+    if not isinstance(kind, TransactionKind):
+        kind = TransactionKind(kind)
+    _require_safe_token(doc_id, "doc_id")
+    transaction_root = Path(config.transaction_dir)
+    # R5-P1-2: 事务根链(含 .runtime)耐久创建——新建层父目录 fsync,
+    # 掉电不得把已绑定 compiling 的 meta 搁浅在无事务目录的现场。
+    durable_makedirs(transaction_root)
+
+    job_id = _generate_job_id()
+    staging = transaction_root / f"{STAGING_PREFIX}{job_id}"
+    final_dir = transaction_root / job_id
+    try:
+        snapshot_dir = staging / "snapshots"
+        snapshot_dir.mkdir(parents=True)
+
+        artifacts: list[ArtifactRecord] = []
+        for index, target in enumerate(artifact_paths(base_dir, doc_id)):
+            relative_path = target.relative_to(base_dir).as_posix()
+            if target.is_file():
+                payload = target.read_bytes()
+                original_sha256 = sha256_file(target)
+                snapshot_rel = f"snapshots/{index:02d}.bin"
+                snapshot_path = staging / snapshot_rel
+                durable_write_bytes(snapshot_path, payload)
+                snapshot_size = snapshot_path.stat().st_size
+                if snapshot_size != len(payload):
+                    raise OSError(
+                        f"snapshot size verification failed: {snapshot_path}"
+                    )
+                snapshot_sha256 = sha256_file(snapshot_path)
+                if snapshot_sha256 != original_sha256:
+                    raise OSError(
+                        f"snapshot sha256 verification failed: {snapshot_path}"
+                    )
+                artifacts.append(ArtifactRecord(
+                    slot=index,
+                    path=relative_path,
+                    existed=True,
+                    snapshot=snapshot_rel,
+                    snapshot_size=snapshot_size,
+                    snapshot_sha256=snapshot_sha256,
+                    original_sha256=original_sha256,
+                ))
+            else:
+                artifacts.append(ArtifactRecord(
+                    slot=index,
+                    path=relative_path,
+                    existed=False,
+                    snapshot=None,
+                    snapshot_size=None,
+                    snapshot_sha256=None,
+                    original_sha256=None,
+                ))
+
+        if previous_meta_bytes is not None:
+            durable_write_bytes(staging / SOURCE_META_FILENAME, previous_meta_bytes)
+        elif previous_meta is not None:
+            durable_write_yaml(staging / SOURCE_META_FILENAME, previous_meta)
+
+        manifest = CompileManifest(
+            schema_version=MANIFEST_SCHEMA_VERSION,
+            job_id=job_id,
+            doc_id=doc_id,
+            kind=kind,
+            state=TransactionState.PREPARED,
+            created_at=_now_iso(),
+            scheduled_at=None,
+            started_at=None,
+            deadline=None,
+            timeout_seconds=config.timeout_seconds,
+            termination_grace_seconds=config.termination_grace_seconds,
+            previous_document_status=(
+                str(previous_meta.get("status"))
+                if previous_meta is not None and previous_meta.get("status") is not None
+                else None
+            ),
+            published_intake=published_intake,
+            process=None,
+            failure={"original_code": None, "original_message": None},
+            recovery={"last_error": None, "failed_paths": []},
+            artifacts=tuple(artifacts),
+            job_dir=final_dir,
+        )
+        durable_write_yaml(staging / MANIFEST_FILENAME, _manifest_to_dict(manifest))
+        durable_publish_directory(staging, final_dir)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        # N7: durable_publish_directory 内部 rename(staging → final_dir)已
+        # 完成、但后续步骤(如 POSIX 父目录 fsync)失败时,staging 已不存在;
+        # 必须一并移除本调用创建的正式事务目录,绝不留下无归属的 PREPARED
+        # 孤儿(原请求 503 且后续全部变更把它误判为 busy)。final_dir 名即本
+        # 调用生成的唯一 job_id,只可能是本调用创建。
+        # P2-1: 与终态清理同一隔离机制(best-effort): 先换名 .cleanup-*
+        # 再递归删除,半删除现场绝不以正式事务目录形态残留。
+        if final_dir.is_dir():
+            quarantine = _quarantine_transaction_dir(final_dir)
+            shutil.rmtree(
+                quarantine if quarantine is not None else final_dir,
+                ignore_errors=True,
+            )
+        raise
+    return manifest
+
+
+def update_published_intake(
+    job_dir: Path, intake: PublishedIntake
+) -> CompileManifest:
+    """耐久更新 published_intake 区段(上传发布提交点);状态机字段不变。
+
+    与 _record_recovery_failure 同模式: load → replace → 原子 Manifest
+    写入 → 回读。仅供上传发布路径在三个业务目标全部耐久发布并记录
+    intake.yaml 之后翻转 published=True。
+    """
+    job_dir = Path(job_dir)
+    manifest = load_manifest(job_dir)
+    updated = replace(manifest, published_intake=intake)
+    durable_write_yaml(job_dir / MANIFEST_FILENAME, _manifest_to_dict(updated))
+    return load_manifest(job_dir)
+
+
+def transition_manifest(
+    job_dir: Path,
+    expected: TransactionState,
+    target: TransactionState,
+    **changes: Any,
+) -> CompileManifest:
+    """原子迁移 Manifest 状态。
+
+    - 当前状态与 expected 不符时抛出 TransactionStateError;
+    - (current → target) 不在 ALLOWED_TRANSITIONS 时抛出 TransactionStateError;
+    - **changes 只允许 _TRANSITION_CHANGEABLE_FIELDS;
+    - 状态翻转本身通过耐久(原子)Manifest 写入提交,COMMITTED 由此成为
+      唯一提交点。
+    """
+    job_dir = Path(job_dir)
+    manifest = load_manifest(job_dir)
+    if manifest.state is not expected:
+        raise TransactionStateError(
+            f"manifest state is {manifest.state.value}, expected {expected.value}"
+        )
+    if target not in ALLOWED_TRANSITIONS[manifest.state]:
+        raise TransactionStateError(
+            f"transition {manifest.state.value} -> {target.value} is not allowed"
+        )
+    unknown_changes = set(changes) - _TRANSITION_CHANGEABLE_FIELDS
+    if unknown_changes:
+        raise TransactionStateError(
+            f"manifest fields are not transition-changeable: {sorted(unknown_changes)}"
+        )
+    updated = replace(manifest, state=target, **changes)
+    durable_write_yaml(job_dir / MANIFEST_FILENAME, _manifest_to_dict(updated))
+    return load_manifest(job_dir)
+
+
+# ---------------------------------------------------------------------------
+# 事务目录扫描
+# ---------------------------------------------------------------------------
+
+
+def list_transaction_dirs(config: CompileRuntimeConfig) -> list[Path]:
+    """返回正式事务目录(排除 .staging-* 与 .cleanup-* 及非目录项),按名称排序。
+
+    .cleanup-* 是删除流程的隔离残留(可能处于半删除状态),绝不视为事务,
+    否则半删除现场会被误判为 manifest-integrity blocker。
+    """
+    root = Path(config.transaction_dir)
+    if not root.is_dir():
+        return []
+    return sorted(
+        entry
+        for entry in root.iterdir()
+        if entry.is_dir()
+        and not entry.name.startswith(STAGING_PREFIX)
+        and not entry.name.startswith(CLEANUP_PREFIX)
+    )
+
+
+def list_active_manifests(config: CompileRuntimeConfig) -> list[CompileManifest]:
+    """返回全部非终态(ACTIVE_STATES)事务 Manifest,供启动恢复扫描。
+
+    返回数量大于一时,启动恢复必须严格阻断(设计 §17)。
+    """
+    manifests: list[CompileManifest] = []
+    for job_dir in list_transaction_dirs(config):
+        manifest = load_manifest(job_dir)
+        if manifest.state in ACTIVE_STATES:
+            manifests.append(manifest)
+    return manifests
+
+
+# ---------------------------------------------------------------------------
+# E005 Task 4: 幂等恢复引擎(设计 §16、§17、§18)
+#
+# 安全合同:
+# - 恢复目标永远由 base_dir + doc_id + 七项白名单重新计算;上传发布文件
+#   只删除重算后确认落在 originals/ 或 raw/ 且属于本 doc_id 的目标;
+# - ManifestIntegrityError(含快照损坏、未知 schema/state)一律硬阻断,
+#   绝不 catch-and-continue,绝不触碰业务文件;
+# - RUNNING 进程身份不匹配时绝不 kill、绝不回滚,保留证据阻断;
+# - 进程树存在幸存者时绝不回滚;
+# - 恢复失败保持 ROLLBACKING 并记录失败路径,下次调用幂等继续。
+# ---------------------------------------------------------------------------
+
+#: raw meta 中的活动 job 绑定字段;终态(meta compiled/error)不得携带。
+#: 与 scripts.doc_admin.ACTIVE_JOB_FIELDS 保持一致。
+META_ACTIVE_JOB_FIELDS = (
+    "compile_job_id",
+    "compile_started_at",
+    "compile_deadline",
+)
+
+#: 文档终态错误码: 未提交事务因服务生命周期中断而恢复(设计 §20.1)。
+ERROR_CODE_INTERRUPTED = "interrupted"
+ERROR_CODE_ROLLBACK_FAILED = "rollback_failed"
+
+#: 文档终态公开错误码合同(设计 §20.1 与前端 DocumentCompileErrorCode);
+#: 内部原因码(如 running_transition_failed)绝不直接进入 meta error_code。
+PUBLIC_DOC_ERROR_CODES = frozenset({
+    "llm_configuration",
+    "service_unavailable",
+    "timeout",
+    "document_processing",
+    "compile_failed",
+    "interrupted",
+    "rollback_failed",
+})
+
+
+def public_doc_error_code(internal_code: str | None) -> str | None:
+    """把内部失败原因码映射为文档终态公开错误码(R4-P2-3)。
+
+    合同集合之外的内部码一律映射为 compile_failed(结构性护栏):
+    running_transition_failed 是基础设施失败而非服务生命周期中断,
+    不得映射为 interrupted。Manifest 的 original_code 保持原样供运维
+    诊断;None 原样返回(调用方另有缺省)。
+    """
+    if internal_code is None:
+        return None
+    if internal_code in PUBLIC_DOC_ERROR_CODES:
+        return internal_code
+    return "compile_failed"
+
+#: 请求未被接受的同步回滚原由(设计 §11):请求线程在事务被接受前
+#: (bind/SCHEDULED 迁移/add_task 失败)立即回滚时使用;回滚必须把文档
+#: meta 恢复为 source-meta-before.yaml 快照,绝不制造文档错误终态。
+#: 启动恢复与执行器路径绝不使用该码——已接受事务的中断回滚仍写
+#: interrupted 等文档终态错误码。
+ERROR_CODE_UNACCEPTED = "unaccepted"
+
+
+@dataclass(frozen=True)
+class RecoveryResult:
+    """单个事务恢复结果: completed / already_terminal / blocked 三态互斥。"""
+
+    job_id: str
+    completed: bool = False
+    already_terminal: bool = False
+    blocked: bool = False
+    reason: str | None = None
+    failed_paths: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class VerificationReport:
+    """终态事务验证结果;ok=False 时绝不清理目录。"""
+
+    job_id: str
+    state: str
+    ok: bool
+    failures: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CleanupReport:
+    """终态清理报告: 验证失败计入 blockers,纯目录删除失败仅 warnings。"""
+
+    cleaned: list[str]
+    kept: list[str]
+    warnings: list[str]
+    blockers: list[str]
+
+
+@dataclass(frozen=True)
+class StartupRecoveryReport:
+    """启动恢复报告;blockers 非空即 ready=False,实例不得开始服务。"""
+
+    ready: bool
+    recovered: list[str]
+    cleaned: list[str]
+    blockers: list[str]
+    warnings: list[str]
+
+
+def _sanitize_error_message(text: str | None) -> str:
+    """脱敏、单行化并限长技术错误信息(复用 compile_jobs 脱敏规则)。
+
+    延迟导入避免与 api.compile_jobs 的循环依赖。
+    """
+    from api.compile_jobs import sanitize_compile_error
+
+    return sanitize_compile_error(text or "")
+
+
+def _read_doc_meta_safe(
+    base_dir: Path, doc_id: str
+) -> tuple[dict | None, str | None]:
+    """read_doc_meta 的失败关闭包装。
+
+    返回 (meta, None);文件不存在返回 (None, None);损坏、不可读或
+    非映射返回 (None, 脱敏原因),绝不向恢复/启动路径抛出异常。
+    """
+    try:
+        meta = read_doc_meta(doc_id, Path(base_dir))
+    except (OSError, yaml.YAMLError) as exc:
+        return None, f"doc meta unreadable: {_sanitize_error_message(exc)}"
+    if meta is None:
+        return None, None
+    if not isinstance(meta, dict):
+        return None, f"raw/{doc_id}.meta.yaml is not a mapping"
+    return meta, None
+
+
+def _doc_is_bound(
+    base_dir: Path, manifest: CompileManifest
+) -> tuple[bool, str | None]:
+    """判断业务文档是否已绑定本事务(meta 绑定 job 或 status=compiling)。
+
+    返回 (bound, error);meta 损坏/不可读时返回 (False, error),
+    调用方必须失败关闭,不得按"未绑定"清理事务。
+    """
+    meta, error = _read_doc_meta_safe(base_dir, manifest.doc_id)
+    if error is not None:
+        return False, error
+    if meta is None:
+        return False, None
+    for field in META_ACTIVE_JOB_FIELDS:
+        if meta.get(field) == manifest.job_id:
+            return True, None
+    return meta.get("status") == "compiling", None
+
+
+def _recompute_intake_targets(
+    base_dir: Path, manifest: CompileManifest
+) -> list[Path] | None:
+    """重算上传发布撤销目标;任一目标不安全时返回 None(失败关闭)。
+
+    - raw 目标必须与 base_dir + doc_id 重算值完全一致;
+    - original 目标必须是 originals/ 的直接子文件;
+    - 其他前缀或越界一律拒绝,绝不按 Manifest 存储路径删除;
+    - R7-P2-1: Manifest 声明的三项目标还必须与事务目录内独立 journal
+      证据(intake.yaml 的 completed 条目)精确一致——单独一个被篡改的
+      original_path(如指向他文档的 originals/ 子文件)不再构成删除
+      授权;journal 缺失/不可解析/不匹配一律 None。journal 存留至事务
+      清理,回滚中途崩溃后的幂等重入仍可验证。
+    """
+    intake = manifest.published_intake
+    if intake is None or not intake.published:
+        return []
+    declared = [
+        intake.original_path,
+        intake.raw_text_path,
+        intake.raw_meta_path,
+    ]
+    # 延迟导入避免与 api.upload_intake 的循环依赖。
+    from api.upload_intake import read_completed_intake_paths
+
+    journal_paths = read_completed_intake_paths(manifest.job_dir)
+    if journal_paths is None or journal_paths != declared:
+        return None
+    expected_raw = {f"raw/{manifest.doc_id}.txt", f"raw/{manifest.doc_id}.meta.yaml"}
+    targets: list[Path] = []
+    for stored in declared:
+        parts = PurePosixPath(stored).parts
+        if parts[0] == "raw":
+            if stored not in expected_raw:
+                return None
+        elif parts[0] == "originals":
+            if len(parts) != 2:
+                return None
+        else:
+            return None
+        targets.append(Path(base_dir) / stored)
+    return targets
+
+
+def _record_recovery_failure(
+    job_dir: Path, last_error: str, failed_paths: list[str]
+) -> None:
+    """在 ROLLBACKING 上记录恢复失败证据;状态不变,原始失败原因保留。"""
+    manifest = load_manifest(job_dir)
+    updated = replace(
+        manifest,
+        recovery={
+            "last_error": _sanitize_error_message(last_error),
+            "failed_paths": list(failed_paths),
+        },
+    )
+    durable_write_yaml(Path(job_dir) / MANIFEST_FILENAME, _manifest_to_dict(updated))
+
+
+def _read_source_meta_snapshot(job_dir: Path) -> bytes | None:
+    """读取 source-meta-before.yaml 原始字节并验证可解析为 YAML 映射。
+
+    缺失、不可读或解析结果非映射一律返回 None(调用方失败关闭)。
+    """
+    try:
+        snapshot_bytes = (Path(job_dir) / SOURCE_META_FILENAME).read_bytes()
+        parsed = yaml.safe_load(snapshot_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return None
+    return snapshot_bytes if isinstance(parsed, Mapping) else None
+
+
+def _scan_orphan_compile_processes(
+    base_dir: Path, doc_id: str
+) -> tuple[int, ...] | None:
+    """R4-P1-1: spawn→RUNNING 身份窗口的孤儿编译器扫描(SCHEDULED 专用)。
+
+    服务在 spawn 之后、RUNNING 持久化之前死亡时,Manifest 停留无进程记录的
+    SCHEDULED,而孤儿编译器可能仍在改写产物;此时直接回滚会与存活写入交错。
+    扫描与本事务预期业务指纹(scripts.compile|<doc_id> 或 compile.py 派生
+    的 relate 子进程形式)且 cwd == base_dir 的活进程;只扫描、绝不终止
+    (无身份记录,设计 §13 禁止 kill);扫描自身失败返回 None(失败关闭)。
+    """
+    probe = ProcessIdentity(
+        pid=0,
+        create_time=0.0,
+        executable="",
+        cwd=str(base_dir),
+        command_fingerprint=f"scripts.compile|{doc_id}",
+        process_group_id=0,
+        platform="",
+    )
+    expected_cwd = _normalize_path(str(base_dir))
+    matches: list[int] = []
+    try:
+        for proc in psutil.process_iter():
+            try:
+                fingerprint = command_fingerprint(proc.cmdline() or [])
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            if not _is_recorded_tree_fingerprint(probe, fingerprint):
+                continue
+            try:
+                if _normalize_path(proc.cwd()) != expected_cwd:
+                    continue
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            matches.append(proc.pid)
+    except psutil.Error as exc:
+        logger.warning("orphan compiler scan failed for %s: %s", doc_id, exc)
+        return None
+    return tuple(matches)
+
+
+def _terminate_leftover_process(
+    manifest: CompileManifest, config: CompileRuntimeConfig
+) -> str | None:
+    """RUNNING/ROLLBACKING 遗留进程处理;返回 None 表示可继续回滚,
+    否则为阻断原因。进程身份验证优先;根进程已退出时仍须确认记录树
+    无幸存后代(F6 幸存者确认),再允许回滚。"""
+    record = manifest.process
+    if record is None:
+        # R5-P1-1 纵深防御: 即使加载层不变量被绕过,RUNNING + 无进程记录
+        # 也是损坏证据——未记录的编译器可能仍在写产物,失败关闭(绝不
+        # 回滚、绝不 kill、保留证据)。ROLLBACKING + 无记录合法(spawn
+        # 失败路径不携带进程记录)。
+        if manifest.state is TransactionState.RUNNING:
+            return (
+                "RUNNING manifest has no process record; damaged evidence, "
+                "fail closed, nothing killed"
+            )
+        return None
+    # N2 纵深防御: 即使加载层校验被绕过,非正 pid/pgid 也绝不进入
+    # verify/killpg 路径——POSIX killpg(0) 目标正是恢复进程自身的进程组。
+    pgid = (
+        record.process_group_id
+        if record.process_group_id is not None
+        else record.pid
+    )
+    if record.pid <= 0 or pgid <= 0:
+        return (
+            "recorded process identity has nonpositive pid/process_group_id; "
+            "fail closed, nothing killed"
+        )
+    # R6-P1-2 纵深防御: 即使加载层被绕过,非有限/非正 create_time 也绝不
+    # 进入 verify/kill 路径(nan 会静默绕过 create_time 容差校验,PID
+    # 复用进程可能被误杀)。
+    if not math.isfinite(record.create_time) or record.create_time <= 0:
+        return (
+            "recorded process identity has invalid create_time; "
+            "fail closed, nothing killed"
+        )
+    identity = ProcessIdentity(
+        pid=record.pid,
+        create_time=record.create_time,
+        executable=record.executable,
+        cwd=record.cwd,
+        command_fingerprint=record.command_fingerprint,
+        process_group_id=pgid,
+        platform=record.platform,
+    )
+    grace = manifest.termination_grace_seconds or config.termination_grace_seconds
+    status = verify_process_identity(identity)
+    if status.status == STATUS_IDENTITY_MISMATCH:
+        fields = ",".join(status.mismatched_fields)
+        return (
+            f"process identity mismatch (fields: {fields}); "
+            "evidence preserved, nothing killed"
+        )
+    if status.status == STATUS_PROCESS_GONE:
+        # 根进程已退出:经 terminate_process_tree 的 already-gone 路径确认
+        # 记录树无幸存后代(孤立的 relate 子进程不得在回滚期间继续写共享
+        # YAML);幸存或无法确认一律阻断。
+        sweep = terminate_process_tree(identity, grace)
+        if sweep.success:
+            return None
+        return (
+            "recorded process tree exit unconfirmed: "
+            f"{sweep.status} {list(sweep.survivors)}"
+        )
+    result = terminate_process_tree(identity, grace)
+    if result.status == STATUS_IDENTITY_MISMATCH:
+        return "process identity mismatch during termination; evidence preserved"
+    if not result.success:
+        return f"process tree survivors remaining: {list(result.survivors)}"
+    return None
+
+
+def _execute_rollback(
+    base_dir: Path, manifest: CompileManifest
+) -> RecoveryResult:
+    """在 ROLLBACKING 上执行幂等回滚(设计 §16 顺序)。
+
+    每一步都可安全重入: 恢复已恢复的文件、删除已删除的文件、重写
+    文档终态均为幂等操作;崩溃后下次调用从同一状态继续。
+    """
+    base_dir = Path(base_dir)
+    job_dir = manifest.job_dir
+    doc_id = manifest.doc_id
+    targets = artifact_paths(base_dir, doc_id)  # 重算白名单目标
+    failed: list[str] = []
+
+    # 1. 恢复快照中原本存在的文件 / 删除本轮新建的文件。
+    #    删除经 durable_unlink 耐久化(POSIX 父目录 fsync): 掉电不得在
+    #    ROLLED_BACK 提交点后复活已删除的业务文件。
+    for record in manifest.artifacts:
+        target = targets[record.slot]
+        if record.existed:
+            payload = (job_dir / record.snapshot).read_bytes()
+            if hashlib.sha256(payload).hexdigest() != record.snapshot_sha256:
+                failed.append(record.path)
+                continue
+            try:
+                durable_write_bytes(target, payload)
+            except OSError:
+                failed.append(record.path)
+        else:
+            try:
+                if target.is_file() or target.is_symlink():
+                    durable_unlink(target)
+                elif target.exists():
+                    failed.append(record.path)
+            except OSError:
+                failed.append(record.path)
+
+    # 2. 撤销上传事务本轮发布的 original/raw 文件(重算安全目标)。
+    intake_targets = _recompute_intake_targets(base_dir, manifest)
+    if manifest.kind is TransactionKind.UPLOAD:
+        if intake_targets is None:
+            failed.append("published_intake")
+        else:
+            for path in intake_targets:
+                try:
+                    if path.is_file() or path.is_symlink():
+                        durable_unlink(path)
+                    elif path.exists():
+                        failed.append(path.name)
+                except OSError:
+                    failed.append(path.name)
+
+    # 3. 验证恢复结果与事务前存在性 + SHA-256 完全一致。
+    for record in manifest.artifacts:
+        target = targets[record.slot]
+        if record.existed:
+            if not target.is_file() or sha256_file(target) != record.original_sha256:
+                if record.path not in failed:
+                    failed.append(record.path)
+        elif target.exists():
+            if record.path not in failed:
+                failed.append(record.path)
+    if manifest.kind is TransactionKind.UPLOAD and intake_targets:
+        for path in intake_targets:
+            if path.exists() and path.name not in failed:
+                failed.append(path.name)
+
+    if failed:
+        _record_recovery_failure(job_dir, "rollback verification failed", failed)
+        return RecoveryResult(
+            job_id=manifest.job_id,
+            blocked=True,
+            reason=ERROR_CODE_ROLLBACK_FAILED,
+            failed_paths=tuple(failed),
+        )
+
+    # 4. 文档终态: 重编译写 error + 原始稳定错误码并清除活动字段;
+    #    上传不保留孤儿 error 文档(本轮 raw/meta/original 已撤销)。
+    if manifest.kind is TransactionKind.RECOMPILE:
+        meta_rel = f"raw/{doc_id}.meta.yaml"
+        if manifest.failure.get("original_code") == ERROR_CODE_UNACCEPTED:
+            # 设计 §11:请求未正式接受时不制造文档错误终态;把 meta 字节级
+            # 恢复为绑定前的 source-meta-before.yaml 快照。快照缺失、不可读
+            # 或恢复写入失败一律阻断(失败关闭),保持 ROLLBACKING 证据。
+            snapshot_bytes = _read_source_meta_snapshot(job_dir)
+            if snapshot_bytes is None:
+                _record_recovery_failure(
+                    job_dir,
+                    "unaccepted rollback source meta snapshot unreadable",
+                    [meta_rel],
+                )
+                return RecoveryResult(
+                    job_id=manifest.job_id,
+                    blocked=True,
+                    reason=ERROR_CODE_ROLLBACK_FAILED,
+                    failed_paths=(meta_rel,),
+                )
+            try:
+                durable_write_bytes(
+                    base_dir / "raw" / f"{doc_id}.meta.yaml", snapshot_bytes
+                )
+            except OSError as exc:
+                _record_recovery_failure(
+                    job_dir,
+                    "unaccepted rollback meta restore failed: "
+                    f"{_sanitize_error_message(exc)}",
+                    [meta_rel],
+                )
+                return RecoveryResult(
+                    job_id=manifest.job_id,
+                    blocked=True,
+                    reason=ERROR_CODE_ROLLBACK_FAILED,
+                    failed_paths=(meta_rel,),
+                )
+        else:
+            # R6-P1-3: 当前 meta 可能被编译进程的截断写(plain open(w)
+            # 中 kill)损坏——不可信。先把绑定前的 source-meta-before.yaml
+            # 快照字节级恢复到 meta 路径(与未接受路径同一权威依据),
+            # 再在完整 meta 上写错误终态;快照缺失/不可解析为映射或恢复
+            # 写入失败一律失败关闭(保持 ROLLBACKING 证据)。
+            snapshot_bytes = _read_source_meta_snapshot(job_dir)
+            if snapshot_bytes is None:
+                _record_recovery_failure(
+                    job_dir,
+                    "rollback source meta snapshot unreadable",
+                    [meta_rel],
+                )
+                return RecoveryResult(
+                    job_id=manifest.job_id,
+                    blocked=True,
+                    reason=ERROR_CODE_ROLLBACK_FAILED,
+                    failed_paths=(meta_rel,),
+                )
+            try:
+                durable_write_bytes(
+                    base_dir / "raw" / f"{doc_id}.meta.yaml", snapshot_bytes
+                )
+            except OSError as exc:
+                _record_recovery_failure(
+                    job_dir,
+                    "rollback meta restore failed: "
+                    f"{_sanitize_error_message(exc)}",
+                    [meta_rel],
+                )
+                return RecoveryResult(
+                    job_id=manifest.job_id,
+                    blocked=True,
+                    reason=ERROR_CODE_ROLLBACK_FAILED,
+                    failed_paths=(meta_rel,),
+                )
+            # R4-P2-3: meta error_code 只写公开合同码;内部码(如
+            # running_transition_failed)映射为 compile_failed,Manifest
+            # 保留原始码供运维诊断。
+            code = (
+                public_doc_error_code(manifest.failure.get("original_code"))
+                or ERROR_CODE_INTERRUPTED
+            )
+            message = _sanitize_error_message(
+                manifest.failure.get("original_message") or "编译任务被中断"
+            )
+            if not write_doc_compile_result(
+                doc_id, "error",
+                error_code=code, error_message=message, base_dir=base_dir,
+            ):
+                _record_recovery_failure(
+                    job_dir, "failed to write doc error terminal", [meta_rel]
+                )
+                return RecoveryResult(
+                    job_id=manifest.job_id,
+                    blocked=True,
+                    reason=ERROR_CODE_ROLLBACK_FAILED,
+                    failed_paths=(meta_rel,),
+                )
+            # R4-P1-3: doc_admin 的终态 meta 写入只有文件级 fsync +
+            # os.replace,无父目录 fsync;ROLLED_BACK 提交点前必须耐久化
+            # raw/ 父目录(POSIX),否则掉电可能丢失终态 meta 而恢复证据
+            # 已被清除。fsync 失败失败关闭(保持 ROLLBACKING 证据)。
+            try:
+                fsync_parent_directory(base_dir / "raw" / f"{doc_id}.meta.yaml")
+            except OSError as exc:
+                _record_recovery_failure(
+                    job_dir,
+                    "doc meta parent fsync failed: "
+                    f"{_sanitize_error_message(exc)}",
+                    [meta_rel],
+                )
+                return RecoveryResult(
+                    job_id=manifest.job_id,
+                    blocked=True,
+                    reason=ERROR_CODE_ROLLBACK_FAILED,
+                    failed_paths=(meta_rel,),
+                )
+
+    # 5. Manifest → ROLLED_BACK(原子状态提交点)。
+    transition_manifest(job_dir, expected=TransactionState.ROLLBACKING,
+                        target=TransactionState.ROLLED_BACK)
+    return RecoveryResult(job_id=manifest.job_id, completed=True)
+
+
+def recover_transaction(
+    base_dir: Path,
+    config: CompileRuntimeConfig,
+    job_dir: Path,
+    *,
+    reason_code: str,
+    reason_message: str,
+) -> RecoveryResult:
+    """恢复单个非终态事务(设计 §16、§17 状态表)。
+
+    - COMMITTED / ROLLED_BACK: already_terminal,不做任何修改;
+    - PREPARED 且业务未绑定: 清理事务目录,不写 interrupted;
+    - PREPARED 已绑定 / SCHEDULED: 按中断事务回滚,绝不重新排队;
+      reason_code=ERROR_CODE_UNACCEPTED(仅请求线程在事务被接受前)时,
+      不写错误终态,而是把 meta 字节级恢复为 source-meta-before.yaml;
+    - RUNNING: 验证进程身份并终止遗留树,确认退出后才回滚;
+    - ROLLBACKING: 继续幂等回滚;携带进程记录时(如 RUNNING 迁移失败后
+      持久化的可恢复证据)同样先验证并终止遗留树、确认无幸存后代才回滚;
+    - ManifestIntegrityError: 硬阻断,不触碰业务文件。
+    """
+    base_dir = Path(base_dir)
+    job_dir = Path(job_dir)
+    try:
+        manifest = load_manifest(job_dir)
+    except ManifestIntegrityError as exc:
+        return RecoveryResult(
+            job_id=job_dir.name,
+            blocked=True,
+            reason=f"manifest integrity: {_sanitize_error_message(exc)}",
+        )
+
+    if manifest.state in (TransactionState.COMMITTED, TransactionState.ROLLED_BACK):
+        return RecoveryResult(job_id=manifest.job_id, already_terminal=True)
+
+    if manifest.state is TransactionState.PREPARED:
+        bound, binding_error = _doc_is_bound(base_dir, manifest)
+        if binding_error is not None:
+            return RecoveryResult(
+                job_id=manifest.job_id,
+                blocked=True,
+                reason=f"cannot prove binding state: {binding_error}",
+            )
+        if not bound:
+            # 设计 §12.4: 上传事务在 PREPARED 后、业务绑定前的崩溃窗口可能
+            # 已发布部分业务文件;先按 intake.yaml 日志精确撤销本请求创建
+            # 的目标(journal 缺失即本轮未发布,no-op),再清理事务目录。
+            # 延迟导入避免与 api.upload_intake 的循环依赖。
+            from api.upload_intake import rollback_published_intake
+
+            intake_failures = rollback_published_intake(manifest, base_dir)
+            if intake_failures:
+                return RecoveryResult(
+                    job_id=manifest.job_id,
+                    blocked=True,
+                    reason=f"intake rollback failed: {list(intake_failures)}",
+                )
+            # P2-1: 与终态清理同一隔离机制——先换名 .cleanup-* 再递归删除;
+            # 换名失败(正式目录仍在)失败关闭;隔离区 rmtree 失败仅警告,
+            # 语义内容已结算,残留由启动清理重试,绝不阻断恢复完成。
+            quarantine = _quarantine_transaction_dir(job_dir)
+            if quarantine is None:
+                if job_dir.is_dir():
+                    return RecoveryResult(
+                        job_id=manifest.job_id,
+                        blocked=True,
+                        reason="prepared transaction cleanup failed: "
+                        "quarantine rename failed",
+                    )
+                # 换名成功但父目录 fsync 失败: 证据已脱离事务命名空间,
+                # 残留重试即可,不阻断恢复完成。
+            else:
+                try:
+                    shutil.rmtree(quarantine)
+                except OSError as exc:
+                    logger.warning(
+                        "prepared transaction %s quarantine removal failed "
+                        "(%s); residue retried at startup",
+                        manifest.job_id, exc,
+                    )
+            return RecoveryResult(
+                job_id=manifest.job_id,
+                completed=True,
+                reason="prepared_unbound_cleaned",
+            )
+
+    if manifest.state in (TransactionState.RUNNING, TransactionState.ROLLBACKING):
+        blocked_reason = _terminate_leftover_process(manifest, config)
+        if blocked_reason is not None:
+            return RecoveryResult(
+                job_id=manifest.job_id, blocked=True, reason=blocked_reason
+            )
+
+    if manifest.state is TransactionState.SCHEDULED:
+        # R4-P1-1: spawn→RUNNING 身份窗口——SCHEDULED 无进程记录,但孤儿
+        # 编译器可能仍存活并改写产物。回滚前扫描活进程;匹配或扫描失败
+        # 一律阻断(失败关闭,绝不自动 kill,绝不猜测)。
+        orphans = _scan_orphan_compile_processes(base_dir, manifest.doc_id)
+        if orphans is None:
+            return RecoveryResult(
+                job_id=manifest.job_id,
+                blocked=True,
+                reason="orphan compiler scan failed; fail closed",
+            )
+        if orphans:
+            return RecoveryResult(
+                job_id=manifest.job_id,
+                blocked=True,
+                reason=(
+                    f"live compile process(es) {list(orphans)} match this "
+                    "transaction's fingerprint and cwd; refusing to roll "
+                    "back under a live compiler"
+                ),
+            )
+
+    if manifest.state is not TransactionState.ROLLBACKING:
+        changes: dict[str, Any] = {}
+        if not manifest.failure.get("original_code"):
+            changes["failure"] = {
+                "original_code": reason_code,
+                "original_message": _sanitize_error_message(reason_message),
+            }
+        manifest = transition_manifest(
+            job_dir,
+            expected=manifest.state,
+            target=TransactionState.ROLLBACKING,
+            **changes,
+        )
+
+    return _execute_rollback(base_dir, manifest)
+
+
+def _load_yaml_mapping(path: Path) -> dict | None:
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _verify_committed_terminal(base_dir: Path, manifest: CompileManifest) -> list[str]:
+    """COMMITTED 清理前验证(设计 §15、§18): meta compiled 无活动字段,
+    必需产物语义合法。"""
+    failures: list[str] = []
+    doc_id = manifest.doc_id
+    meta, meta_error = _read_doc_meta_safe(base_dir, doc_id)
+    if meta_error is not None:
+        failures.append(meta_error)
+    elif meta is None:
+        failures.append(f"raw/{doc_id}.meta.yaml missing")
+    else:
+        if meta.get("status") != "compiled":
+            failures.append("doc meta status is not compiled")
+        for field in META_ACTIVE_JOB_FIELDS:
+            if field in meta:
+                failures.append(f"doc meta still carries active field {field}")
+
+    for path, label in (
+        (base_dir / "wiki" / f"{doc_id}.summary.yaml", "summary"),
+        (base_dir / "meta" / "ontology" / f"{doc_id}.ontology.yaml", "ontology"),
+    ):
+        data = _load_yaml_mapping(path)
+        if data is None:
+            failures.append(f"{label} missing or unparsable")
+        elif data.get("doc_id") != doc_id:
+            failures.append(f"{label} doc_id mismatch")
+
+    index = _load_yaml_mapping(base_dir / "wiki" / "index.yaml")
+    documents = index.get("documents") if index else None
+    if not isinstance(documents, list) or sum(
+        1
+        for entry in documents
+        if isinstance(entry, Mapping) and entry.get("id") == doc_id
+    ) != 1:
+        failures.append("wiki/index.yaml must contain exactly one entry for doc")
+
+    relations_path = base_dir / "meta" / "relations" / f"{doc_id}.relations.yaml"
+    if relations_path.exists():
+        data = _load_yaml_mapping(relations_path)
+        if data is None or data.get("doc_id") != doc_id:
+            failures.append("doc relations missing or doc_id mismatch")
+
+    for global_path in (
+        base_dir / "meta" / "ontology" / "global_ontology.yaml",
+        base_dir / "meta" / "relations" / "knowledge_graph.yaml",
+        base_dir / "meta" / "ontology" / "entity_relations.yaml",
+    ):
+        if global_path.exists() and _load_yaml_mapping(global_path) is None:
+            failures.append(f"{global_path.name} top-level structure invalid")
+    return failures
+
+
+def _verify_rolled_back_terminal(
+    base_dir: Path, manifest: CompileManifest
+) -> list[str]:
+    """ROLLED_BACK 清理前验证(设计 §18): 七项产物与事务前存在性 + SHA
+    一致,上传发布已撤销,重编译 meta 为 error 且错误码匹配原始失败原因。"""
+    failures: list[str] = []
+    targets = artifact_paths(base_dir, manifest.doc_id)
+    for record in manifest.artifacts:
+        target = targets[record.slot]
+        if record.existed:
+            if not target.is_file():
+                failures.append(f"{record.path} missing after rollback")
+            elif sha256_file(target) != record.original_sha256:
+                failures.append(f"{record.path} sha256 differs from pre-transaction")
+        elif target.exists():
+            failures.append(f"{record.path} must not exist after rollback")
+
+    if manifest.kind is TransactionKind.UPLOAD:
+        intake_targets = _recompute_intake_targets(base_dir, manifest)
+        if intake_targets is None:
+            failures.append("published_intake paths fail safety recomputation")
+        else:
+            for path in intake_targets:
+                if path.exists():
+                    failures.append(f"upload published file not revoked: {path.name}")
+    else:
+        meta, meta_error = _read_doc_meta_safe(base_dir, manifest.doc_id)
+        raw_code = manifest.failure.get("original_code")
+        # R4-P2-3: meta 只携带公开合同码;验证必须与映射后的公开码比较
+        # (内部码如 running_transition_failed 在 meta 中为 compile_failed)。
+        expected_code = public_doc_error_code(raw_code)
+        if meta_error is not None:
+            failures.append(meta_error)
+        elif meta is None:
+            failures.append("recompile doc meta missing after rollback")
+        elif raw_code == ERROR_CODE_UNACCEPTED:
+            # 未接受请求的回滚(设计 §11):meta 必须与绑定前快照字节一致,
+            # 不携带活动字段,不得出现制造的错误终态。
+            meta_path = base_dir / "raw" / f"{manifest.doc_id}.meta.yaml"
+            snapshot_path = manifest.job_dir / SOURCE_META_FILENAME
+            try:
+                identical = meta_path.read_bytes() == snapshot_path.read_bytes()
+            except OSError:
+                identical = False
+            if not identical:
+                failures.append(
+                    "unaccepted rollback did not restore pre-bind doc meta"
+                )
+            for field in META_ACTIVE_JOB_FIELDS:
+                if field in meta:
+                    failures.append(f"doc meta still carries active field {field}")
+        else:
+            if meta.get("status") != "error":
+                failures.append("recompile doc meta is not error after rollback")
+            if (
+                expected_code is not None
+                and meta.get("error_code") != expected_code
+            ):
+                failures.append(
+                    "recompile error_code does not match original failure reason"
+                )
+            for field in META_ACTIVE_JOB_FIELDS:
+                if field in meta:
+                    failures.append(f"doc meta still carries active field {field}")
+    return failures
+
+
+def verify_terminal_transaction(
+    base_dir: Path, manifest: CompileManifest
+) -> VerificationReport:
+    """验证终态事务是否满足清理合同(设计 §18);只看 state 不足以免验证。"""
+    base_dir = Path(base_dir)
+    if manifest.state in ACTIVE_STATES:
+        return VerificationReport(
+            job_id=manifest.job_id,
+            state=manifest.state.value,
+            ok=False,
+            failures=("transaction is not terminal",),
+        )
+    if manifest.state is TransactionState.COMMITTED:
+        failures = _verify_committed_terminal(base_dir, manifest)
+    else:
+        failures = _verify_rolled_back_terminal(base_dir, manifest)
+    return VerificationReport(
+        job_id=manifest.job_id,
+        state=manifest.state.value,
+        ok=not failures,
+        failures=tuple(failures),
+    )
+
+
+def _mark_cleanup_verified(job_dir: Path) -> None:
+    """终态验证通过后、目录删除前,把 cleanup_verified=True 耐久写入 Manifest。
+
+    后续清理(重启/CLI)对该目录只重试删除,绝不重新内容验证(设计 §18
+    增补): 删除失败只是警告,但期间合法编译可能已改变共享产物,重新验证
+    会把合法变化误判为损坏而阻断启动。
+    """
+    manifest = load_manifest(job_dir)
+    updated = replace(manifest, cleanup_verified=True)
+    durable_write_yaml(Path(job_dir) / MANIFEST_FILENAME, _manifest_to_dict(updated))
+
+
+def _quarantine_transaction_dir(job_dir: Path) -> Path | None:
+    """把正式事务目录原子换名为同级 .cleanup-{name} 隔离目录并 fsync 父目录。
+
+    Codex R3 P2-1: 递归删除前先换名隔离——rmtree 在半删除状态(如已删
+    manifest、目录残留)失败或掉电时,残留永远以 .cleanup-* 形态存在,
+    不会被 list_transaction_dirs 当作损坏事务阻断启动;残留由启动
+    staging 清理 best-effort 重试。
+
+    返回隔离目录路径(换名与父目录 fsync 均成功);失败返回 None:
+    - 换名失败: 原目录原样保留,调用方警告后留待下次重试;
+    - fsync 失败: 换名已完成但耐久性无法证明,绝不继续递归删除,
+      残留由下次启动清理(失败关闭)。
+    既有同名隔离残留先 best-effort 移除;无法移除则本轮拒绝换名。
+    """
+    job_dir = Path(job_dir)
+    quarantine = job_dir.parent / f"{CLEANUP_PREFIX}{job_dir.name}"
+    if quarantine.exists():
+        try:
+            shutil.rmtree(quarantine)
+        except OSError as exc:
+            logger.warning(
+                "pre-existing cleanup residue %s cannot be removed (%s); "
+                "skipping quarantine rename this round",
+                quarantine.name, exc,
+            )
+            return None
+    try:
+        os.replace(job_dir, quarantine)
+    except OSError as exc:
+        logger.warning(
+            "quarantine rename failed for %s: %s", job_dir.name, exc
+        )
+        return None
+    try:
+        fsync_parent_directory(quarantine)
+    except OSError as exc:
+        logger.warning(
+            "parent fsync failed after quarantine rename of %s (%s); "
+            "residue left for startup retry",
+            job_dir.name, exc,
+        )
+        return None
+    return quarantine
+
+
+def cleanup_terminal_transactions(
+    base_dir: Path, config: CompileRuntimeConfig
+) -> CleanupReport:
+    """验证并清理全部终态事务(设计 §18)。
+
+    - 非终态事务只报告保留,绝不删除;
+    - Manifest 不可读或验证失败: 计入 blockers,保留目录;
+    - 终态验证通过后先把 cleanup_verified=True 耐久写入 Manifest,
+      再尝试删除;cleanup_verified=True 的目录只重试删除,绝不重新
+      内容验证(期间合法编译对共享产物的改变不被误判为损坏);
+    - 删除先原子换名 .cleanup-* 隔离区(POSIX 父目录 fsync)再递归删除:
+      半删除现场绝不以正式事务目录形态存在,残留由启动清理重试;
+    - 换名失败与纯目录删除失败: 仅 warnings,后续启动或 CLI 继续尝试。
+    """
+    base_dir = Path(base_dir)
+    cleaned: list[str] = []
+    kept: list[str] = []
+    warnings: list[str] = []
+    blockers: list[str] = []
+    for job_dir in list_transaction_dirs(config):
+        try:
+            manifest = load_manifest(job_dir)
+        except ManifestIntegrityError as exc:
+            blockers.append(
+                f"manifest integrity: {job_dir.name}: "
+                f"{_sanitize_error_message(exc)}"
+            )
+            continue
+        if manifest.state in ACTIVE_STATES:
+            kept.append(manifest.job_id)
+            continue
+        if not manifest.cleanup_verified:
+            verification = verify_terminal_transaction(base_dir, manifest)
+            if not verification.ok:
+                blockers.append(
+                    f"terminal verification failed for {manifest.job_id}: "
+                    f"{list(verification.failures)}"
+                )
+                continue
+            try:
+                _mark_cleanup_verified(job_dir)
+            except OSError as exc:
+                # 旗标写入失败不阻断本轮删除(验证已通过);下次清理将
+                # 重新验证(退化为旧行为,安全但不优)。
+                warnings.append(
+                    f"cleanup_verified marker write failed for "
+                    f"{manifest.job_id}: {_sanitize_error_message(exc)}"
+                )
+        quarantine = _quarantine_transaction_dir(job_dir)
+        if quarantine is None:
+            # 换名失败: 已验证目录原样保留,下轮清理重试;换名成功但父目录
+            # fsync 失败: 目录已脱离事务命名空间,.cleanup-* 残留只能由
+            # 启动时的 staging/残留清扫重试(清理循环看不到该前缀)。
+            warnings.append(
+                f"quarantine failed for {manifest.job_id}; "
+                "kept directory retried next cleanup round, "
+                ".cleanup-* residue retried by startup residue sweep"
+            )
+            continue
+        try:
+            shutil.rmtree(quarantine)
+        except OSError as exc:
+            warnings.append(
+                f"directory deletion failed for {manifest.job_id}: "
+                f"{_sanitize_error_message(exc)}"
+            )
+            continue
+        cleaned.append(manifest.job_id)
+    return CleanupReport(
+        cleaned=cleaned, kept=kept, warnings=warnings, blockers=blockers
+    )
+
+
+def find_orphan_compiling_docs(
+    base_dir: Path, exclude_doc_ids: frozenset[str] | None = None
+) -> tuple[list[str], list[str]]:
+    """扫描全部 raw/*.meta.yaml,返回 (孤立 compiling doc_id 列表, 不可读 meta 列表)。
+
+    只读;孤立 compiling 由调用方阻断并展示 doc_id,绝不自动修复。
+    """
+    base_dir = Path(base_dir)
+    excluded = exclude_doc_ids or frozenset()
+    orphans: list[str] = []
+    unreadable: list[str] = []
+    raw_dir = base_dir / "raw"
+    if not raw_dir.is_dir():
+        return orphans, unreadable
+    suffix = ".meta.yaml"
+    for meta_path in sorted(raw_dir.glob(f"*{suffix}")):
+        doc_id = meta_path.name[: -len(suffix)]
+        data = _load_yaml_mapping(meta_path)
+        if data is None:
+            unreadable.append(doc_id)
+            continue
+        if data.get("status") == "compiling" and doc_id not in excluded:
+            orphans.append(doc_id)
+    return orphans, unreadable
+
+
+def _clean_unpublished_staging(config: CompileRuntimeConfig) -> list[str]:
+    """清理未发布的 upload/compile staging(.staging-*)与终态删除的
+    .cleanup-* 隔离残留;失败仅警告。
+
+    .cleanup-* 只存在于事务命名空间(终态清理/PREPARED 未绑定删除的
+    隔离区);upload-intake 树不使用该前缀,只清理 .staging-*。
+    """
+    warnings: list[str] = []
+    roots = (
+        (Path(config.transaction_dir), (STAGING_PREFIX, CLEANUP_PREFIX)),
+        (Path(config.upload_intake_dir), (STAGING_PREFIX,)),
+    )
+    for root, prefixes in roots:
+        if not root.is_dir():
+            continue
+        for entry in sorted(root.iterdir()):
+            if entry.is_dir() and entry.name.startswith(prefixes):
+                try:
+                    shutil.rmtree(entry)
+                except OSError as exc:
+                    warnings.append(
+                        f"staging cleanup failed: {entry.name}: "
+                        f"{_sanitize_error_message(exc)}"
+                    )
+    return warnings
+
+
+def recover_startup(
+    base_dir: Path, config: CompileRuntimeConfig
+) -> StartupRecoveryReport:
+    """启动恢复(设计 §17 顺序)。
+
+    清理未发布 staging → 扫描正式事务 → 硬阻断(未知 schema/state、
+    ≥2 活动事务、PID 身份不匹配、快照损坏)→ 按状态表恢复非终态事务
+    → 验证并清理终态事务 → 扫描孤立 compiling(输出 doc_id 并阻断,
+    绝不自动修复)→ ready。任何 blocker 都意味着 NOT ready。
+    """
+    base_dir = Path(base_dir)
+    recovered: list[str] = []
+    cleaned: list[str] = []
+    blockers: list[str] = []
+    warnings = _clean_unpublished_staging(config)
+
+    manifests: list[CompileManifest] = []
+    for job_dir in list_transaction_dirs(config):
+        try:
+            manifests.append(load_manifest(job_dir))
+        except ManifestIntegrityError as exc:
+            blockers.append(
+                f"manifest integrity: {job_dir.name}: "
+                f"{_sanitize_error_message(exc)}"
+            )
+    if blockers:
+        return StartupRecoveryReport(
+            ready=False,
+            recovered=recovered,
+            cleaned=cleaned,
+            blockers=blockers,
+            warnings=warnings,
+        )
+
+    active = [m for m in manifests if m.state in ACTIVE_STATES]
+    if len(active) >= 2:
+        blockers.append(
+            "multiple active transactions: "
+            + ", ".join(sorted(m.job_id for m in active))
+        )
+        return StartupRecoveryReport(
+            ready=False,
+            recovered=recovered,
+            cleaned=cleaned,
+            blockers=blockers,
+            warnings=warnings,
+        )
+
+    if active:
+        manifest = active[0]
+        result = recover_transaction(
+            base_dir,
+            config,
+            manifest.job_dir,
+            reason_code=ERROR_CODE_INTERRUPTED,
+            reason_message="compile interrupted by service restart",
+        )
+        if result.blocked:
+            blockers.append(
+                f"recovery blocked for {manifest.job_id}: {result.reason}"
+            )
+            return StartupRecoveryReport(
+                ready=False,
+                recovered=recovered,
+                cleaned=cleaned,
+                blockers=blockers,
+                warnings=warnings,
+            )
+        if result.completed:
+            recovered.append(manifest.job_id)
+
+    cleanup = cleanup_terminal_transactions(base_dir, config)
+    cleaned.extend(cleanup.cleaned)
+    blockers.extend(cleanup.blockers)
+    warnings.extend(cleanup.warnings)
+    if blockers:
+        return StartupRecoveryReport(
+            ready=False,
+            recovered=recovered,
+            cleaned=cleaned,
+            blockers=blockers,
+            warnings=warnings,
+        )
+
+    orphans, unreadable = find_orphan_compiling_docs(base_dir)
+    for doc_id in unreadable:
+        blockers.append(f"unreadable doc meta: {doc_id}")
+    for doc_id in orphans:
+        blockers.append(f"orphan compiling document: {doc_id}")
+
+    return StartupRecoveryReport(
+        ready=not blockers,
+        recovered=recovered,
+        cleaned=cleaned,
+        blockers=blockers,
+        warnings=warnings,
+    )

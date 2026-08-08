@@ -728,7 +728,7 @@ git diff --check
 6. 共享YAML存在并发覆盖和半成品风险；
 7. 文档ID生成存在编号空洞和并发风险；
 8. ~~多轮问答引用可能使用全局状态~~（E003已处理：引用、正文和生成状态迁移为assistant消息级状态，ActiveRequest请求身份守卫覆盖停止竞态与旧请求清理；历史thoughts仍不持久化；详见 `docs/dev/tasks/E003-message-scoped-citations.md`）；
-9. ~~后台编译任务缺少可靠状态和错误记录~~（E004已处理API来源编译闭环：上传和重编译统一调度，接受任务前写`compiling`，当前单API进程内全局串行，失败时回滚摘要、索引、本体和关系产物，元数据保存脱敏`error_code/error_message`，前端3秒轮询并仅显示友好文案；仍不覆盖多API进程、外部CLI并发、API强制终止恢复、后台硬超时和全部共享YAML通用原子化，风险6仍保留）；
+9. ~~后台编译任务缺少可靠状态和错误记录~~（E004已处理API来源编译闭环：上传和重编译统一调度，接受任务前写`compiling`，单API进程内全局串行，失败时回滚摘要、索引、本体和关系产物，元数据保存脱敏`error_code/error_message`，前端3秒轮询并仅显示友好文案；E005已处理**单API实例**的持久恢复与硬超时：事务Manifest+七项快照持久化、启动恢复（SCHEDULED/RUNNING/ROLLBACKING/COMMITTED分类）、唯一提交点、进程树硬超时、两阶段上传摄入与intake.yaml journal精确撤销、readiness门禁、前端脱敏错误码与恢复提示，详见 `docs/dev/tasks/E005-compile-transaction-recovery.md`；保留边界：不覆盖多worker/多宿主写入，不覆盖外部CLI并发协调，不建立通用共享YAML事务框架，未声明真实LLM UAT；风险6仍保留）；
 10. 测试指南、路线图和当前代码可能存在漂移；
 11. GitHub Actions门禁已建立：`repository-integrity`、`python-core`、`frontend-unit-build` 三个required checks；E001已在 `python-core` 中增加 `pip check` 和无密钥startup smoke；E002已在 `python-core` 的 startup smoke 之后增加真正离线检索门禁（无密钥+黑洞代理运行 `test_embedding_fallback`、`test_search`、`test_hybrid_search`、`test_api_qa` 四文件）；T001已在 `python-core` 的99项确定性核心测试之后新增 `Run full backend test suite`（无密钥+黑洞代理运行完整 `pytest tests/ -q`）作为最终后端门禁，startup smoke、离线检索、99项核心测试保留为分层诊断步骤；完整pytest绿色不得解释为前端E2E或真实栈UAT已完成。
 

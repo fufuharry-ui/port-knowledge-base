@@ -16,6 +16,9 @@ import yaml
 
 from scripts.doc_admin import edges_excluding_doc, remove_doc
 from scripts.doc_admin import prepare_doc_compile, read_doc_meta, write_doc_compile_result
+from scripts.doc_admin import bind_doc_compile_job, clear_doc_compile_job
+
+ACTIVE_JOB_FIELDS = ("compile_job_id", "compile_started_at", "compile_deadline")
 
 
 class TestEdgesExcludingDoc:
@@ -220,3 +223,137 @@ def test_write_doc_compile_result_clears_errors_on_success(project_dir):
     assert meta["status"] == "compiled"
     assert "error_code" not in meta
     assert "error_message" not in meta
+
+
+# ---------------------------------------------------------------------------
+# E005 Task 5: 活动 job 绑定字段(compile_job_id/compile_started_at/compile_deadline)
+# ---------------------------------------------------------------------------
+
+
+def _write_meta(project_dir, doc_id, meta):
+    meta_path = project_dir / "raw" / f"{doc_id}.meta.yaml"
+    meta_path.write_text(yaml.safe_dump(meta, allow_unicode=True), encoding="utf-8")
+    return meta_path
+
+
+def test_bind_doc_compile_job_sets_compiling_and_active_fields(project_dir):
+    doc_id = "doc_20260806_200"
+    _write_meta(project_dir, doc_id, {
+        "id": doc_id,
+        "status": "error",
+        "error_code": "compile_failed",
+        "error_message": "old failure",
+    })
+
+    bound = bind_doc_compile_job(
+        doc_id,
+        "job-abc",
+        "2026-08-06T14:30:01+00:00",
+        "2026-08-06T15:00:01+00:00",
+        base_dir=project_dir,
+    )
+
+    assert bound is True
+    meta = read_doc_meta(doc_id, base_dir=project_dir)
+    assert meta["status"] == "compiling"
+    assert meta["compile_job_id"] == "job-abc"
+    assert meta["compile_started_at"] == "2026-08-06T14:30:01+00:00"
+    assert meta["compile_deadline"] == "2026-08-06T15:00:01+00:00"
+    # 绑定必须清除陈旧错误字段
+    assert "error_code" not in meta
+    assert "error_message" not in meta
+
+
+def test_bind_doc_compile_job_refuses_missing_meta(project_dir):
+    doc_id = "doc_20260806_201"
+    bound = bind_doc_compile_job(
+        doc_id, "job-abc", "s", "d", base_dir=project_dir
+    )
+    assert bound is False
+    assert not (project_dir / "raw" / f"{doc_id}.meta.yaml").exists()
+
+
+def test_bind_doc_compile_job_refuses_already_compiling(project_dir):
+    doc_id = "doc_20260806_202"
+    meta_path = _write_meta(project_dir, doc_id, {
+        "id": doc_id,
+        "status": "compiling",
+        "compile_job_id": "job-old",
+    })
+    before = meta_path.read_bytes()
+
+    bound = bind_doc_compile_job(
+        doc_id, "job-new", "s", "d", base_dir=project_dir
+    )
+
+    assert bound is False
+    assert meta_path.read_bytes() == before
+
+
+def test_clear_doc_compile_job_strips_active_fields(project_dir):
+    doc_id = "doc_20260806_203"
+    _write_meta(project_dir, doc_id, {
+        "id": doc_id,
+        "status": "compiling",
+        "compile_job_id": "job-abc",
+        "compile_started_at": "s",
+        "compile_deadline": "d",
+    })
+
+    cleared = clear_doc_compile_job(doc_id, base_dir=project_dir)
+
+    assert cleared is True
+    meta = read_doc_meta(doc_id, base_dir=project_dir)
+    for field in ACTIVE_JOB_FIELDS:
+        assert field not in meta
+    # 只剥离活动字段,不改动文档状态
+    assert meta["status"] == "compiling"
+
+
+def test_clear_doc_compile_job_missing_meta_returns_false(project_dir):
+    assert clear_doc_compile_job("doc_20260806_204", base_dir=project_dir) is False
+
+
+def test_write_doc_compile_result_error_clears_active_job_fields(project_dir):
+    doc_id = "doc_20260806_205"
+    _write_meta(project_dir, doc_id, {
+        "id": doc_id,
+        "status": "compiling",
+        "compile_job_id": "job-abc",
+        "compile_started_at": "s",
+        "compile_deadline": "d",
+    })
+
+    written = write_doc_compile_result(
+        doc_id,
+        "error",
+        error_code="timeout",
+        error_message="hard timeout",
+        base_dir=project_dir,
+    )
+
+    assert written is True
+    meta = read_doc_meta(doc_id, base_dir=project_dir)
+    assert meta["status"] == "error"
+    assert meta["error_code"] == "timeout"
+    for field in ACTIVE_JOB_FIELDS:
+        assert field not in meta
+
+
+def test_write_doc_compile_result_compiled_clears_active_job_fields(project_dir):
+    doc_id = "doc_20260806_206"
+    _write_meta(project_dir, doc_id, {
+        "id": doc_id,
+        "status": "compiling",
+        "compile_job_id": "job-abc",
+        "compile_started_at": "s",
+        "compile_deadline": "d",
+    })
+
+    written = write_doc_compile_result(doc_id, "compiled", base_dir=project_dir)
+
+    assert written is True
+    meta = read_doc_meta(doc_id, base_dir=project_dir)
+    assert meta["status"] == "compiled"
+    for field in ACTIVE_JOB_FIELDS:
+        assert field not in meta

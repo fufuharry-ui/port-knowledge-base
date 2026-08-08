@@ -1,20 +1,48 @@
 import json
+import logging
 import os
-import shutil
-import tempfile
 import threading
-from pathlib import Path
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path, PureWindowsPath
 from typing import AsyncIterable
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
+from fastapi import FastAPI, Request, UploadFile, File, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 import yaml
 
-from api.compile_jobs import COMPILE_EXECUTION_LOCK, run_compile_task
-from scripts.doc_admin import prepare_doc_compile, read_doc_meta
-from scripts.ingest import PARSERS, get_file_hash, ingest_file
+from api.compile_jobs import (
+    COMPILE_EXECUTION_LOCK,
+    prepare_recompile_transaction,
+    run_compile_task,
+    sanitize_compile_error,
+)
+from api.compile_transactions import (
+    ERROR_CODE_UNACCEPTED,
+    TransactionState,
+    list_active_manifests,
+    recover_startup,
+    recover_transaction,
+    transition_manifest,
+)
+from api.durable_fs import probe_durable_directory
+from api.runtime_guard import (
+    ApiInstanceLock,
+    CompileRuntimeConfig,
+    ServiceReadiness,
+    load_compile_runtime_config,
+)
+from api.upload_intake import (
+    discard_staged_upload,
+    prepare_upload_transaction,
+    publish_upload_intake,
+    stage_upload,
+)
+from scripts.doc_admin import bind_doc_compile_job, read_doc_meta
+from scripts.ingest import PARSERS, IngestParseError, get_file_hash, prepare_ingest
 from scripts.search import (
     search, get_llm_client, layer1_filter, layer2_score, layer3_answer,
     layer3_answer_stream, _load_ontology,
@@ -25,7 +53,52 @@ from scripts.consistency import (
     run_consistency_check, load_contradictions, find_contradiction_candidates,
 )
 
-app = FastAPI(title="Karpathy-Style LLM Wiki API", version="2.0.0")
+logger = logging.getLogger(__name__)
+
+# ─── E005 Task 8:应用运行时与业务门禁原语 ────────────────────────────────────
+
+
+@dataclass
+class AppRuntime:
+    """lifespan 启动成功后挂接到 app.state.runtime 的运行时容器。
+
+    resolved_base:lifespan 解析的知识库根;缺省 None 表示按调用时的模块级
+    BASE_DIR 解析(测试经 monkeypatch 重绑定模块常量后仍一致)。不得用导入期
+    BASE_DIR 快照作默认值——那会在 monkeypatch 之后错误地指向真实仓库。
+    """
+
+    config: CompileRuntimeConfig
+    readiness: ServiceReadiness
+    instance_lock: ApiInstanceLock
+    resolved_base: Path | None = None
+
+
+def _runtime_base_dir(runtime: AppRuntime) -> Path:
+    """事务面向调用的知识库根: 优先 runtime 解析根,缺省回退模块 BASE_DIR。"""
+    base = getattr(runtime, "resolved_base", None)
+    return Path(base) if base is not None else BASE_DIR
+
+
+#: 门禁豁免路径(设计 §19):仅 liveness 与 readiness 探针。
+GATE_EXEMPT_PATHS = frozenset({"/api/v1/health", "/api/v1/ready"})
+
+#: 门禁响应体:只含稳定错误码,绝不泄露 reason、job、路径或 PID。
+RECOVERY_REQUIRED_BODY = {"detail": {"code": "recovery_required"}}
+
+
+def _current_service_mode(app: FastAPI) -> str:
+    """返回粗粒度 service_mode("ready" | "recovery_required")。
+
+    runtime 缺失(lifespan 未运行)时:显式 allow_unmanaged 的测试实例按
+    "ready" 处理,其余一律 fail-closed 视为 "recovery_required"。
+    """
+    runtime = getattr(app.state, "runtime", None)
+    if runtime is None:
+        if getattr(app.state, "allow_unmanaged", False):
+            return "ready"
+        return "recovery_required"
+    mode, _reason = runtime.readiness.snapshot()
+    return mode
 
 
 # ─── .env 加载(启动即读,避免 /health 在首次检索前读到空 env) ────────────────
@@ -51,19 +124,6 @@ try:
     _JIEBA_READY = True
 except Exception:
     pass  # jieba 不可用时 BM25 回退到空白分词,不影响启动
-
-# ─── CORS ─────────────────────────────────────────────────────────────────────
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        # 常规本地 dev(3000)+ UAT 隔离 live 套件(3001);均为本地回环,非生产策略。
-        "http://localhost:3000", "http://127.0.0.1:3000",
-        "http://localhost:3001", "http://127.0.0.1:3001",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent.parent
@@ -150,9 +210,15 @@ def _find_duplicate_doc(file_hash: str) -> dict | None:
 
 
 def _safe_upload_name(filename: str | None) -> str:
-    """只取 basename(剥离路径分量),并校验扩展名在 PARSERS 内,否则 422。"""
+    """只取 basename(剥离路径分量),并校验扩展名在 PARSERS 内,否则 422。
+
+    multipart 文件名可能携带 Windows 客户端路径(C:\\fakepath\\x.pdf);
+    POSIX 宿主上 Path.name 不把反斜杠当分隔符,必须先经 PureWindowsPath
+    归一(其同时识别 \\ 与 /),保证唯一性检查、staging 与响应构造使用
+    同一安全名。
+    """
     supplied = filename or ""
-    safe = Path(supplied).name
+    safe = Path(PureWindowsPath(supplied).name).name
     suffix = Path(safe).suffix.lower()
     if not safe or suffix not in PARSERS:
         raise HTTPException(status_code=422, detail=f"不支持的文件格式 '{suffix or supplied}'")
@@ -173,79 +239,503 @@ def _unique_original_path(filename: str) -> Path:
         sequence += 1
 
 
-def _stage_upload(file: UploadFile) -> tuple[Path | None, dict | None]:
-    """落盘 + 哈希去重。返回 (staged_path, None) 或 (None, duplicate_doc)。
+# ─── E005 Task 10:R8 上传崩溃窗口注入边界(设计 §24.6)────────────────────────
+# 生产路径一律为 no-op;崩溃恢复测试经 monkeypatch 在命名边界注入退出,
+# 绝不使用生产环境开关。窗口 4/5 位于 intake 发布内部,命名边界是
+# api.upload_intake 的 durable_write_bytes / durable_write_yaml(测试包装后
+# 在 raw text / raw meta 目标边界抛出专用崩溃异常)。
 
-    先写临时文件再哈希,命中重复则删临时文件(不写最终 originals/);否则原子替换到唯一目标。
+
+def _r8_boundary_after_intake_stage(staged) -> None:
+    """R8 窗口 1(after_intake_stage):intake staging 写入后、prepare_ingest 前。"""
+
+
+def _r8_boundary_after_prepare_ingest(prepared) -> None:
+    """R8 窗口 2(after_prepare_ingest):候选 raw/meta 生成后、PREPARED 发布前。"""
+
+
+def _r8_boundary_after_prepared_manifest(manifest) -> None:
+    """R8 窗口 3(after_prepared_manifest):PREPARED 发布后、业务文件发布前。"""
+
+
+def _r8_boundary_after_scheduled(manifest) -> None:
+    """R8 窗口 6(after_scheduled):SCHEDULED 持久迁移后、add_task 前。"""
+
+
+def _endpoint_runtime(request: Request) -> AppRuntime | None:
+    """解析当前请求所属 app 的运行时;缺失时返回 None(调用方 fail-closed)。
+
+    config/readiness 的唯一来源是 app.state.runtime(由 lifespan 挂接);
+    绝不另行构造 ServiceReadiness,避免第二 readiness 来源。
     """
-    filename = _safe_upload_name(file.filename)
-    ORIGINALS_DIR.mkdir(parents=True, exist_ok=True)
-    suffix = Path(filename).suffix.lower()
-    with tempfile.NamedTemporaryFile(dir=ORIGINALS_DIR, suffix=suffix, delete=False) as handle:
-        shutil.copyfileobj(file.file, handle)
-        staged = Path(handle.name)
-
-    file_hash = get_file_hash(staged)
-    duplicate = _find_duplicate_doc(file_hash)
-    if duplicate:
-        staged.unlink(missing_ok=True)
-        return None, duplicate
-
-    destination = _unique_original_path(filename)
-    staged.replace(destination)
-    return destination, None
+    return getattr(request.app.state, "runtime", None)
 
 
-def _schedule_compile(background_tasks: BackgroundTasks, doc_id: str) -> None:
+def _list_active_manifests_guarded(runtime: AppRuntime) -> list:
+    """枚举活动事务;扫描失败即无法证明无活动事务,失败关闭并进入门禁。"""
+    try:
+        return list_active_manifests(runtime.config)
+    except Exception as exc:
+        logger.error("active transaction scan failed: %s", exc)
+        runtime.readiness.mark_recovery_required("transaction_scan_failed")
+        raise HTTPException(
+            status_code=503, detail={"code": "recovery_required"}
+        ) from None
+
+
+def _rollback_unaccepted_transaction(
+    runtime: AppRuntime,
+    manifest,
+    *,
+    reason_code: str,
+    reason_message: str,
+) -> bool:
+    """请求未被接受时经恢复库回滚事务(设计 §11);返回 False 表示一致性
+    无法证明(失败关闭:readiness 已进入 recovery_required)。
+
+    重编译与上传共用:恢复库按事务 kind 处理——重编译把 meta 字节级恢复为
+    绑定前快照(绝不制造 error 终态);上传按 journal/published_intake 精确
+    撤销本轮发布的 original/raw(绝不保留孤儿 doc)。"""
+    try:
+        result = recover_transaction(
+            _runtime_base_dir(runtime),
+            runtime.config,
+            manifest.job_dir,
+            reason_code=reason_code,
+            reason_message=reason_message,
+        )
+    except Exception as exc:
+        logger.error(
+            "compile transaction rollback raised for job %s: %s",
+            manifest.job_id, exc,
+        )
+        runtime.readiness.mark_recovery_required("rollback_failed")
+        return False
+    if result.blocked:
+        logger.error(
+            "compile transaction rollback blocked for job %s: %s",
+            manifest.job_id, result.reason,
+        )
+        runtime.readiness.mark_recovery_required(
+            sanitize_compile_error(result.reason or "rollback_failed")
+        )
+        return False
+    return True
+
+
+def _schedule_compile(
+    background_tasks: BackgroundTasks, doc_id: str, runtime: AppRuntime | None
+) -> None:
     """统一编译调度入口(/upload、/ingest、/docs/{id}/recompile 共用)。
 
-    COMPILE_SCHEDULE_LOCK 覆盖 读/判 → prepare_doc_compile 原子置 compiling →
-    add_task 的短临界区:并发请求中恰一个能进入编译,其余得 409。
-    detail 只含稳定错误码,不泄露内部技术细节。
+    E005 Task 9:调度迁移为持久化事务(设计 §11)。COMPILE_SCHEDULE_LOCK 覆盖
+    readiness 校验 → 活动事务检查 → PREPARED 准备 → meta 绑定 → SCHEDULED
+    持久迁移 → add_task 整个临界区:并发请求中恰一个能进入编译,其余得 409。
+    Codex R4-P2-1:活动事务检查之后还须非阻塞持有 COMPILE_EXECUTION_LOCK
+    (锁序 SCHEDULE → EXECUTION,与删除路径一致)——无活动事务时后台线程
+    可能正处于终态验证/清理窗口,此时绑定 meta 会被旧验证器误判为损坏。
+    请求只有在事务正式发布、meta 绑定、Manifest 持久化 SCHEDULED 且后台任务
+    登记完成后才被接受;准备/绑定/登记失败时请求线程立即经恢复库回滚,
+    绝不留下活动事务或半绑定 meta。detail 只含稳定错误码,不泄露内部技术细节。
+    runtime 缺失时 fail-closed(生产路径门禁已 503,此处兜底直接调用)。
     """
+    if runtime is None:
+        logger.error("schedule compile for %s rejected: runtime absent", doc_id)
+        raise HTTPException(status_code=503, detail={"code": "recovery_required"})
+    config = runtime.config
+    readiness = runtime.readiness
+    base = _runtime_base_dir(runtime)
     with COMPILE_SCHEDULE_LOCK:
-        result = prepare_doc_compile(doc_id, base_dir=BASE_DIR)
-        if result.get("prepared"):
-            background_tasks.add_task(run_compile_task, doc_id, BASE_DIR)
-            return
-        if result.get("reason") == "compile_in_progress":
+        try:
+            readiness.require_ready()
+        except RuntimeError:
+            raise HTTPException(
+                status_code=503, detail={"code": "recovery_required"}
+            ) from None
+        active = _list_active_manifests_guarded(runtime)
+        if active:
+            same_doc = any(manifest.doc_id == doc_id for manifest in active)
             raise HTTPException(
                 status_code=409,
-                detail={"code": "compile_in_progress"},
+                detail={
+                    "code": "compile_in_progress" if same_doc else "knowledge_base_busy"
+                },
             )
-        raise HTTPException(status_code=404, detail="Document metadata not found")
+        # Codex R4-P2-1: 无活动事务时仍可能处于后台终态验证/清理窗口
+        # (执行锁被 run_compile_task 持有);此时绑定同文档 meta 会让旧
+        # 验证器把合法新状态误判为损坏而永久 recovery_required。活动检查
+        # 之后非阻塞获取执行锁并持有到 add_task 返回(锁序恒为
+        # SCHEDULE → EXECUTION,与删除路径一致);被占用即 409 busy——
+        # 无活动事务却持锁的唯一场景正是该清理窗口。
+        if not COMPILE_EXECUTION_LOCK.acquire(blocking=False):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "knowledge_base_busy"},
+            )
+        try:
+            meta = read_doc_meta(doc_id, base_dir=base)
+            if meta is None:
+                raise HTTPException(status_code=404, detail="Document metadata not found")
+            if meta.get("status") == "compiling":
+                raise HTTPException(
+                    status_code=409, detail={"code": "compile_in_progress"}
+                )
+            try:
+                manifest = prepare_recompile_transaction(doc_id, base, config)
+            except Exception as exc:
+                logger.error(
+                    "compile transaction preparation failed for %s: %s", doc_id, exc
+                )
+                raise HTTPException(
+                    status_code=503, detail={"code": "compile_transaction_unavailable"}
+                ) from None
+
+            scheduled_at = datetime.now(timezone.utc)
+            deadline = scheduled_at + timedelta(seconds=manifest.timeout_seconds)
+            bound = False
+            try:
+                bound = bind_doc_compile_job(
+                    doc_id,
+                    manifest.job_id,
+                    scheduled_at.isoformat(),
+                    deadline.isoformat(),
+                    base_dir=base,
+                )
+            except Exception as exc:
+                logger.error(
+                    "compile binding raised for %s (job %s): %s",
+                    doc_id, manifest.job_id, exc,
+                )
+            if bound:
+                try:
+                    manifest = transition_manifest(
+                        manifest.job_dir,
+                        expected=TransactionState.PREPARED,
+                        target=TransactionState.SCHEDULED,
+                        scheduled_at=scheduled_at.isoformat(),
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "SCHEDULED transition failed for job %s: %s",
+                        manifest.job_id, exc,
+                    )
+                    # bind 已生效但请求未被接受:回滚恢复绑定前 meta(绝不制造
+                    # error 终态);响应恒为 503——回滚后无任何编译在进行,
+                    # 不得按绑定中的 meta 报 409(评审修复)。
+                    if not _rollback_unaccepted_transaction(
+                        runtime,
+                        manifest,
+                        reason_code=ERROR_CODE_UNACCEPTED,
+                        reason_message=(
+                            f"schedule transition failed before acceptance: {exc}"
+                        ),
+                    ):
+                        raise HTTPException(
+                            status_code=503, detail={"code": "recovery_required"}
+                        ) from None
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"code": "compile_transaction_unavailable"},
+                    ) from None
+            else:
+                logger.error(
+                    "compile binding refused for %s (job %s)", doc_id, manifest.job_id
+                )
+                # 先按绑定前 meta 分类响应码,再回滚(回滚可能改写 meta)。
+                meta_after = read_doc_meta(doc_id, base_dir=base)
+                status_after = (
+                    meta_after.get("status") if isinstance(meta_after, dict) else None
+                )
+                if not _rollback_unaccepted_transaction(
+                    runtime,
+                    manifest,
+                    reason_code=ERROR_CODE_UNACCEPTED,
+                    reason_message="doc binding refused before acceptance",
+                ):
+                    raise HTTPException(
+                        status_code=503, detail={"code": "recovery_required"}
+                    )
+                if meta_after is None:
+                    raise HTTPException(
+                        status_code=404, detail="Document metadata not found"
+                    )
+                if status_after == "compiling":
+                    raise HTTPException(
+                        status_code=409, detail={"code": "compile_in_progress"}
+                    )
+                raise HTTPException(
+                    status_code=503, detail={"code": "compile_transaction_unavailable"}
+                )
+            try:
+                background_tasks.add_task(
+                    run_compile_task, manifest.job_id, base, config, readiness
+                )
+            except Exception as exc:
+                logger.error(
+                    "background task registration failed for job %s: %s",
+                    manifest.job_id, exc,
+                )
+                # add_task 失败 = 请求未被接受:立即回滚并恢复绑定前 meta,
+                # 绝不留下 SCHEDULED 事务或制造的 error 终态(设计 §11)。
+                if not _rollback_unaccepted_transaction(
+                    runtime,
+                    manifest,
+                    reason_code=ERROR_CODE_UNACCEPTED,
+                    reason_message=f"background task registration failed: {exc}",
+                ):
+                    raise HTTPException(
+                        status_code=503, detail={"code": "recovery_required"}
+                    ) from None
+                raise HTTPException(
+                    status_code=503, detail={"code": "compile_transaction_unavailable"}
+                ) from None
+        finally:
+            COMPILE_EXECUTION_LOCK.release()
 
 
-def _accept_upload(background_tasks: BackgroundTasks, file: UploadFile) -> dict:
-    """权威上传契约:落盘 → 去重 → 同步 ingest_file → 调度按 doc_id 编译。
+def _accept_upload(
+    background_tasks: BackgroundTasks, file: UploadFile, runtime: AppRuntime | None
+) -> dict:
+    """权威上传契约(E005 Task 10 两阶段事务化,设计 §12.3/§12.4)。
 
-    返回权威 doc_id(来自 ingest_file,而非上传时预生成),含 skipped 字段。
-    /upload 与 /ingest 共用此契约。
+    全流程在 COMPILE_SCHEDULE_LOCK 内直到 Manifest 持久迁移 SCHEDULED 且
+    add_task 返回:
+
+        readiness 校验(503 recovery_required)
+        → 活动事务检查(409 knowledge_base_busy,业务目录不变)
+        → 锁内选定无冲突原始文件名并 stage_upload 到 intake staging
+        → file_hash 去重(命中返回 skipped 合同,不建事务,丢弃 staging)
+        → prepare_ingest 纯准备(空文本/解析失败 422,无任何业务写入)
+        → prepare_upload_transaction 发布 PREPARED(kind=UPLOAD)
+        → publish_upload_intake 按 journal 原子发布 original/raw text/raw meta
+        → bind_doc_compile_job 绑定 compiling + job 字段
+        → PREPARED→SCHEDULED 持久迁移
+        → add_task(run_compile_task, job_id, BASE_DIR, config, readiness)
+
+    PREPARED 之后任何失败都经同一恢复库回滚(_rollback_unaccepted_transaction):
+    上传未接受即本轮发布完全撤销,绝不保留孤儿 doc 或制造的 error 终态。
+    成功响应形状与去重响应形状保持不变,绝不返回 job_id。
+
+    intake staging 所有权:请求线程自 stage_upload 起持有 staging;
+    publish_upload_intake 成功返回后,字节已耐久发布到三项业务目标、
+    journal 与 Manifest(published=True)成为唯一恢复依据,staging 立即被
+    请求线程丢弃;此前任何退出(去重/422/准备或发布失败/异常)由 finally
+    丢弃未接受的 staging;进程真实崩溃时由 recover_startup 的
+    .staging-* 清理兜底。staging 绝不参与回滚判定。
+
+    Codex R4-P2-1 曾注记上传无需执行锁——该推理只覆盖验证器内容检查
+    (上传只发布新文档文件)。Codex R5-P2-1:旧任务的终态验证器(持有
+    COMPILE_EXECUTION_LOCK)仍可能在接受窗口内把 readiness 翻转为
+    recovery_required,使上传在门禁失效后继续发布并入队一个本应运行的
+    SCHEDULED 任务。因此上传与 _schedule_compile 同模式:活动事务检查后
+    非阻塞持有执行锁直到 add_task 返回(锁序 SCHEDULE → EXECUTION)。
+    释放执行锁到后台任务获取之间不会有 readiness 翻转:运行时只有执行
+    锁持有者(run_compile_task 路径)会翻转 readiness,而此时已存在
+    本事务的 SCHEDULED 活动 Manifest,任何新调度/删除请求都会先被
+    409 拒绝,绝不进入翻转路径。
     """
-    stored, duplicate = _stage_upload(file)
-    if duplicate:
-        return {
-            "status": "skipped",
-            "skipped": True,
-            "doc_id": duplicate["id"],
-            "filename": file.filename,
-            "message": "文件已存在，已跳过",
-        }
+    if runtime is None:
+        logger.error("upload rejected: runtime absent")
+        raise HTTPException(status_code=503, detail={"code": "recovery_required"})
+    safe_name = _safe_upload_name(file.filename)
+    config = runtime.config
+    readiness = runtime.readiness
+    base = _runtime_base_dir(runtime)
+    staged = None
+    with COMPILE_SCHEDULE_LOCK:
+        try:
+            try:
+                readiness.require_ready()
+            except RuntimeError:
+                raise HTTPException(
+                    status_code=503, detail={"code": "recovery_required"}
+                ) from None
+            active = _list_active_manifests_guarded(runtime)
+            if active:
+                raise HTTPException(
+                    status_code=409, detail={"code": "knowledge_base_busy"}
+                )
+            # Codex R5-P2-1: 与 _schedule_compile 同模式——无活动事务时后台
+            # 终态验证器可能持有执行锁并随时翻转 readiness;非阻塞获取执行锁
+            # 并持有到 add_task 返回(锁序 SCHEDULE → EXECUTION),被占用即
+            # 409 busy,绝不发布业务文件、绝不离队任务。
+            if not COMPILE_EXECUTION_LOCK.acquire(blocking=False):
+                raise HTTPException(
+                    status_code=409, detail={"code": "knowledge_base_busy"}
+                )
+            try:
+                # 唯一命名必须在锁内:同名上传串行,绝不覆盖既有 original。
+                final_name = _unique_original_path(safe_name).name
+                staged = stage_upload(file, config, safe_name=final_name)
+                _r8_boundary_after_intake_stage(staged)
+                duplicate = _find_duplicate_doc(get_file_hash(staged.staged_file))
+                if duplicate:
+                    return {
+                        "status": "skipped",
+                        "skipped": True,
+                        "doc_id": duplicate["id"],
+                        "filename": file.filename,
+                        "message": "文件已存在，已跳过",
+                    }
+                try:
+                    prepared = prepare_ingest(
+                        staged.staged_file,
+                        base_dir=base,
+                        existing_doc_ids={
+                            doc["id"]
+                            for doc in _load_document_catalog()
+                            if doc.get("id")
+                        },
+                    )
+                except IngestParseError as exc:
+                    logger.warning(
+                        "upload parse failed for %s: %s", safe_name, exc.original
+                    )
+                    raise HTTPException(
+                        status_code=422, detail="文件无法解析或内容为空"
+                    ) from None
+                if not prepared.text_bytes.strip():
+                    raise HTTPException(
+                        status_code=422, detail="文件无法解析或内容为空"
+                    )
+                _r8_boundary_after_prepare_ingest(prepared)
+                try:
+                    manifest = prepare_upload_transaction(
+                        staged, prepared, base, config
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "upload transaction preparation failed for %s: %s",
+                        safe_name, exc,
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"code": "compile_transaction_unavailable"},
+                    ) from None
+                _r8_boundary_after_prepared_manifest(manifest)
+                try:
+                    publish_upload_intake(manifest, staged, prepared, base)
+                except Exception as exc:
+                    logger.error(
+                        "upload intake publish failed for job %s: %s",
+                        manifest.job_id, exc,
+                    )
+                    if not _rollback_unaccepted_transaction(
+                        runtime,
+                        manifest,
+                        reason_code=ERROR_CODE_UNACCEPTED,
+                        reason_message=f"upload intake publish failed: {exc}",
+                    ):
+                        raise HTTPException(
+                            status_code=503, detail={"code": "recovery_required"}
+                        ) from None
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"code": "compile_transaction_unavailable"},
+                    ) from None
+                # 字节已耐久发布、journal 完整、published=True:staging 立即丢弃,
+                # 恢复依据转为 journal + Manifest。
+                discard_staged_upload(staged)
+                staged = None
 
-    assert stored is not None
-    meta = ingest_file(stored)
-    if not meta:
-        raise HTTPException(status_code=422, detail="文件无法解析或内容为空")
-
-    doc_id = meta["id"]
-    _schedule_compile(background_tasks, doc_id)
-    return {
-        "status": "processing",
-        "skipped": False,
-        "doc_id": doc_id,
-        "filename": stored.name,
-        "message": "摄入成功，后台自动编译中...",
-    }
+                scheduled_at = datetime.now(timezone.utc)
+                deadline = scheduled_at + timedelta(seconds=manifest.timeout_seconds)
+                bound = False
+                try:
+                    bound = bind_doc_compile_job(
+                        prepared.doc_id,
+                        manifest.job_id,
+                        scheduled_at.isoformat(),
+                        deadline.isoformat(),
+                        base_dir=base,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "upload binding raised for %s (job %s): %s",
+                        prepared.doc_id, manifest.job_id, exc,
+                    )
+                if not bound:
+                    logger.error(
+                        "upload binding refused for %s (job %s)",
+                        prepared.doc_id, manifest.job_id,
+                    )
+                    if not _rollback_unaccepted_transaction(
+                        runtime,
+                        manifest,
+                        reason_code=ERROR_CODE_UNACCEPTED,
+                        reason_message="upload doc binding failed before acceptance",
+                    ):
+                        raise HTTPException(
+                            status_code=503, detail={"code": "recovery_required"}
+                        )
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"code": "compile_transaction_unavailable"},
+                    )
+                try:
+                    manifest = transition_manifest(
+                        manifest.job_dir,
+                        expected=TransactionState.PREPARED,
+                        target=TransactionState.SCHEDULED,
+                        scheduled_at=scheduled_at.isoformat(),
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "SCHEDULED transition failed for upload job %s: %s",
+                        manifest.job_id, exc,
+                    )
+                    if not _rollback_unaccepted_transaction(
+                        runtime,
+                        manifest,
+                        reason_code=ERROR_CODE_UNACCEPTED,
+                        reason_message=(
+                            f"upload schedule transition failed before acceptance: {exc}"
+                        ),
+                    ):
+                        raise HTTPException(
+                            status_code=503, detail={"code": "recovery_required"}
+                        ) from None
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"code": "compile_transaction_unavailable"},
+                    ) from None
+                _r8_boundary_after_scheduled(manifest)
+                try:
+                    background_tasks.add_task(
+                        run_compile_task, manifest.job_id, base, config, readiness
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "background task registration failed for upload job %s: %s",
+                        manifest.job_id, exc,
+                    )
+                    # add_task 失败 = 请求未被接受:本轮上传发布完全撤销,
+                    # 绝不留下 SCHEDULED 事务或孤儿 doc(设计 §11/§12.4)。
+                    if not _rollback_unaccepted_transaction(
+                        runtime,
+                        manifest,
+                        reason_code=ERROR_CODE_UNACCEPTED,
+                        reason_message=f"background task registration failed: {exc}",
+                    ):
+                        raise HTTPException(
+                            status_code=503, detail={"code": "recovery_required"}
+                        ) from None
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"code": "compile_transaction_unavailable"},
+                    ) from None
+                return {
+                    "status": "processing",
+                    "skipped": False,
+                    "doc_id": prepared.doc_id,
+                    "filename": final_name,
+                    "message": "摄入成功，后台自动编译中...",
+                }
+            finally:
+                COMPILE_EXECUTION_LOCK.release()
+        finally:
+            if staged is not None:
+                discard_staged_upload(staged)
 
 # ─── Pydantic Models ──────────────────────────────────────────────────────────
 
@@ -261,11 +751,12 @@ class QAQuery(BaseModel):
 
 # ─── GET /api/v1/health (落地增强:部署健康检查) ─────────────────────────────
 
-@app.get("/api/v1/health")
-async def health():
-    """运维健康检查。返回服务状态 + 关键依赖可用性(部署监控用)。
+async def health(request: Request):
+    """运维健康检查(liveness)。返回服务状态 + 关键依赖可用性(部署监控用)。
 
     设计:只读、快速、不调 LLM、不抛异常(即使部分依赖缺失也返回 200 + 如实字段)。
+    E005 Task 8:追加 ready 布尔与粗粒度 service_mode;不暴露 reason、job、
+    路径或 PID(设计 §19)。liveness 永远 200,不受业务门禁影响。
     """
     # 文档数
     try:
@@ -288,19 +779,31 @@ async def health():
     except Exception:
         ontology_loaded = False
 
+    service_mode = _current_service_mode(request.app)
+
     return {
         "status": "ok",
         "doc_count": doc_count,
         "llm_configured": llm_configured,
         "jieba_loaded": jieba_loaded,
         "ontology_loaded": ontology_loaded,
-        "version": app.version,
+        "ready": service_mode == "ready",
+        "service_mode": service_mode,
+        "version": request.app.version,
     }
+
+
+# ─── GET /api/v1/ready (E005 Task 8:readiness 探针) ─────────────────────────
+
+async def ready(request: Request):
+    """readiness 探针:ready 时 200 {"status": "ready"};门禁时 503(安全响应体)。"""
+    if _current_service_mode(request.app) == "ready":
+        return {"status": "ready"}
+    return JSONResponse(status_code=503, content={"status": "not_ready"})
 
 
 # ─── GET /api/v1/wiki/index ───────────────────────────────────────────────────
 
-@app.get("/api/v1/wiki/index")
 async def wiki_index():
     """Return the full wiki document catalog (compiled + raw) as JSON.
 
@@ -312,7 +815,6 @@ async def wiki_index():
 
 # ─── GET /api/v1/graph ───────────────────────────────────────────────────────
 
-@app.get("/api/v1/graph")
 async def graph_data():
     """Build nodes and edges from index and the knowledge graph.
 
@@ -357,7 +859,6 @@ async def graph_data():
     return {"nodes": nodes, "edges": unique_edges}
 
 
-@app.get("/api/v1/ontology")
 async def ontology_data():
     """Return the global ontology tree (供前端本体视图;Big-Loop #1 新增)。"""
     ont_file = META_DIR / "ontology" / "global_ontology.yaml"
@@ -372,7 +873,6 @@ async def ontology_data():
     }
 
 
-@app.get("/api/v1/entity-graph")
 async def entity_graph(term: str = "", depth: int = 1):
     """返回某术语的实体级邻居(Big-Loop #2 新增,供前端实体图谱查询)。
 
@@ -399,14 +899,12 @@ async def entity_graph(term: str = "", depth: int = 1):
 
 # ─── GET /api/v1/docs ────────────────────────────────────────────────────────
 
-@app.get("/api/v1/docs")
 async def list_docs():
     docs = _load_document_catalog()
     return {"documents": docs, "total": len(docs)}
 
 # ─── GET /api/v1/docs/{doc_id} ───────────────────────────────────────────────
 
-@app.get("/api/v1/docs/{doc_id}")
 async def get_doc(doc_id: str):
     for doc in _load_document_catalog():
         if doc["id"] == doc_id:
@@ -416,15 +914,23 @@ async def get_doc(doc_id: str):
 
 # ─── 文档管理:删除 + 重编译(Loop #10)─────────────────────────────────────────
 
-def _remove_doc_exclusively(doc_id: str) -> dict:
-    """删除与完整编译事务互斥(E004-FIX-02)。
+def _remove_doc_exclusively(doc_id: str, runtime: AppRuntime | None) -> dict:
+    """删除与完整编译事务互斥(E004-FIX-02 + E005 Task 9)。
 
-    锁顺序恒为 COMPILE_SCHEDULE_LOCK → COMPILE_EXECUTION_LOCK,与
+    锁顺序恒为 COMPILE_SCHEDULE_LOCK → COMPILE_EXECUTION_LOCK(非阻塞),与
     _schedule_compile(仅调度锁)、run_compile_task(仅执行锁)不构成循环等待。
-    执行锁被占用说明有编译事务(快照/编译/回滚)在进行:删除必须立即 409,
+    执行锁被占用说明有编译事务(快照/编译/回滚)在执行:删除必须立即 409,
     不得阻塞等待数分钟,否则失败回滚或成功发布都可能复活已删除的共享引用。
-    目标文档已排队 compiling(尚未取得执行锁)同样拒绝,封住调度窗口。
+    存在任一活动 Manifest(PREPARED/SCHEDULED/RUNNING/ROLLBACKING)同样拒绝
+    ——同文档 409 compile_in_progress,其他文档 409 knowledge_base_busy——
+    封住调度窗口与恢复窗口。runtime 缺失时 fail-closed(生产路径门禁已 503)。
+    Codex R3 P2-2:锁内必须重检 readiness——门禁通过与锁获取之间后台编译
+    线程可能已把 readiness 翻转为 recovery_required,此时删除会改写正是
+    验证失败来源的产物(TOCTOU);与 _schedule_compile 同一模式 fail-closed。
     """
+    if runtime is None:
+        logger.error("delete %s rejected: runtime absent", doc_id)
+        raise HTTPException(status_code=503, detail={"code": "recovery_required"})
     with COMPILE_SCHEDULE_LOCK:
         if not COMPILE_EXECUTION_LOCK.acquire(blocking=False):
             raise HTTPException(
@@ -432,59 +938,82 @@ def _remove_doc_exclusively(doc_id: str) -> dict:
                 detail={"code": "knowledge_base_busy"},
             )
         try:
-            meta = read_doc_meta(doc_id, base_dir=BASE_DIR)
+            try:
+                runtime.readiness.require_ready()
+            except RuntimeError:
+                raise HTTPException(
+                    status_code=503, detail={"code": "recovery_required"}
+                ) from None
+            active = _list_active_manifests_guarded(runtime)
+            if active:
+                same_doc = any(manifest.doc_id == doc_id for manifest in active)
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": (
+                            "compile_in_progress" if same_doc else "knowledge_base_busy"
+                        )
+                    },
+                )
+            base = _runtime_base_dir(runtime)
+            meta = read_doc_meta(doc_id, base_dir=base)
             if meta and meta.get("status") == "compiling":
                 raise HTTPException(
                     status_code=409,
                     detail={"code": "compile_in_progress"},
                 )
             from scripts.doc_admin import remove_doc
-            return remove_doc(doc_id, base_dir=BASE_DIR)
+            return remove_doc(doc_id, base_dir=base)
         finally:
             COMPILE_EXECUTION_LOCK.release()
 
 
-@app.delete("/api/v1/docs/{doc_id}")
-async def delete_doc(doc_id: str):
+async def delete_doc(request: Request, doc_id: str):
     """删除文档 + 全部产物 + 清理 index/KG/entity_relations 引用。
 
     此前知识库只能追加无法维护——上传错文档/编译失败时无法清理。
     E004-FIX-02:经 _remove_doc_exclusively 与编译事务互斥;编译进行中
     返回 409(knowledge_base_busy / compile_in_progress),不阻塞等待。
+    E005 Task 9:任一活动 Manifest 期间删除一律 409。
     """
-    summary = _remove_doc_exclusively(doc_id)
+    summary = _remove_doc_exclusively(doc_id, _endpoint_runtime(request))
     if not summary.get("removed"):
         raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found")
     return {"status": "deleted", **summary}
 
 
-@app.post("/api/v1/docs/{doc_id}/recompile")
-async def recompile_doc_endpoint(doc_id: str, background_tasks: BackgroundTasks):
+async def recompile_doc_endpoint(
+    request: Request, doc_id: str, background_tasks: BackgroundTasks
+):
     """重编译既有文档(error 文档重试用)。
 
-    与上传共用 _schedule_compile:prepare_doc_compile 原子置 compiling 并清旧错误;
-    compiling 中 → 409;meta 缺失 → 404。响应形状保持不变。
+    E005 Task 9:_schedule_compile 经持久化事务调度(PREPARED → 绑定 →
+    SCHEDULED → add_task);同文档活动事务 → 409 compile_in_progress,其他
+    文档活动事务 → 409 knowledge_base_busy,事务准备失败 → 503
+    compile_transaction_unavailable,meta 缺失 → 404。响应形状保持不变,
+    绝不返回 job_id。
     """
-    _schedule_compile(background_tasks, doc_id)
+    _schedule_compile(background_tasks, doc_id, _endpoint_runtime(request))
     return {"status": "recompiling", "doc_id": doc_id}
 
 # ─── POST /api/v1/upload (alias for ingest) ──────────────────────────────────
 
-@app.post("/api/v1/upload")
-async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+async def upload_document(
+    request: Request, background_tasks: BackgroundTasks, file: UploadFile = File(...)
+):
     """Frontend-compatible upload endpoint. 返回权威 doc_id + skipped 字段。"""
-    return _accept_upload(background_tasks, file)
+    return _accept_upload(background_tasks, file, _endpoint_runtime(request))
 
 # ─── POST /api/v1/ingest ─────────────────────────────────────────────────────
 
-@app.post("/api/v1/ingest")
-async def ingest_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+async def ingest_document(
+    request: Request, background_tasks: BackgroundTasks, file: UploadFile = File(...)
+):
     """Alias of /upload — 同一权威契约(权威 doc_id + skipped + 按 doc_id 编译)。"""
-    return _accept_upload(background_tasks, file)
+    return _accept_upload(background_tasks, file, _endpoint_runtime(request))
 
 # ─── POST /api/v1/search (sync JSON) ─────────────────────────────────────────
 
-@app.post("/api/v1/search")
 async def search_endpoint(request: SearchQuery):
     try:
         client = get_llm_client()
@@ -501,7 +1030,6 @@ async def search_endpoint(request: SearchQuery):
 
 # ─── GET /api/v1/search/stream (SSE) ─────────────────────────────────────────
 
-@app.get("/api/v1/search/stream")
 async def search_stream(q: str):
     """SSE streaming search endpoint used by the Search page."""
     async def generate():
@@ -557,7 +1085,6 @@ async def search_stream(q: str):
 
 # ─── POST /api/v1/qa (SSE Q&A with thought trace) ────────────────────────────
 
-@app.post("/api/v1/qa")
 async def qa_stream(request: QAQuery):
     """SSE streaming Q&A used by the ChatPanel on /qa page.
     Emits: thought, source, entity, delta, done events.
@@ -638,7 +1165,6 @@ async def qa_stream(request: QAQuery):
 
 # ─── POST /api/v1/lint ────────────────────────────────────────────────────────
 
-@app.post("/api/v1/lint")
 async def lint_endpoint():
     linter = Linter()
     orphans = linter.detect_orphan_pages()
@@ -665,7 +1191,6 @@ async def lint_endpoint():
 
 # ─── GET/POST /api/v1/consistency (Big-Loop #3: 跨文档一致性稽核) ─────────────
 
-@app.get("/api/v1/consistency")
 async def consistency_get():
     """查看已知矛盾报告(不触发 LLM,只读 contradictions.yaml)。"""
     report = load_contradictions()
@@ -678,7 +1203,6 @@ async def consistency_get():
     }
 
 
-@app.post("/api/v1/consistency")
 async def consistency_run():
     """触发全库一致性稽核:生成候选对 → LLM 逐对判定 → 写 contradictions.yaml。
 
@@ -698,3 +1222,157 @@ async def consistency_run():
         "last_updated": report.get("last_updated"),
         "contradictions": report.get("contradictions", []),
     }
+
+
+# ─── E005 Task 8:lifespan、单实例锁与启动恢复门禁 ────────────────────────────
+
+def _build_lifespan(base_dir: Path):
+    """构造绑定 base_dir 的 lifespan(设计 §6.1、§17)。
+
+    启动顺序(任何一步失败即拒绝启动,进程不得开始服务):
+
+        加载并校验 CompileRuntimeConfig(纯解析,无 I/O)
+        → 获取 ApiInstanceLock(第二实例立即失败)
+        → probe_durable_directory(transaction_dir)
+        → recover_startup(任何 blocker → 拒绝启动)
+        → 挂接 AppRuntime,service_mode=ready,开始服务
+
+    实例锁覆盖 配置/探针/恢复/服务 全周期,仅在 lifespan shutdown 释放。
+    recover_startup 自身不获取实例锁(Phase 1 评审结论),锁由本 lifespan 持有。
+    """
+
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI):
+        config = load_compile_runtime_config(base_dir)  # ValueError → 启动失败
+        lock = ApiInstanceLock(config.instance_lock_path)
+        lock.acquire()  # portalocker.AlreadyLocked → 第二实例启动失败
+        try:
+            probe_durable_directory(config.transaction_dir)
+            report = recover_startup(base_dir, config)
+            for warning in report.warnings:
+                logger.warning("startup recovery warning: %s", warning)
+            if not report.ready:
+                for blocker in report.blockers:
+                    logger.error("startup recovery blocker: %s", blocker)
+                raise RuntimeError(
+                    "startup recovery blocked; refusing to serve "
+                    f"({len(report.blockers)} blockers)"
+                )
+            app.state.runtime = AppRuntime(
+                config=config,
+                readiness=ServiceReadiness(),
+                instance_lock=lock,
+                resolved_base=base_dir,
+            )
+            yield
+        finally:
+            app.state.runtime = None
+            lock.release()
+
+    return _lifespan
+
+
+def create_app(
+    base_dir: Path | str | None = None,
+    *,
+    allow_unmanaged: bool = False,
+    allow_path_override: bool = False,
+) -> FastAPI:
+    """应用工厂。
+
+    - base_dir:知识库根目录(事务目录、实例锁、启动恢复的作用域);
+      默认模块级 BASE_DIR(生产 uvicorn 路径)。
+    - allow_unmanaged: 仅测试使用的显式 opt-in。纯 TestClient(非上下文
+      管理器)不执行 lifespan,app.state.runtime 不存在;设 True 时该情形
+      按 ready 放行,设 False(默认,生产语义)时 fail-closed 返回 503。
+      生产 ASGI 服务器必经 lifespan,此旗标不得用于生产实例。
+    - allow_path_override: 仅测试使用的显式 opt-in。路由处理器依赖模块级
+      路径常量(BASE_DIR/RAW_DIR/ORIGINALS_DIR/INDEX_FILE 等,单实例
+      合同),lifespan 的 base_dir 只作用于 config/实例锁/启动恢复;
+      base_dir 与模块 BASE_DIR 不一致而未 opt-in 时直接拒绝(fail-closed),
+      避免 app 对仓库 X 报 ready 却在默认仓库上读写。仅当测试已同步
+      monkeypatch 重绑定模块路径常量时才允许设 True。
+    """
+    resolved_base = Path(base_dir) if base_dir is not None else BASE_DIR
+    if (
+        resolved_base.resolve() != BASE_DIR.resolve()
+        and not allow_path_override
+    ):
+        raise ValueError(
+            "create_app base_dir 与模块 BASE_DIR 不一致:路由处理器依赖模块级 "
+            "路径常量(单实例合同),仅测试可在显式 allow_path_override=True "
+            "并同步重绑定模块常量后覆盖"
+        )
+
+    app = FastAPI(
+        title="Karpathy-Style LLM Wiki API",
+        version="2.0.0",
+        lifespan=_build_lifespan(resolved_base),
+    )
+    app.state.base_dir = resolved_base
+    app.state.allow_unmanaged = allow_unmanaged
+
+    @app.middleware("http")
+    async def recovery_gate(request: Request, call_next):
+        """全局业务门禁(设计 §19):readiness != ready 时,除 health/ready 外
+        一律 503 {"detail": {"code": "recovery_required"}}(单向、fail-closed)。"""
+        if request.url.path in GATE_EXEMPT_PATHS:
+            return await call_next(request)
+        runtime = getattr(request.app.state, "runtime", None)
+        if runtime is None:
+            if getattr(request.app.state, "allow_unmanaged", False):
+                return await call_next(request)
+            logger.error(
+                "rejecting %s %s: runtime absent (lifespan not run)",
+                request.method, request.url.path,
+            )
+            return JSONResponse(status_code=503, content=RECOVERY_REQUIRED_BODY)
+        mode, reason = runtime.readiness.snapshot()
+        if mode != "ready":
+            # reason 仅服务端日志,绝不进入公共响应体。
+            logger.warning(
+                "gate rejecting %s %s: service_mode=%s reason=%s",
+                request.method, request.url.path, mode, reason,
+            )
+            return JSONResponse(status_code=503, content=RECOVERY_REQUIRED_BODY)
+        return await call_next(request)
+
+    # CORS 在门禁之后注册,成为最外层中间件,门禁 503 响应同样携带 CORS 头。
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            # 常规本地 dev(3000)+ UAT 隔离 live 套件(3001);均为本地回环,非生产策略。
+            "http://localhost:3000", "http://127.0.0.1:3000",
+            "http://localhost:3001", "http://127.0.0.1:3001",
+        ],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # 路由注册(处理器为模块级函数,路径常量仍在调用时解析模块属性,
+    # 既有测试的 monkeypatch 语义保持不变)。
+    app.get("/api/v1/health")(health)
+    app.get("/api/v1/ready")(ready)
+    app.get("/api/v1/wiki/index")(wiki_index)
+    app.get("/api/v1/graph")(graph_data)
+    app.get("/api/v1/ontology")(ontology_data)
+    app.get("/api/v1/entity-graph")(entity_graph)
+    app.get("/api/v1/docs")(list_docs)
+    app.get("/api/v1/docs/{doc_id}")(get_doc)
+    app.delete("/api/v1/docs/{doc_id}")(delete_doc)
+    app.post("/api/v1/docs/{doc_id}/recompile")(recompile_doc_endpoint)
+    app.post("/api/v1/upload")(upload_document)
+    app.post("/api/v1/ingest")(ingest_document)
+    app.post("/api/v1/search")(search_endpoint)
+    app.get("/api/v1/search/stream")(search_stream)
+    app.post("/api/v1/qa")(qa_stream)
+    app.post("/api/v1/lint")(lint_endpoint)
+    app.get("/api/v1/consistency")(consistency_get)
+    app.post("/api/v1/consistency")(consistency_run)
+    return app
+
+
+# 生产入口(uvicorn api.main:app):严格 fail-closed 语义;
+# lifespan 在服务器启动时执行,import 时不触发、不创建 .runtime。
+app = create_app()

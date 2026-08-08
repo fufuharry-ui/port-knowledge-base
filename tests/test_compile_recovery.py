@@ -567,10 +567,16 @@ def test_upload_rollback_blocks_on_nested_original_path_without_deleting(tmp_pat
 
 # ---------------------------------------------------------------------------
 # 损坏/不可读 meta 的失败关闭(Finding 1)
+# Codex R6-P1-3 语义更新: 已接受重编译的当前 meta 可能被编译进程的截断写
+# 损坏;恢复先从 source-meta-before.yaml 快照字节级恢复 meta,再写错误
+# 终态——当前 meta 损坏不再阻断(快照是唯一权威依据),快照本身损坏才
+# 失败关闭。
 # ---------------------------------------------------------------------------
 
 
-def test_corrupt_bound_meta_blocks_recovery_without_raising(tmp_path):
+def test_corrupt_bound_meta_is_restored_from_snapshot(tmp_path):
+    """R6-P1-3(a): 当前 meta 截断损坏(不可解析)→ 从快照恢复后完成回滚,
+    终态 meta 携带快照中的原始字段 + error 终态,终态验证通过。"""
     manifest = scheduled_manifest(tmp_path)
     (tmp_path / "raw" / f"{DOC_ID}.meta.yaml").write_text(
         "key: [unclosed\n", encoding="utf-8"
@@ -579,17 +585,22 @@ def test_corrupt_bound_meta_blocks_recovery_without_raising(tmp_path):
         tmp_path, runtime_config(tmp_path), manifest.job_dir,
         reason_code="interrupted", reason_message="service restart",
     )
-    assert result.blocked is True
-    assert any("meta" in path for path in result.failed_paths)
-    # 保持 ROLLBACKING,记录失败路径,下次可幂等继续
+    assert result.completed is True
+    meta = read_meta(tmp_path, DOC_ID)
+    assert meta["status"] == "error"
+    assert meta["error_code"] == "interrupted"
+    # 原始字段来自事务前快照
+    assert meta["id"] == DOC_ID
+    assert "compile_job_id" not in meta
     reloaded = load_manifest(manifest.job_dir)
-    assert reloaded.state is ROLLBACKING
-    assert reloaded.recovery["failed_paths"]
-    # 原始失败原因保留
+    assert reloaded.state is ROLLED_BACK
     assert reloaded.failure["original_code"] == "interrupted"
+    verification = verify_terminal_transaction(tmp_path, reloaded)
+    assert verification.ok is True, verification.failures
 
 
-def test_non_mapping_bound_meta_blocks_recovery_without_raising(tmp_path):
+def test_non_mapping_bound_meta_is_restored_from_snapshot(tmp_path):
+    """R6-P1-3(a) 变体: 当前 meta 为合法 YAML 但非映射 → 同样从快照恢复。"""
     manifest = scheduled_manifest(tmp_path)
     (tmp_path / "raw" / f"{DOC_ID}.meta.yaml").write_text(
         "- a\n- b\n", encoding="utf-8"
@@ -598,19 +609,24 @@ def test_non_mapping_bound_meta_blocks_recovery_without_raising(tmp_path):
         tmp_path, runtime_config(tmp_path), manifest.job_dir,
         reason_code="interrupted", reason_message="service restart",
     )
-    assert result.blocked is True
-    assert load_manifest(manifest.job_dir).state is ROLLBACKING
+    assert result.completed is True
+    meta = read_meta(tmp_path, DOC_ID)
+    assert meta["id"] == DOC_ID
+    assert meta["status"] == "error"
 
 
-def test_corrupt_bound_meta_blocks_startup_with_report(tmp_path):
+def test_startup_recovers_with_corrupt_meta_via_snapshot(tmp_path):
+    """R6-P1-3: 启动恢复对截断损坏的当前 meta 经快照恢复,ready。"""
     manifest = scheduled_manifest(tmp_path)
     (tmp_path / "raw" / f"{DOC_ID}.meta.yaml").write_text(
         "key: [unclosed\n", encoding="utf-8"
     )
     report = recover_startup(tmp_path, runtime_config(tmp_path))
-    assert report.ready is False
-    assert any(manifest.job_id in blocker for blocker in report.blockers)
-    assert manifest.job_dir.exists()
+    assert report.ready is True
+    assert manifest.job_id in report.recovered
+    meta = read_meta(tmp_path, DOC_ID)
+    assert meta["status"] == "error"
+    assert meta["id"] == DOC_ID
 
 
 def test_prepared_with_corrupt_meta_blocks_startup_without_cleaning(tmp_path):
@@ -1854,3 +1870,96 @@ def test_rollback_public_contract_codes_pass_through(tmp_path, public_code):
         tmp_path, load_manifest(manifest.job_dir)
     )
     assert verification.ok is True, verification.failures
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 6 (R6-P1-2 纵深防御 / R6-P1-3 快照恢复补充)
+# ---------------------------------------------------------------------------
+
+
+def test_recovery_never_signals_invalid_recorded_create_time(tmp_path, monkeypatch):
+    """R6-P1-2(b): 即使加载层被绕过,非有限/非正 create_time 的记录也
+    直接阻断,绝不调用 verify/kill,绝不回滚(镜像 N2/R5 护栏)。"""
+    from dataclasses import replace as dc_replace
+
+    manifest = running_manifest(tmp_path)
+    tampered = dc_replace(
+        manifest, process=dc_replace(manifest.process, create_time=float("nan"))
+    )
+    import api.compile_transactions as transactions
+
+    monkeypatch.setattr(transactions, "load_manifest", lambda _job_dir: tampered)
+    verify = Mock()
+    terminate = Mock()
+    monkeypatch.setattr(transactions, "verify_process_identity", verify)
+    monkeypatch.setattr(transactions, "terminate_process_tree", terminate)
+    before = hash_tree(tmp_path)
+
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+
+    assert result.blocked is True
+    assert "create_time" in (result.reason or "")
+    verify.assert_not_called()
+    terminate.assert_not_called()
+    assert hash_tree(tmp_path) == before
+
+
+def test_rollback_restores_partial_meta_keys_from_snapshot(tmp_path):
+    """R6-P1-3(b): 当前 meta 为合法 YAML 但缺失键(部分写入)→ 终态 meta
+    仍携带快照中的 id 等原始字段。"""
+    manifest = scheduled_manifest(tmp_path)
+    (tmp_path / "raw" / f"{DOC_ID}.meta.yaml").write_text(
+        "status: compiling\ncompile_job_id: " + manifest.job_id + "\n",
+        encoding="utf-8",
+    )
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+    assert result.completed is True
+    meta = read_meta(tmp_path, DOC_ID)
+    assert meta["id"] == DOC_ID
+    assert meta["status"] == "error"
+    assert meta["error_code"] == "interrupted"
+    assert "compile_job_id" not in meta
+    verification = verify_terminal_transaction(
+        tmp_path, load_manifest(manifest.job_dir)
+    )
+    assert verification.ok is True, verification.failures
+
+
+def test_rollback_blocks_when_source_meta_snapshot_missing(tmp_path):
+    """R6-P1-3(c): 快照缺失 → 失败关闭,保持 ROLLBACKING,当前 meta 与
+    事务证据原样保留。"""
+    manifest = scheduled_manifest(tmp_path)
+    meta_path = tmp_path / "raw" / f"{DOC_ID}.meta.yaml"
+    meta_before = meta_path.read_bytes()
+    (manifest.job_dir / "source-meta-before.yaml").unlink()
+
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+
+    assert result.blocked is True
+    reloaded = load_manifest(manifest.job_dir)
+    assert reloaded.state is ROLLBACKING
+    assert reloaded.recovery["failed_paths"]
+    assert meta_path.read_bytes() == meta_before
+
+
+def test_rollback_blocks_when_source_meta_snapshot_not_a_mapping(tmp_path):
+    """R6-P1-3(c) 变体: 快照可解析但非映射 → 同样失败关闭。"""
+    manifest = scheduled_manifest(tmp_path)
+    (manifest.job_dir / "source-meta-before.yaml").write_text(
+        "- a\n- b\n", encoding="utf-8"
+    )
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+    assert result.blocked is True
+    assert load_manifest(manifest.job_dir).state is ROLLBACKING

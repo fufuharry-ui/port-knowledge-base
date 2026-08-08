@@ -13,6 +13,8 @@ from typing import Mapping
 
 import portalocker
 
+from api.durable_fs import durable_makedirs
+
 ENV_TRANSACTION_DIR = "COMPILE_TRANSACTION_DIR"
 ENV_TIMEOUT_SECONDS = "COMPILE_TIMEOUT_SECONDS"
 ENV_TERMINATION_GRACE_SECONDS = "COMPILE_TERMINATION_GRACE_SECONDS"
@@ -116,7 +118,10 @@ class ApiInstanceLock:
     def acquire(self) -> None:
         if self._handle is not None:
             raise RuntimeError("ApiInstanceLock already acquired")
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        # R6-P1-1: 锁父目录(.runtime)必须经耐久原语创建——裸 mkdir 会让
+        # 后续 probe 的 durable_makedirs 误判"已存在",跳过 .runtime 条目
+        # 的父目录 fsync(掉电可能丢失 .runtime 目录条目)。
+        durable_makedirs(self._path.parent)
         handle = portalocker.Lock(str(self._path), mode="a", timeout=0)
         handle.acquire()
         self._handle = handle

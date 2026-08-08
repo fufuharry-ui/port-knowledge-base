@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import dataclasses
+from pathlib import Path
 
 import pytest
 from portalocker.exceptions import LockException
@@ -150,3 +151,63 @@ def test_service_readiness_blocks_after_mark_recovery_required():
     with pytest.raises(RuntimeError, match="recovery_required"):
         readiness.require_ready()
     assert readiness.snapshot() == ("recovery_required", "rollback_failed")
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 6 (R6-P1-1): 实例锁父目录(.runtime)必须经 durable_makedirs
+# 耐久创建——裸 mkdir 会让探针的 durable_makedirs 误判"已存在"而跳过
+# .runtime 条目的父目录 fsync。测试只 spy 内层边界,不翻转 os.name。
+# ---------------------------------------------------------------------------
+
+
+def test_instance_lock_creates_runtime_parent_durably(tmp_path, monkeypatch):
+    """R6-P1-1: 首次获取锁时 .runtime 经耐久原语创建(spy 证明调用),
+    且新建层父目录被 fsync。"""
+    import api.durable_fs as durable_fs
+
+    events = []
+    monkeypatch.setattr(
+        durable_fs,
+        "_fsync_parent_directory",
+        lambda path: events.append(Path(path)),
+    )
+    lock = ApiInstanceLock(tmp_path / ".runtime" / "api-instance.lock")
+    lock.acquire()
+    try:
+        assert (tmp_path / ".runtime" / "api-instance.lock").exists()
+    finally:
+        lock.release()
+    # .runtime 是新建层: 其父目录(tmp_path)被 fsync
+    assert tmp_path / ".runtime" in events
+
+
+def test_instance_lock_skips_fsync_when_runtime_parent_exists(tmp_path, monkeypatch):
+    """R6-P1-1: .runtime 已存在时不得重复 fsync(幂等)。"""
+    import api.durable_fs as durable_fs
+
+    (tmp_path / ".runtime").mkdir()
+    events = []
+    monkeypatch.setattr(
+        durable_fs,
+        "_fsync_parent_directory",
+        lambda path: events.append(Path(path)),
+    )
+    lock = ApiInstanceLock(tmp_path / ".runtime" / "api-instance.lock")
+    lock.acquire()
+    lock.release()
+    assert events == []
+
+
+def test_instance_lock_acquire_fails_closed_on_parent_fsync_failure(
+    tmp_path, monkeypatch
+):
+    """R6-P1-1: 父目录 fsync 失败 → acquire 失败关闭(原样抛出)。"""
+    import api.durable_fs as durable_fs
+
+    def boom(path):
+        raise OSError("simulated parent fsync failure")
+
+    monkeypatch.setattr(durable_fs, "_fsync_parent_directory", boom)
+    lock = ApiInstanceLock(tmp_path / ".runtime" / "api-instance.lock")
+    with pytest.raises(OSError, match="simulated parent fsync failure"):
+        lock.acquire()

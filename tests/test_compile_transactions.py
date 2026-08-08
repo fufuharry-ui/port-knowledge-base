@@ -494,6 +494,106 @@ def test_load_manifest_accepts_rollbacking_without_process(tmp_path):
     assert loaded.process is None
 
 
+# ---------------------------------------------------------------------------
+# Codex Round 6 (R6-P2-1): UPLOAD 事务的 intake 不变量——
+# published_intake=null 对上传事务绝不合法(所有状态);PREPARED 之后的
+# 状态必须 published=True(发布完成才迁移 SCHEDULED)。违反即损坏证据,
+# 加载失败关闭,绝不空转回滚删除证据而搁浅已上传文件。
+# ---------------------------------------------------------------------------
+
+
+def _upload_manifest_data(tmp_path, *, published):
+    intake = PublishedIntake(
+        original_path="originals/example.pdf",
+        raw_text_path=f"raw/{DOC_ID}.txt",
+        raw_meta_path=f"raw/{DOC_ID}.meta.yaml",
+        published=published,
+    )
+    manifest = create_prepared_transaction(
+        base_dir=tmp_path,
+        config=runtime_config(tmp_path),
+        doc_id=DOC_ID,
+        kind=TransactionKind.UPLOAD,
+        previous_meta=None,
+        published_intake=intake,
+    )
+    return manifest, read_manifest_yaml(manifest.job_dir)
+
+
+def test_load_manifest_rejects_upload_with_null_intake(tmp_path):
+    """R6-P2-1: kind=upload + published_intake=null → ManifestIntegrityError。"""
+    manifest, data = _upload_manifest_data(tmp_path, published=True)
+    data["published_intake"] = None
+    rewrite_manifest_yaml(manifest.job_dir, data)
+    with pytest.raises(ManifestIntegrityError):
+        load_manifest(manifest.job_dir)
+
+
+@pytest.mark.parametrize(
+    "state", ["SCHEDULED", "ROLLBACKING", "ROLLED_BACK", "COMMITTED"]
+)
+def test_load_manifest_rejects_upload_unpublished_past_prepared(tmp_path, state):
+    """R6-P2-1: 上传事务 PREPARED 之后的状态携带 published=false →
+    ManifestIntegrityError(失败关闭)。"""
+    manifest, data = _upload_manifest_data(tmp_path, published=False)
+    data["state"] = state
+    rewrite_manifest_yaml(manifest.job_dir, data)
+    with pytest.raises(ManifestIntegrityError):
+        load_manifest(manifest.job_dir)
+
+
+def test_load_manifest_rejects_upload_running_unpublished(tmp_path):
+    """R6-P2-1: RUNNING + published=false(携带合法进程记录以隔离
+    intake 规则)→ ManifestIntegrityError。"""
+    manifest, data = _upload_manifest_data(tmp_path, published=False)
+    data["state"] = "RUNNING"
+    data["process"] = {
+        "pid": 4321,
+        "create_time": 1786007401.25,
+        "executable": "python",
+        "cwd": "D:/repo",
+        "command_fingerprint": f"scripts.compile|{DOC_ID}",
+        "process_group_id": 4321,
+        "platform": "windows",
+    }
+    rewrite_manifest_yaml(manifest.job_dir, data)
+    with pytest.raises(ManifestIntegrityError):
+        load_manifest(manifest.job_dir)
+
+
+@pytest.mark.parametrize("published", [False, True])
+def test_load_manifest_accepts_upload_prepared_intake_states(tmp_path, published):
+    """R6-P2-1 对照: PREPARED 下 published=false(发布前)与 true
+    (发布后绑定前窗口)均合法。"""
+    manifest, _data = _upload_manifest_data(tmp_path, published=published)
+    loaded = load_manifest(manifest.job_dir)
+    assert loaded.kind is TransactionKind.UPLOAD
+    assert loaded.published_intake.published is published
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 6 (R6-P1-2): create_time 必须有限且为正——nan 使
+# abs(actual - nan) > tolerance 恒为 False,create_time 校验被静默绕过,
+# PID 复用的新编译器会被误杀(与 N2 非正 pid 同一防御模式)。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_create_time",
+    [float("nan"), float("inf"), float("-inf"), 0, -1],
+)
+def test_load_manifest_rejects_invalid_create_time(tmp_path, bad_create_time):
+    """R6-P1-2(a): 非有限/非正 create_time → ManifestIntegrityError。"""
+    manifest = prepared_manifest(tmp_path)
+    data = read_manifest_yaml(manifest.job_dir)
+    rewrite_manifest_yaml(
+        manifest.job_dir,
+        _manifest_with_process(data, create_time=bad_create_time),
+    )
+    with pytest.raises(ManifestIntegrityError):
+        load_manifest(manifest.job_dir)
+
+
 @pytest.mark.parametrize("bad_pid", [0, -1, -9999])
 def test_load_manifest_rejects_nonpositive_pid(tmp_path, bad_pid):
     """N2: 非正 pid 一律 ManifestIntegrityError(失败关闭)。"""

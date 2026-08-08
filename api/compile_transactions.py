@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import os
 import re
 import secrets
@@ -410,6 +411,14 @@ def _parse_process(raw: Any) -> ProcessRecord | None:
         _reject("manifest process.pid must be positive")
     if not isinstance(create_time, (int, float)) or isinstance(create_time, bool):
         _reject("manifest process.create_time must be a number")
+    # R6-P1-2: create_time 必须有限且为正——nan 使 abs(差值) > tolerance
+    # 恒为 False,create_time 校验被静默绕过,PID 复用的新编译器可能被
+    # 误当作记录进程而遭信号(与 N2 非正 pid 同一防御模式)。
+    # 注: _read_create_time 的 spawn 竞态(Popen 后 psutil 读取前进程
+    # 即逝)会记录 0.0;正常流程在 API 崩溃前已按 wait 失败回滚,此处的
+    # 完整性硬阻断只是把双重稀有崩溃窗口转为失败关闭——可接受。
+    if not math.isfinite(create_time) or create_time <= 0:
+        _reject("manifest process.create_time must be finite and positive")
     pgid = raw.get("process_group_id")
     if pgid is not None and (not isinstance(pgid, int) or isinstance(pgid, bool)):
         _reject("manifest process.process_group_id must be an integer or null")
@@ -575,6 +584,21 @@ def load_manifest(job_dir: Path) -> CompileManifest:
     if state is TransactionState.RUNNING and process is None:
         _reject("manifest state RUNNING requires a process record")
 
+    intake = _parse_intake(data.get("published_intake"))
+    # R6-P2-1: 上传事务的 intake 不变量——prepare_upload_transaction 恒写
+    # 非空 published_intake,且发布完成(published=True)后才迁移
+    # SCHEDULED。kind=upload + intake=null(任意状态)或 PREPARED 之后
+    # published=false 均为损坏证据: 空转回滚会删除证据并搁浅已上传文件,
+    # 必须失败关闭。
+    if kind is TransactionKind.UPLOAD:
+        if intake is None:
+            _reject("upload manifest requires published_intake")
+        if state is not TransactionState.PREPARED and not intake.published:
+            _reject(
+                "upload manifest past PREPARED requires published_intake "
+                "published=true"
+            )
+
     return CompileManifest(
         schema_version=MANIFEST_SCHEMA_VERSION,
         job_id=job_id,
@@ -588,7 +612,7 @@ def load_manifest(job_dir: Path) -> CompileManifest:
         timeout_seconds=timeout_seconds,
         termination_grace_seconds=grace_seconds,
         previous_document_status=data.get("previous_document_status"),
-        published_intake=_parse_intake(data.get("published_intake")),
+        published_intake=intake,
         process=process,
         failure=_parse_failure(data.get("failure")),
         recovery=_parse_recovery(data.get("recovery")),
@@ -1024,6 +1048,19 @@ def _record_recovery_failure(
     durable_write_yaml(Path(job_dir) / MANIFEST_FILENAME, _manifest_to_dict(updated))
 
 
+def _read_source_meta_snapshot(job_dir: Path) -> bytes | None:
+    """读取 source-meta-before.yaml 原始字节并验证可解析为 YAML 映射。
+
+    缺失、不可读或解析结果非映射一律返回 None(调用方失败关闭)。
+    """
+    try:
+        snapshot_bytes = (Path(job_dir) / SOURCE_META_FILENAME).read_bytes()
+        parsed = yaml.safe_load(snapshot_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return None
+    return snapshot_bytes if isinstance(parsed, Mapping) else None
+
+
 def _scan_orphan_compile_processes(
     base_dir: Path, doc_id: str
 ) -> tuple[int, ...] | None:
@@ -1094,6 +1131,14 @@ def _terminate_leftover_process(
     if record.pid <= 0 or pgid <= 0:
         return (
             "recorded process identity has nonpositive pid/process_group_id; "
+            "fail closed, nothing killed"
+        )
+    # R6-P1-2 纵深防御: 即使加载层被绕过,非有限/非正 create_time 也绝不
+    # 进入 verify/kill 路径(nan 会静默绕过 create_time 容差校验,PID
+    # 复用进程可能被误杀)。
+    if not math.isfinite(record.create_time) or record.create_time <= 0:
+        return (
+            "recorded process identity has invalid create_time; "
             "fail closed, nothing killed"
         )
     identity = ProcessIdentity(
@@ -1216,15 +1261,7 @@ def _execute_rollback(
             # 设计 §11:请求未正式接受时不制造文档错误终态;把 meta 字节级
             # 恢复为绑定前的 source-meta-before.yaml 快照。快照缺失、不可读
             # 或恢复写入失败一律阻断(失败关闭),保持 ROLLBACKING 证据。
-            snapshot_path = job_dir / SOURCE_META_FILENAME
-            snapshot_bytes: bytes | None = None
-            try:
-                snapshot_bytes = snapshot_path.read_bytes()
-                parsed = yaml.safe_load(snapshot_bytes.decode("utf-8"))
-                if not isinstance(parsed, Mapping):
-                    snapshot_bytes = None
-            except (OSError, UnicodeDecodeError, yaml.YAMLError):
-                snapshot_bytes = None
+            snapshot_bytes = _read_source_meta_snapshot(job_dir)
             if snapshot_bytes is None:
                 _record_recovery_failure(
                     job_dir,
@@ -1255,11 +1292,16 @@ def _execute_rollback(
                     failed_paths=(meta_rel,),
                 )
         else:
-            meta, meta_error = _read_doc_meta_safe(base_dir, doc_id)
-            if meta is None:
+            # R6-P1-3: 当前 meta 可能被编译进程的截断写(plain open(w)
+            # 中 kill)损坏——不可信。先把绑定前的 source-meta-before.yaml
+            # 快照字节级恢复到 meta 路径(与未接受路径同一权威依据),
+            # 再在完整 meta 上写错误终态;快照缺失/不可解析为映射或恢复
+            # 写入失败一律失败关闭(保持 ROLLBACKING 证据)。
+            snapshot_bytes = _read_source_meta_snapshot(job_dir)
+            if snapshot_bytes is None:
                 _record_recovery_failure(
                     job_dir,
-                    meta_error or "doc meta missing during rollback",
+                    "rollback source meta snapshot unreadable",
                     [meta_rel],
                 )
                 return RecoveryResult(
@@ -1268,12 +1310,23 @@ def _execute_rollback(
                     reason=ERROR_CODE_ROLLBACK_FAILED,
                     failed_paths=(meta_rel,),
                 )
-            cleaned_meta = {
-                key: value
-                for key, value in meta.items()
-                if key not in META_ACTIVE_JOB_FIELDS
-            }
-            durable_write_yaml(base_dir / "raw" / f"{doc_id}.meta.yaml", cleaned_meta)
+            try:
+                durable_write_bytes(
+                    base_dir / "raw" / f"{doc_id}.meta.yaml", snapshot_bytes
+                )
+            except OSError as exc:
+                _record_recovery_failure(
+                    job_dir,
+                    "rollback meta restore failed: "
+                    f"{_sanitize_error_message(exc)}",
+                    [meta_rel],
+                )
+                return RecoveryResult(
+                    job_id=manifest.job_id,
+                    blocked=True,
+                    reason=ERROR_CODE_ROLLBACK_FAILED,
+                    failed_paths=(meta_rel,),
+                )
             # R4-P2-3: meta error_code 只写公开合同码;内部码(如
             # running_transition_failed)映射为 compile_failed,Manifest
             # 保留原始码供运维诊断。

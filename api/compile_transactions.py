@@ -414,9 +414,12 @@ def _parse_process(raw: Any) -> ProcessRecord | None:
     # R6-P1-2: create_time 必须有限且为正——nan 使 abs(差值) > tolerance
     # 恒为 False,create_time 校验被静默绕过,PID 复用的新编译器可能被
     # 误当作记录进程而遭信号(与 N2 非正 pid 同一防御模式)。
-    # 注: _read_create_time 的 spawn 竞态(Popen 后 psutil 读取前进程
-    # 即逝)会记录 0.0;正常流程在 API 崩溃前已按 wait 失败回滚,此处的
-    # 完整性硬阻断只是把双重稀有崩溃窗口转为失败关闭——可接受。
+    # 注: <=0 子句针对退化记录值(如 spawn 竞态下 _read_create_time 的
+    # 0.0 回退)。0.0 对存活进程本就因纪元级差值 mismatch 而失败关闭;
+    # 若 0.0 记录真的落盘,transition_manifest 写后回读会在 SCHEDULED→
+    # RUNNING 迁移处直接抛出完整性错误,转入 running_transition_failed
+    # 路径——该竞态实际需要子进程在 Popen 与 psutil 读取之间被完全回收
+    # (未回收子进程是 zombie,psutil 仍可读取),实践中不可达。
     if not math.isfinite(create_time) or create_time <= 0:
         _reject("manifest process.create_time must be finite and positive")
     pgid = raw.get("process_group_id")

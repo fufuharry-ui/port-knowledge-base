@@ -43,6 +43,9 @@ def isolate_api_originals(tmp_path, monkeypatch):
     originals.mkdir()
     monkeypatch.setattr(api_mod, "ORIGINALS_DIR", originals)
     monkeypatch.setattr(api_mod, "RAW_DIR", tmp_path / "raw")
+    # E005 Task 10:两阶段上传的 catalog 去重经 _load_index 读 INDEX_FILE;
+    # 一并隔离,绝不读取真实 wiki/index.yaml。
+    monkeypatch.setattr(api_mod, "INDEX_FILE", tmp_path / "wiki" / "index.yaml")
     # BASE_DIR: _schedule_compile 以 BASE_DIR 调用 prepare_recompile_transaction/
     # bind_doc_compile_job,并把 BASE_DIR 传给 run_compile_task。
     # 指向 tmp_path 后 compile_script 不存在 → 终态 error(隔离),绝不 spawn 指向真实仓库的子进程。
@@ -72,44 +75,40 @@ def isolate_api_originals(tmp_path, monkeypatch):
 
 
 @patch("api.main.run_compile_task")
-@patch("api.main.ingest_file")
-def test_ingest_endpoint(mock_ingest, mock_run, isolate_api_originals):
-    """UAT Big-Loop Task 6:/ingest 返回权威 doc_id(来自 ingest_file,而非上传时预生成),
-    含 skipped 字段,并经统一入口 _schedule_compile 调度。
-    E005 Task 9:后台任务以持久化事务的 job_id(绝非 doc_id)登记,
-    即 run_compile_task(job_id, BASE_DIR, config, readiness)。
-    参数顺序:@patch mock 在前,fixture 在后(pytest 9.x arg_names[N:] 语义)。
+def test_ingest_endpoint(mock_run, isolate_api_originals):
+    """UAT Big-Loop Task 6 + E005 Task 10:/ingest 与 /upload 共用两阶段上传事务。
+
+    权威 doc_id 来自 prepare_ingest(非上传时预生成);original/raw text/raw meta
+    经 intake journal 耐久发布;meta 绑定同一 job;后台任务以持久化事务的
+    job_id(绝非 doc_id)登记 run_compile_task(job_id, BASE_DIR, config, readiness);
+    Manifest 已持久迁移到 SCHEDULED。
     """
     import api.main as api_mod
+    from api.compile_transactions import (
+        TransactionState,
+        list_transaction_dirs,
+        load_manifest,
+    )
 
-    doc_id = "doc_test_001"
-
-    def fake_ingest(_stored):
-        api_mod.RAW_DIR.mkdir(parents=True, exist_ok=True)
-        (api_mod.RAW_DIR / f"{doc_id}.meta.yaml").write_text(
-            yaml.safe_dump({
-                "id": doc_id, "title": "test", "status": "raw",
-                "file_hash": "sha256:test", "source_type": "txt",
-            }),
-            encoding="utf-8",
-        )
-        return {
-            "id": doc_id, "title": "test", "status": "raw",
-            "file_hash": "sha256:test", "source_type": "txt",
-        }
-
-    mock_ingest.side_effect = fake_ingest
     response = client.post(
         "/api/v1/ingest",
         files={"file": ("test.txt", b"Mock document content", "text/plain")}
     )
     assert response.status_code == 200
     data = response.json()
+    doc_id = data["doc_id"]
     assert data["status"] == "processing"
-    assert data["doc_id"] == "doc_test_001"
+    assert doc_id.startswith("doc_")
     assert data["skipped"] is False
-    assert (isolate_api_originals / "test.txt").exists()
-    mock_ingest.assert_called_once()
+    assert data["filename"] == "test.txt"
+    assert "job_id" not in response.text
+    # 三项业务目标已发布
+    assert (isolate_api_originals / "test.txt").read_bytes() == b"Mock document content"
+    assert (api_mod.RAW_DIR / f"{doc_id}.txt").read_bytes() == b"Mock document content"
+    meta = yaml.safe_load(
+        (api_mod.RAW_DIR / f"{doc_id}.meta.yaml").read_text(encoding="utf-8")
+    )
+    assert meta["status"] == "compiling"
     mock_run.assert_called_once()
     args = mock_run.call_args.args
     job_id = args[0]
@@ -118,11 +117,10 @@ def test_ingest_endpoint(mock_ingest, mock_run, isolate_api_originals):
     runtime = unmanaged_app.state.runtime
     assert args[2] is runtime.config
     assert args[3] is runtime.readiness
-    meta = yaml.safe_load(
-        (api_mod.RAW_DIR / f"{doc_id}.meta.yaml").read_text(encoding="utf-8")
-    )
-    assert meta["status"] == "compiling"
     assert meta["compile_job_id"] == job_id
+    job_dirs = list_transaction_dirs(runtime.config)
+    assert [path.name for path in job_dirs] == [job_id]
+    assert load_manifest(job_dirs[0]).state is TransactionState.SCHEDULED
 
 @patch("api.main.search")
 @patch("api.main.get_llm_client")
@@ -642,39 +640,28 @@ def test_catalog_includes_raw_meta_before_compile(tmp_path, monkeypatch):
 
 
 @patch("api.main.run_compile_task")
-@patch("api.main.ingest_file")
-def test_upload_returns_authoritative_ingested_id(mock_ingest, mock_run, isolate_api_originals):
-    """CAP-INGEST:/upload 必须返回 ingest_file() 的权威 doc_id(而非上传时预生成),
-    含 skipped=false,并经统一入口调度 run_compile_task(权威 doc_id, BASE_DIR)。
-    """
+def test_upload_returns_authoritative_ingested_id(mock_run, isolate_api_originals):
+    """CAP-INGEST + E005 Task 10:/upload 返回 prepare_ingest 的权威 doc_id,
+    成功响应体精确为既有合同(含 skipped=false,无 job_id);
+    后台任务以 job_id(绝非 doc_id)登记,meta 绑定同一 job。"""
     import api.main as api_mod
 
-    doc_id = "doc_20260719_007"
-
-    def fake_ingest(_stored):
-        api_mod.RAW_DIR.mkdir(parents=True, exist_ok=True)
-        (api_mod.RAW_DIR / f"{doc_id}.meta.yaml").write_text(
-            yaml.safe_dump({
-                "id": doc_id, "title": "truthful", "status": "raw",
-                "file_hash": "sha256:new",
-            }),
-            encoding="utf-8",
-        )
-        return {
-            "id": doc_id, "title": "truthful", "status": "raw",
-            "file_hash": "sha256:new",
-        }
-
-    mock_ingest.side_effect = fake_ingest
     response = client.post(
         "/api/v1/upload",
         files={"file": ("truthful.md", b"# Truthful", "text/markdown")},
     )
     assert response.status_code == 200
-    assert response.json()["doc_id"] == "doc_20260719_007"
-    assert response.json()["skipped"] is False
-    mock_ingest.assert_called_once()
-    # E005 Task 9:后台任务以 job_id(绝非 doc_id)登记。
+    data = response.json()
+    doc_id = data["doc_id"]
+    assert doc_id.startswith("doc_")
+    assert data == {
+        "status": "processing",
+        "skipped": False,
+        "doc_id": doc_id,
+        "filename": "truthful.md",
+        "message": "摄入成功，后台自动编译中...",
+    }
+    # E005 Task 9/10:后台任务以 job_id(绝非 doc_id)登记。
     mock_run.assert_called_once()
     args = mock_run.call_args.args
     job_id = args[0]
@@ -693,9 +680,12 @@ def test_upload_returns_authoritative_ingested_id(mock_ingest, mock_run, isolate
 def test_duplicate_upload_returns_existing_id_without_compile(
     mock_run, isolate_api_originals, monkeypatch
 ):
-    """CAP-INGEST:重复哈希必须返回既有 doc_id + skipped=true,且不调度编译(无幽灵任务)。
+    """CAP-INGEST + E005 Task 10:重复哈希必须返回既有 doc_id + skipped=true
+    精确响应体,不创建编译事务、不调度编译(无幽灵任务),intake staging 被丢弃。
     """
     import api.main as api_mod
+    from api.compile_transactions import list_transaction_dirs
+
     monkeypatch.setattr(
         api_mod,
         "_find_duplicate_doc",
@@ -706,9 +696,18 @@ def test_duplicate_upload_returns_existing_id_without_compile(
         files={"file": ("duplicate.md", b"same bytes", "text/markdown")},
     )
     assert response.status_code == 200
-    assert response.json()["skipped"] is True
-    assert response.json()["doc_id"] == "doc_existing"
+    assert response.json() == {
+        "status": "skipped",
+        "skipped": True,
+        "doc_id": "doc_existing",
+        "filename": "duplicate.md",
+        "message": "文件已存在，已跳过",
+    }
     mock_run.assert_not_called()
+    runtime = unmanaged_app.state.runtime
+    assert list_transaction_dirs(runtime.config) == []
+    staging_root = runtime.config.upload_intake_dir
+    assert not staging_root.exists() or list(staging_root.iterdir()) == []
 
 
 def test_upload_rejects_unsupported_extension_without_writing(isolate_api_originals):
@@ -723,10 +722,11 @@ def test_upload_rejects_unsupported_extension_without_writing(isolate_api_origin
 
 def test_upload_strips_path_components(isolate_api_originals):
     """安全最小线:文件名中的路径分量被剥离(只取 basename),不写到 originals/ 之外。"""
-    response = client.post(
-        "/api/v1/upload",
-        files={"file": ("../safe.md", b"# Safe", "text/markdown")},
-    )
+    with patch("api.main.run_compile_task"):
+        response = client.post(
+            "/api/v1/upload",
+            files={"file": ("../safe.md", b"# Safe", "text/markdown")},
+        )
     assert response.status_code in (200, 422)
     assert not (isolate_api_originals.parent / "safe.md").exists()
 
@@ -734,39 +734,29 @@ def test_upload_strips_path_components(isolate_api_originals):
 # ─── E004 Task 5:统一编译调度契约(_schedule_compile)──────────────────────────
 
 @patch("api.main.run_compile_task")
-@patch("api.main.ingest_file")
 def test_upload_marks_compiling_before_background_task(
-    mock_ingest, mock_run, isolate_api_originals
+    mock_run, isolate_api_originals
 ):
-    """E004:上传必须在调度后台任务之前把 meta 原子置为 compiling。
+    """E004/E005 Task 10:上传必须在后台任务登记前把 meta 原子置为 compiling
+    并绑定同一 job_id(two-phase:publish_upload_intake → bind → SCHEDULED)。
 
     旧路径 compile_ingested_task 只 spawn 子进程、不准备状态,导致 catalog
     在编译期间停留 raw、重复上传/重编译无法被 409 拦截。
     """
     import api.main as api_mod
 
-    doc_id = "doc_20260805_030"
-
-    def fake_ingest(_stored):
-        api_mod.RAW_DIR.mkdir(parents=True, exist_ok=True)
-        (api_mod.RAW_DIR / f"{doc_id}.meta.yaml").write_text(
-            yaml.safe_dump({"id": doc_id, "status": "raw"}),
-            encoding="utf-8",
-        )
-        return {"id": doc_id, "status": "raw"}
-
-    mock_ingest.side_effect = fake_ingest
     response = client.post(
         "/api/v1/upload",
         files={"file": ("task.md", b"# task", "text/markdown")},
     )
 
     assert response.status_code == 200
+    doc_id = response.json()["doc_id"]
     meta = yaml.safe_load(
         (api_mod.RAW_DIR / f"{doc_id}.meta.yaml").read_text(encoding="utf-8")
     )
     assert meta["status"] == "compiling"
-    # E005 Task 9:后台任务以 job_id(绝非 doc_id)登记,与 meta 绑定一致。
+    # E005 Task 9/10:后台任务以 job_id(绝非 doc_id)登记,与 meta 绑定一致。
     mock_run.assert_called_once()
     args = mock_run.call_args.args
     assert args[0] == meta["compile_job_id"]
@@ -1097,16 +1087,49 @@ def _read_meta_bytes(repo: Path, doc_id: str) -> bytes:
     return (repo / "raw" / f"{doc_id}.meta.yaml").read_bytes()
 
 
+def _business_manifest(repo: Path) -> dict:
+    """业务目录(raw/wiki/meta/originals)的 path→sha256 清单(字节级比对)。"""
+    from api.durable_fs import sha256_file
+
+    result = {}
+    for sub in ("raw", "wiki", "meta", "originals"):
+        base = repo / sub
+        if not base.exists():
+            continue
+        for path in sorted(base.rglob("*")):
+            if path.is_file():
+                result[path.relative_to(repo).as_posix()] = sha256_file(path)
+    return result
+
+
 @pytest.fixture()
 def tmp_repo(tmp_path, monkeypatch):
-    """隔离知识库:两篇 raw 文档;api.main.BASE_DIR/RAW_DIR 指向该仓库。"""
+    """隔离知识库:两篇 raw 文档;api.main 与 scripts.ingest 路径常量指向该仓库。
+
+    E005 Task 10:补齐 ORIGINALS_DIR/INDEX_FILE 与 scripts.ingest/scripts.logger
+    路径隔离——两阶段上传流程(originals 唯一命名、catalog 去重)及旧流程的
+    RED 运行都绝不读取或写入真实仓库。
+    """
     import api.main as api_mod
+    import scripts.ingest as ingest_mod
+    import scripts.logger as logger_mod
 
     (tmp_path / "wiki").mkdir(exist_ok=True)
+    originals = tmp_path / "originals"
+    originals.mkdir(exist_ok=True)
     _write_repo_doc(tmp_path, "doc_1")
     _write_repo_doc(tmp_path, "doc_2")
     monkeypatch.setattr(api_mod, "BASE_DIR", tmp_path)
     monkeypatch.setattr(api_mod, "RAW_DIR", tmp_path / "raw")
+    monkeypatch.setattr(api_mod, "ORIGINALS_DIR", originals)
+    monkeypatch.setattr(api_mod, "INDEX_FILE", tmp_path / "wiki" / "index.yaml")
+    monkeypatch.setattr(ingest_mod, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(ingest_mod, "RAW_DIR", tmp_path / "raw")
+    monkeypatch.setattr(ingest_mod, "ORIGINALS_DIR", originals)
+    monkeypatch.setattr(ingest_mod, "WIKI_DIR", tmp_path / "wiki")
+    monkeypatch.setattr(ingest_mod, "INDEX_FILE", tmp_path / "wiki" / "index.yaml")
+    sandbox_logger = logger_mod.ActivityLogger(tmp_path / "wiki")
+    monkeypatch.setattr(logger_mod, "global_logger", sandbox_logger)
     return tmp_path
 
 
@@ -1364,3 +1387,150 @@ def test_unaccepted_rollback_blocked_enters_recovery_required(
     assert response.json() == {"detail": {"code": "recovery_required"}}
     mode, _reason = runtime.readiness.snapshot()
     assert mode == "recovery_required"
+
+
+# ─── E005 Task 10:两阶段上传 API 合同 ─────────────────────────────────────────
+
+def test_busy_upload_publishes_no_business_files(
+    managed_client, tmp_repo, active_transaction
+):
+    """E005 Task 10(brief 示例):存在活动事务时上传必须 409
+    knowledge_base_busy(精确响应体);业务数据目录字节级不变,
+    且不残留 intake staging、不创建新事务。"""
+    from api.compile_transactions import list_transaction_dirs
+
+    runtime = _repo_runtime(managed_client)
+    before = _business_manifest(tmp_repo)
+    response = managed_client.post(
+        "/api/v1/upload",
+        files={"file": ("a.txt", b"content", "text/plain")},
+    )
+    assert response.status_code == 409
+    assert response.json() == {"detail": {"code": "knowledge_base_busy"}}
+    assert _business_manifest(tmp_repo) == before
+    assert len(list_transaction_dirs(runtime.config)) == 1  # 仅既有活动事务
+    staging_root = runtime.config.upload_intake_dir
+    assert not staging_root.exists() or list(staging_root.iterdir()) == []
+
+
+def test_upload_publish_failure_revokes_published_files(
+    managed_client, tmp_repo, monkeypatch
+):
+    """E005 Task 10:发布在 original 之后、raw text 之前失败 → 请求线程立即经
+    恢复库回滚(journal 精确撤销本轮 original 并清理 PREPARED 事务),响应 503
+    compile_transaction_unavailable;既有业务文件字节不变,无活动事务,
+    readiness 不被污染。"""
+    import api.upload_intake as intake_mod
+    from api.compile_transactions import (
+        list_active_manifests,
+        list_transaction_dirs,
+    )
+    from api.durable_fs import durable_write_bytes as real_write_bytes
+
+    runtime = _repo_runtime(managed_client)
+    before = _business_manifest(tmp_repo)
+    observed = {"raw_text_write": False}
+
+    def failing_write_bytes(path, payload):
+        path = Path(path)
+        if path.parent.name == "raw" and path.suffix == ".txt":
+            observed["raw_text_write"] = True
+            raise OSError("simulated durable write failure")
+        return real_write_bytes(path, payload)
+
+    monkeypatch.setattr(intake_mod, "durable_write_bytes", failing_write_bytes)
+    response = managed_client.post(
+        "/api/v1/upload",
+        files={"file": ("newdoc.txt", b"brand new content", "text/plain")},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": {"code": "compile_transaction_unavailable"}}
+    assert observed["raw_text_write"] is True
+    # 本轮 original 已撤销;既有业务文件字节不变
+    assert _business_manifest(tmp_repo) == before
+    assert list_active_manifests(runtime.config) == []
+    # PREPARED-unbound 事务目录已清理
+    assert list_transaction_dirs(runtime.config) == []
+    mode, _reason = runtime.readiness.snapshot()
+    assert mode == "ready"
+
+
+def test_upload_whitespace_only_returns_422_without_business_writes(
+    managed_client, tmp_repo
+):
+    """E005 Task 10:空白文本在任何 PREPARED/业务写入之前拒绝 → 422
+    (既有不可解析合同);无事务、无业务写入、无 staging 残留。"""
+    from api.compile_transactions import list_transaction_dirs
+
+    runtime = _repo_runtime(managed_client)
+    before = _business_manifest(tmp_repo)
+    response = managed_client.post(
+        "/api/v1/upload",
+        files={"file": ("empty.txt", b"   \n\t  ", "text/plain")},
+    )
+    assert response.status_code == 422
+    assert response.json() == {"detail": "文件无法解析或内容为空"}
+    assert _business_manifest(tmp_repo) == before
+    assert list_transaction_dirs(runtime.config) == []
+    staging_root = runtime.config.upload_intake_dir
+    assert not staging_root.exists() or list(staging_root.iterdir()) == []
+
+
+def test_upload_unparseable_returns_422_without_business_writes(
+    managed_client, tmp_repo
+):
+    """E005 Task 10:解析失败(IngestParseError)→ 同一 422 合同;
+    不写 error meta、不创建事务、不发布任何业务文件。"""
+    from api.compile_transactions import list_transaction_dirs
+
+    runtime = _repo_runtime(managed_client)
+    before = _business_manifest(tmp_repo)
+    response = managed_client.post(
+        "/api/v1/upload",
+        files={"file": ("broken.txt", b"\xff\xfe\x00\x01", "text/plain")},
+    )
+    assert response.status_code == 422
+    assert response.json() == {"detail": "文件无法解析或内容为空"}
+    assert _business_manifest(tmp_repo) == before
+    assert list_transaction_dirs(runtime.config) == []
+
+
+def test_upload_add_task_failure_fully_revokes_published_upload(
+    managed_client, tmp_repo
+):
+    """E005 Task 10:add_task 失败 = 请求未被接受:本轮发布的
+    original/raw text/raw meta 全部撤销(无孤儿 doc、无制造的 error 终态),
+    既有业务文件字节不变,响应 503 compile_transaction_unavailable。"""
+    from fastapi import BackgroundTasks
+    from api.compile_transactions import (
+        TransactionState,
+        list_active_manifests,
+        list_transaction_dirs,
+        load_manifest,
+        verify_terminal_transaction,
+    )
+
+    runtime = _repo_runtime(managed_client)
+    before = _business_manifest(tmp_repo)
+    with patch.object(
+        BackgroundTasks, "add_task", side_effect=RuntimeError("queue down")
+    ):
+        response = managed_client.post(
+            "/api/v1/upload",
+            files={"file": ("queued.txt", b"queued upload content", "text/plain")},
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": {"code": "compile_transaction_unavailable"}}
+    # 本轮上传完全撤销:业务清单与上传前字节一致(无孤儿 original/raw/meta)
+    assert _business_manifest(tmp_repo) == before
+    assert list_active_manifests(runtime.config) == []
+    job_dirs = list_transaction_dirs(runtime.config)
+    assert len(job_dirs) == 1
+    rolled_back = load_manifest(job_dirs[0])
+    assert rolled_back.state is TransactionState.ROLLED_BACK
+    # ROLLED_BACK 终态满足清理合同(下次启动绝不阻断)
+    assert verify_terminal_transaction(tmp_repo, rolled_back).ok is True
+    mode, _reason = runtime.readiness.snapshot()
+    assert mode == "ready"

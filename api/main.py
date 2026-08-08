@@ -1,8 +1,6 @@
 import json
 import logging
 import os
-import shutil
-import tempfile
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -37,8 +35,14 @@ from api.runtime_guard import (
     ServiceReadiness,
     load_compile_runtime_config,
 )
+from api.upload_intake import (
+    discard_staged_upload,
+    prepare_upload_transaction,
+    publish_upload_intake,
+    stage_upload,
+)
 from scripts.doc_admin import bind_doc_compile_job, read_doc_meta
-from scripts.ingest import PARSERS, get_file_hash, ingest_file
+from scripts.ingest import PARSERS, IngestParseError, get_file_hash, prepare_ingest
 from scripts.search import (
     search, get_llm_client, layer1_filter, layer2_score, layer3_answer,
     layer3_answer_stream, _load_ontology,
@@ -217,27 +221,27 @@ def _unique_original_path(filename: str) -> Path:
         sequence += 1
 
 
-def _stage_upload(file: UploadFile) -> tuple[Path | None, dict | None]:
-    """落盘 + 哈希去重。返回 (staged_path, None) 或 (None, duplicate_doc)。
+# ─── E005 Task 10:R8 上传崩溃窗口注入边界(设计 §24.6)────────────────────────
+# 生产路径一律为 no-op;崩溃恢复测试经 monkeypatch 在命名边界注入退出,
+# 绝不使用生产环境开关。窗口 4/5 位于 intake 发布内部,命名边界是
+# api.upload_intake 的 durable_write_bytes / durable_write_yaml(测试包装后
+# 在 raw text / raw meta 目标边界抛出专用崩溃异常)。
 
-    先写临时文件再哈希,命中重复则删临时文件(不写最终 originals/);否则原子替换到唯一目标。
-    """
-    filename = _safe_upload_name(file.filename)
-    ORIGINALS_DIR.mkdir(parents=True, exist_ok=True)
-    suffix = Path(filename).suffix.lower()
-    with tempfile.NamedTemporaryFile(dir=ORIGINALS_DIR, suffix=suffix, delete=False) as handle:
-        shutil.copyfileobj(file.file, handle)
-        staged = Path(handle.name)
 
-    file_hash = get_file_hash(staged)
-    duplicate = _find_duplicate_doc(file_hash)
-    if duplicate:
-        staged.unlink(missing_ok=True)
-        return None, duplicate
+def _r8_boundary_after_intake_stage(staged) -> None:
+    """R8 窗口 1(after_intake_stage):intake staging 写入后、prepare_ingest 前。"""
 
-    destination = _unique_original_path(filename)
-    staged.replace(destination)
-    return destination, None
+
+def _r8_boundary_after_prepare_ingest(prepared) -> None:
+    """R8 窗口 2(after_prepare_ingest):候选 raw/meta 生成后、PREPARED 发布前。"""
+
+
+def _r8_boundary_after_prepared_manifest(manifest) -> None:
+    """R8 窗口 3(after_prepared_manifest):PREPARED 发布后、业务文件发布前。"""
+
+
+def _r8_boundary_after_scheduled(manifest) -> None:
+    """R8 窗口 6(after_scheduled):SCHEDULED 持久迁移后、add_task 前。"""
 
 
 def _endpoint_runtime(request: Request) -> AppRuntime | None:
@@ -261,7 +265,7 @@ def _list_active_manifests_guarded(runtime: AppRuntime) -> list:
         ) from None
 
 
-def _rollback_unaccepted_compile(
+def _rollback_unaccepted_transaction(
     runtime: AppRuntime,
     manifest,
     *,
@@ -269,7 +273,11 @@ def _rollback_unaccepted_compile(
     reason_message: str,
 ) -> bool:
     """请求未被接受时经恢复库回滚事务(设计 §11);返回 False 表示一致性
-    无法证明(失败关闭:readiness 已进入 recovery_required)。"""
+    无法证明(失败关闭:readiness 已进入 recovery_required)。
+
+    重编译与上传共用:恢复库按事务 kind 处理——重编译把 meta 字节级恢复为
+    绑定前快照(绝不制造 error 终态);上传按 journal/published_intake 精确
+    撤销本轮发布的 original/raw(绝不保留孤儿 doc)。"""
     try:
         result = recover_transaction(
             BASE_DIR,
@@ -380,7 +388,7 @@ def _schedule_compile(
                 # bind 已生效但请求未被接受:回滚恢复绑定前 meta(绝不制造
                 # error 终态);响应恒为 503——回滚后无任何编译在进行,
                 # 不得按绑定中的 meta 报 409(评审修复)。
-                if not _rollback_unaccepted_compile(
+                if not _rollback_unaccepted_transaction(
                     runtime,
                     manifest,
                     reason_code=ERROR_CODE_UNACCEPTED,
@@ -404,7 +412,7 @@ def _schedule_compile(
             status_after = (
                 meta_after.get("status") if isinstance(meta_after, dict) else None
             )
-            if not _rollback_unaccepted_compile(
+            if not _rollback_unaccepted_transaction(
                 runtime,
                 manifest,
                 reason_code=ERROR_CODE_UNACCEPTED,
@@ -435,7 +443,7 @@ def _schedule_compile(
             )
             # add_task 失败 = 请求未被接受:立即回滚并恢复绑定前 meta,
             # 绝不留下 SCHEDULED 事务或制造的 error 终态(设计 §11)。
-            if not _rollback_unaccepted_compile(
+            if not _rollback_unaccepted_transaction(
                 runtime,
                 manifest,
                 reason_code=ERROR_CODE_UNACCEPTED,
@@ -452,35 +460,223 @@ def _schedule_compile(
 def _accept_upload(
     background_tasks: BackgroundTasks, file: UploadFile, runtime: AppRuntime | None
 ) -> dict:
-    """权威上传契约:落盘 → 去重 → 同步 ingest_file → 调度按 doc_id 编译。
+    """权威上传契约(E005 Task 10 两阶段事务化,设计 §12.3/§12.4)。
 
-    返回权威 doc_id(来自 ingest_file,而非上传时预生成),含 skipped 字段。
-    /upload 与 /ingest 共用此契约。
+    全流程在 COMPILE_SCHEDULE_LOCK 内直到 Manifest 持久迁移 SCHEDULED 且
+    add_task 返回:
+
+        readiness 校验(503 recovery_required)
+        → 活动事务检查(409 knowledge_base_busy,业务目录不变)
+        → 锁内选定无冲突原始文件名并 stage_upload 到 intake staging
+        → file_hash 去重(命中返回 skipped 合同,不建事务,丢弃 staging)
+        → prepare_ingest 纯准备(空文本/解析失败 422,无任何业务写入)
+        → prepare_upload_transaction 发布 PREPARED(kind=UPLOAD)
+        → publish_upload_intake 按 journal 原子发布 original/raw text/raw meta
+        → bind_doc_compile_job 绑定 compiling + job 字段
+        → PREPARED→SCHEDULED 持久迁移
+        → add_task(run_compile_task, job_id, BASE_DIR, config, readiness)
+
+    PREPARED 之后任何失败都经同一恢复库回滚(_rollback_unaccepted_transaction):
+    上传未接受即本轮发布完全撤销,绝不保留孤儿 doc 或制造的 error 终态。
+    成功响应形状与去重响应形状保持不变,绝不返回 job_id。
+
+    intake staging 所有权:请求线程自 stage_upload 起持有 staging;
+    publish_upload_intake 成功返回后,字节已耐久发布到三项业务目标、
+    journal 与 Manifest(published=True)成为唯一恢复依据,staging 立即被
+    请求线程丢弃;此前任何退出(去重/422/准备或发布失败/异常)由 finally
+    丢弃未接受的 staging;进程真实崩溃时由 recover_startup 的
+    .staging-* 清理兜底。staging 绝不参与回滚判定。
     """
-    stored, duplicate = _stage_upload(file)
-    if duplicate:
-        return {
-            "status": "skipped",
-            "skipped": True,
-            "doc_id": duplicate["id"],
-            "filename": file.filename,
-            "message": "文件已存在，已跳过",
-        }
+    if runtime is None:
+        logger.error("upload rejected: runtime absent")
+        raise HTTPException(status_code=503, detail={"code": "recovery_required"})
+    safe_name = _safe_upload_name(file.filename)
+    config = runtime.config
+    readiness = runtime.readiness
+    staged = None
+    with COMPILE_SCHEDULE_LOCK:
+        try:
+            try:
+                readiness.require_ready()
+            except RuntimeError:
+                raise HTTPException(
+                    status_code=503, detail={"code": "recovery_required"}
+                ) from None
+            active = _list_active_manifests_guarded(runtime)
+            if active:
+                raise HTTPException(
+                    status_code=409, detail={"code": "knowledge_base_busy"}
+                )
+            # 唯一命名必须在锁内:同名上传串行,绝不覆盖既有 original。
+            final_name = _unique_original_path(safe_name).name
+            staged = stage_upload(file, config, safe_name=final_name)
+            _r8_boundary_after_intake_stage(staged)
+            duplicate = _find_duplicate_doc(get_file_hash(staged.staged_file))
+            if duplicate:
+                return {
+                    "status": "skipped",
+                    "skipped": True,
+                    "doc_id": duplicate["id"],
+                    "filename": file.filename,
+                    "message": "文件已存在，已跳过",
+                }
+            try:
+                prepared = prepare_ingest(
+                    staged.staged_file,
+                    base_dir=BASE_DIR,
+                    existing_doc_ids={
+                        doc["id"]
+                        for doc in _load_document_catalog()
+                        if doc.get("id")
+                    },
+                )
+            except IngestParseError as exc:
+                logger.warning(
+                    "upload parse failed for %s: %s", safe_name, exc.original
+                )
+                raise HTTPException(
+                    status_code=422, detail="文件无法解析或内容为空"
+                ) from None
+            if not prepared.text_bytes.strip():
+                raise HTTPException(
+                    status_code=422, detail="文件无法解析或内容为空"
+                )
+            _r8_boundary_after_prepare_ingest(prepared)
+            try:
+                manifest = prepare_upload_transaction(
+                    staged, prepared, BASE_DIR, config
+                )
+            except Exception as exc:
+                logger.error(
+                    "upload transaction preparation failed for %s: %s",
+                    safe_name, exc,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail={"code": "compile_transaction_unavailable"},
+                ) from None
+            _r8_boundary_after_prepared_manifest(manifest)
+            try:
+                publish_upload_intake(manifest, staged, prepared, BASE_DIR)
+            except Exception as exc:
+                logger.error(
+                    "upload intake publish failed for job %s: %s",
+                    manifest.job_id, exc,
+                )
+                if not _rollback_unaccepted_transaction(
+                    runtime,
+                    manifest,
+                    reason_code=ERROR_CODE_UNACCEPTED,
+                    reason_message=f"upload intake publish failed: {exc}",
+                ):
+                    raise HTTPException(
+                        status_code=503, detail={"code": "recovery_required"}
+                    ) from None
+                raise HTTPException(
+                    status_code=503,
+                    detail={"code": "compile_transaction_unavailable"},
+                ) from None
+            # 字节已耐久发布、journal 完整、published=True:staging 立即丢弃,
+            # 恢复依据转为 journal + Manifest。
+            discard_staged_upload(staged)
+            staged = None
 
-    assert stored is not None
-    meta = ingest_file(stored)
-    if not meta:
-        raise HTTPException(status_code=422, detail="文件无法解析或内容为空")
-
-    doc_id = meta["id"]
-    _schedule_compile(background_tasks, doc_id, runtime)
-    return {
-        "status": "processing",
-        "skipped": False,
-        "doc_id": doc_id,
-        "filename": stored.name,
-        "message": "摄入成功，后台自动编译中...",
-    }
+            scheduled_at = datetime.now(timezone.utc)
+            deadline = scheduled_at + timedelta(seconds=manifest.timeout_seconds)
+            bound = False
+            try:
+                bound = bind_doc_compile_job(
+                    prepared.doc_id,
+                    manifest.job_id,
+                    scheduled_at.isoformat(),
+                    deadline.isoformat(),
+                    base_dir=BASE_DIR,
+                )
+            except Exception as exc:
+                logger.error(
+                    "upload binding raised for %s (job %s): %s",
+                    prepared.doc_id, manifest.job_id, exc,
+                )
+            if not bound:
+                logger.error(
+                    "upload binding refused for %s (job %s)",
+                    prepared.doc_id, manifest.job_id,
+                )
+                if not _rollback_unaccepted_transaction(
+                    runtime,
+                    manifest,
+                    reason_code=ERROR_CODE_UNACCEPTED,
+                    reason_message="upload doc binding failed before acceptance",
+                ):
+                    raise HTTPException(
+                        status_code=503, detail={"code": "recovery_required"}
+                    )
+                raise HTTPException(
+                    status_code=503,
+                    detail={"code": "compile_transaction_unavailable"},
+                )
+            try:
+                manifest = transition_manifest(
+                    manifest.job_dir,
+                    expected=TransactionState.PREPARED,
+                    target=TransactionState.SCHEDULED,
+                    scheduled_at=scheduled_at.isoformat(),
+                )
+            except Exception as exc:
+                logger.error(
+                    "SCHEDULED transition failed for upload job %s: %s",
+                    manifest.job_id, exc,
+                )
+                if not _rollback_unaccepted_transaction(
+                    runtime,
+                    manifest,
+                    reason_code=ERROR_CODE_UNACCEPTED,
+                    reason_message=(
+                        f"upload schedule transition failed before acceptance: {exc}"
+                    ),
+                ):
+                    raise HTTPException(
+                        status_code=503, detail={"code": "recovery_required"}
+                    ) from None
+                raise HTTPException(
+                    status_code=503,
+                    detail={"code": "compile_transaction_unavailable"},
+                ) from None
+            _r8_boundary_after_scheduled(manifest)
+            try:
+                background_tasks.add_task(
+                    run_compile_task, manifest.job_id, BASE_DIR, config, readiness
+                )
+            except Exception as exc:
+                logger.error(
+                    "background task registration failed for upload job %s: %s",
+                    manifest.job_id, exc,
+                )
+                # add_task 失败 = 请求未被接受:本轮上传发布完全撤销,
+                # 绝不留下 SCHEDULED 事务或孤儿 doc(设计 §11/§12.4)。
+                if not _rollback_unaccepted_transaction(
+                    runtime,
+                    manifest,
+                    reason_code=ERROR_CODE_UNACCEPTED,
+                    reason_message=f"background task registration failed: {exc}",
+                ):
+                    raise HTTPException(
+                        status_code=503, detail={"code": "recovery_required"}
+                    ) from None
+                raise HTTPException(
+                    status_code=503,
+                    detail={"code": "compile_transaction_unavailable"},
+                ) from None
+            return {
+                "status": "processing",
+                "skipped": False,
+                "doc_id": prepared.doc_id,
+                "filename": final_name,
+                "message": "摄入成功，后台自动编译中...",
+            }
+        finally:
+            if staged is not None:
+                discard_staged_upload(staged)
 
 # ─── Pydantic Models ──────────────────────────────────────────────────────────
 

@@ -1569,9 +1569,13 @@ def cleanup_terminal_transactions(
                 )
         quarantine = _quarantine_transaction_dir(job_dir)
         if quarantine is None:
+            # 换名失败: 已验证目录原样保留,下轮清理重试;换名成功但父目录
+            # fsync 失败: 目录已脱离事务命名空间,.cleanup-* 残留只能由
+            # 启动时的 staging/残留清扫重试(清理循环看不到该前缀)。
             warnings.append(
                 f"quarantine failed for {manifest.job_id}; "
-                "retry next cleanup round or startup"
+                "kept directory retried next cleanup round, "
+                ".cleanup-* residue retried by startup residue sweep"
             )
             continue
         try:

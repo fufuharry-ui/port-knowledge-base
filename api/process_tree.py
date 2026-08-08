@@ -10,7 +10,10 @@
   survivors_remaining,调用方据此进入 recovery_required 且不得回滚;
 - POSIX 进程组: 组存在性(killpg 0)不是归属证明——每次发信号前必须
   重新枚举组成员并逐一复核指纹 + cwd;任一成员不可读或不匹配即失败
-  关闭,绝不发信号(防误杀优先于自动恢复)。
+  关闭,绝不发信号(防误杀优先于自动恢复);
+- POSIX 协作终止(根进程存活): 根进程刚通过身份验证,信号发向活根的
+  实际进程组(os.getpgid(root.pid));记录 pgid 只用于根已退出的
+  恢复路径,绝不作为根存活路径的信号目标。
 
 子进程 stdout/stderr 使用管道捕获(communicate 排出,避免缓冲死锁),仅用于
 诊断,不写入 Manifest。
@@ -327,15 +330,30 @@ def _cooperative_terminate(root: psutil.Process, identity: ProcessIdentity) -> N
         if os.name == "nt" and hasattr(signal, "CTRL_BREAK_EVENT"):
             root.send_signal(signal.CTRL_BREAK_EVENT)
         elif os.name != "nt":
+            # 根进程刚通过五要素身份验证: 信号必须发向活根进程的实际进程组
+            # (os.getpgid(root.pid)),绝不发向记录 pgid——记录值可能损坏
+            # 或与复用组冲突(防误杀优先)。记录 pgid 仅用于根进程已退出的
+            # 恢复路径(_posix_recorded_group_members 会复核组成员身份)。
             try:
-                os.killpg(identity.process_group_id, signal.SIGTERM)
+                live_pgid = os.getpgid(root.pid)
             except OSError as exc:
                 logger.warning(
-                    "killpg(%d, SIGTERM) failed, falling back to root.terminate: %s",
-                    identity.process_group_id,
+                    "getpgid(%d) failed, falling back to root.terminate: %s",
+                    root.pid,
                     exc,
                 )
                 root.terminate()
+            else:
+                try:
+                    os.killpg(live_pgid, signal.SIGTERM)
+                except OSError as exc:
+                    logger.warning(
+                        "killpg(%d, SIGTERM) failed, falling back to "
+                        "root.terminate: %s",
+                        live_pgid,
+                        exc,
+                    )
+                    root.terminate()
         else:
             root.terminate()
     except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as exc:

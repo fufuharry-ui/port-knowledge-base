@@ -739,3 +739,84 @@ def test_already_gone_posix_group_without_members_returns_already_gone(monkeypat
     assert result.status == "already_gone"
     assert result.success
     assert all(sig == 0 for sig in signals)
+
+
+# ---------------------------------------------------------------------------
+# Codex R3 后续加固: POSIX 协作终止(根进程存活路径)必须把 SIGTERM 发向
+# 经验证根进程的活进程组(os.getpgid(root.pid)),绝不发向记录 pgid——
+# 记录值可能损坏或与复用组冲突;根进程刚通过五要素身份验证,其活组可信。
+# 记录 pgid 仅保留给根进程已退出的恢复路径(_posix_recorded_group_members)。
+# ---------------------------------------------------------------------------
+
+
+def _install_live_root(monkeypatch, identity, root, signals):
+    """安装根进程存活路径替身: os.name=posix + killpg 记录 + wait_procs 全灭。"""
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(
+        os,
+        "killpg",
+        lambda pgid, sig: signals.append((pgid, sig)),
+        raising=False,
+    )
+    monkeypatch.setattr(psutil, "Process", lambda pid: root)
+    monkeypatch.setattr(
+        psutil, "wait_procs", lambda procs, timeout=None: ([], [])
+    )
+
+
+def test_cooperative_terminate_signals_live_group_of_verified_root(monkeypatch):
+    """(a) 记录 pgid 损坏/与活根不一致而根身份验证通过 → SIGTERM 发向
+    活根进程组(777777),绝不发向记录 pgid。"""
+    identity = _fake_identity(pid=424242)
+    root = _matching_fake(identity)
+    signals = []
+    _install_live_root(monkeypatch, identity, root, signals)
+    monkeypatch.setattr(os, "getpgid", lambda pid: 777777, raising=False)
+
+    result = terminate_process_tree(identity, grace_seconds=1)
+
+    assert result.status == "terminated"
+    assert signals == [(777777, signal.SIGTERM)]
+    assert all(pgid != identity.process_group_id for pgid, _ in signals)
+
+
+def test_cooperative_terminate_falls_back_to_root_terminate_when_getpgid_fails(
+    monkeypatch,
+):
+    """(b) getpgid(root.pid) 抛 OSError → 回退 root.terminate(),
+    绝不发向记录 pgid。"""
+    identity = _fake_identity(pid=424242)
+    log = []
+    root = _matching_fake(identity, log=log)
+    signals = []
+    _install_live_root(monkeypatch, identity, root, signals)
+
+    def broken_getpgid(pid):
+        raise OSError("simulated getpgid failure")
+
+    monkeypatch.setattr(os, "getpgid", broken_getpgid, raising=False)
+
+    result = terminate_process_tree(identity, grace_seconds=1)
+
+    assert result.status == "terminated"
+    assert signals == []
+    assert ("terminate", identity.pid) in log
+
+
+def test_cooperative_terminate_signals_group_exactly_once(monkeypatch):
+    """(c) 正常路径(记录 pgid == 活组): 恰向进程组发一次 SIGTERM,
+    绝不回退 root.terminate。"""
+    identity = _fake_identity(pid=424242)
+    log = []
+    root = _matching_fake(identity, log=log)
+    signals = []
+    _install_live_root(monkeypatch, identity, root, signals)
+    monkeypatch.setattr(
+        os, "getpgid", lambda pid: identity.process_group_id, raising=False
+    )
+
+    result = terminate_process_tree(identity, grace_seconds=1)
+
+    assert result.status == "terminated"
+    assert signals == [(identity.process_group_id, signal.SIGTERM)]
+    assert ("terminate", identity.pid) not in log

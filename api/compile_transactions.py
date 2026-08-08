@@ -414,12 +414,9 @@ def _parse_process(raw: Any) -> ProcessRecord | None:
     # R6-P1-2: create_time 必须有限且为正——nan 使 abs(差值) > tolerance
     # 恒为 False,create_time 校验被静默绕过,PID 复用的新编译器可能被
     # 误当作记录进程而遭信号(与 N2 非正 pid 同一防御模式)。
-    # 注: <=0 子句针对退化记录值(如 spawn 竞态下 _read_create_time 的
-    # 0.0 回退)。0.0 对存活进程本就因纪元级差值 mismatch 而失败关闭;
-    # 若 0.0 记录真的落盘,transition_manifest 写后回读会在 SCHEDULED→
-    # RUNNING 迁移处直接抛出完整性错误,转入 running_transition_failed
-    # 路径——该竞态实际需要子进程在 Popen 与 psutil 读取之间被完全回收
-    # (未回收子进程是 zombie,psutil 仍可读取),实践中不可达。
+    # 注: <=0 子句针对退化记录值;R7-P1-1 起 spawn 在 create_time 不可读
+    # 时直接抛出(身份捕获失败),0.0 身份绝不持久化——写者/读者一致,
+    # 不再存在"持久化 0.0 后回读抛出"的窗口。
     if not math.isfinite(create_time) or create_time <= 0:
         _reject("manifest process.create_time must be finite and positive")
     pgid = raw.get("process_group_id")
@@ -1011,18 +1008,30 @@ def _recompute_intake_targets(
 
     - raw 目标必须与 base_dir + doc_id 重算值完全一致;
     - original 目标必须是 originals/ 的直接子文件;
-    - 其他前缀或越界一律拒绝,绝不按 Manifest 存储路径删除。
+    - 其他前缀或越界一律拒绝,绝不按 Manifest 存储路径删除;
+    - R7-P2-1: Manifest 声明的三项目标还必须与事务目录内独立 journal
+      证据(intake.yaml 的 completed 条目)精确一致——单独一个被篡改的
+      original_path(如指向他文档的 originals/ 子文件)不再构成删除
+      授权;journal 缺失/不可解析/不匹配一律 None。journal 存留至事务
+      清理,回滚中途崩溃后的幂等重入仍可验证。
     """
     intake = manifest.published_intake
     if intake is None or not intake.published:
         return []
-    expected_raw = {f"raw/{manifest.doc_id}.txt", f"raw/{manifest.doc_id}.meta.yaml"}
-    targets: list[Path] = []
-    for stored in (
+    declared = [
         intake.original_path,
         intake.raw_text_path,
         intake.raw_meta_path,
-    ):
+    ]
+    # 延迟导入避免与 api.upload_intake 的循环依赖。
+    from api.upload_intake import read_completed_intake_paths
+
+    journal_paths = read_completed_intake_paths(manifest.job_dir)
+    if journal_paths is None or journal_paths != declared:
+        return None
+    expected_raw = {f"raw/{manifest.doc_id}.txt", f"raw/{manifest.doc_id}.meta.yaml"}
+    targets: list[Path] = []
+    for stored in declared:
         parts = PurePosixPath(stored).parts
         if parts[0] == "raw":
             if stored not in expected_raw:

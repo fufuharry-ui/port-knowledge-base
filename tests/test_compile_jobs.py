@@ -1310,3 +1310,61 @@ def test_commit_aborts_and_rolls_back_when_output_fsync_fails(
         assert field not in meta
     assert readiness.snapshot()[0] == "ready"
     assert not manifest.job_dir.exists()
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 7 (R7-P1-1) 端到端: 身份捕获失败(create_time 不可读)→
+# spawn 抛出 → 按 spawn 失败从 SCHEDULED 回滚为 ROLLED_BACK,文档进入
+# error 终态,readiness 保持 ready,事务目录经终态验证清理。
+# ---------------------------------------------------------------------------
+
+
+def test_run_compile_task_rolls_back_when_identity_capture_fails(
+    tmp_path, monkeypatch
+):
+    """R7-P1-1: create_time 不可读绝不持久化 0.0 身份;事务干净回滚。"""
+    import api.process_tree as process_tree
+
+    manifest, old_payloads = scheduled_transaction(tmp_path)
+
+    class _DyingPopen:
+        """身份捕获前即逝的伪 Popen;记录回收调用,绝不指向真实进程。"""
+
+        def __init__(self):
+            self.pid = FAKE_PID
+            self.killed = False
+            self.waited = False
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=None):
+            self.waited = True
+            return -9
+
+    dying = _DyingPopen()
+    monkeypatch.setattr(
+        process_tree.subprocess, "Popen", lambda *args, **kwargs: dying
+    )
+    import psutil as _psutil
+    monkeypatch.setattr(
+        process_tree.psutil,
+        "Process",
+        lambda pid: (_ for _ in ()).throw(_psutil.NoSuchProcess(pid)),
+    )
+
+    readiness = ServiceReadiness()
+    run_compile_task(
+        manifest.job_id, tmp_path, runtime_config(tmp_path), readiness
+    )
+
+    assert dying.killed and dying.waited
+    meta = read_doc_meta(manifest.doc_id, tmp_path)
+    assert meta["status"] == "error"
+    for field in ACTIVE_JOB_FIELDS:
+        assert field not in meta
+    for rel, payload in old_payloads.items():
+        assert (tmp_path / rel).read_bytes() == payload
+    assert readiness.snapshot()[0] == "ready"
+    # 回滚完成并经终态验证清理(无 RUNNING 完整性阻断残留)
+    assert not manifest.job_dir.exists()

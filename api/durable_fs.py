@@ -98,10 +98,35 @@ def durable_makedirs(path: Path, exist_ok: bool = True) -> None:
         _fsync_parent_directory(created)
 
 
-def durable_write_bytes(path: Path, payload: bytes) -> None:
-    """按耐久写入合同把 payload 原子发布到 path 并回读验证。"""
+def _publish_temp_file(tmp_path: Path, path: Path, no_overwrite: bool) -> None:
+    """把同目录临时文件发布为最终目标。
+
+    默认 os.replace 原子替换;no_overwrite=True 时经 os.link 原子排他
+    创建(R7-P2-3,POSIX 硬链接/Windows NTFS 硬链接同一 API):目标
+    已存在即 FileExistsError,绝不覆盖既有字节;链接成功后清理临时
+    文件。父目录 fsync 由调用方统一执行。
+    """
+    if not no_overwrite:
+        os.replace(tmp_path, path)
+        return
+    try:
+        os.link(tmp_path, path)
+    finally:
+        # 链接成功或 FileExistsError,临时文件都必须清理
+        tmp_path.unlink(missing_ok=True)
+
+
+def durable_write_bytes(
+    path: Path, payload: bytes, *, no_overwrite: bool = False
+) -> None:
+    """按耐久写入合同把 payload 原子发布到 path 并回读验证。
+
+    R7-P2-2: 缺失的父目录链经 durable_makedirs 耐久创建(新建层父目录
+    fsync)。no_overwrite=True 时目标已存在即 FileExistsError,绝不覆盖
+    (R7-P2-3,排他发布)。
+    """
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    durable_makedirs(path.parent)
     fd, tmp_name = tempfile.mkstemp(
         prefix=path.name + ".", suffix=".tmp", dir=str(path.parent)
     )
@@ -111,12 +136,12 @@ def durable_write_bytes(path: Path, payload: bytes) -> None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp_path, path)
+        _publish_temp_file(tmp_path, path, no_overwrite)
         if path.read_bytes() != payload:
             raise OSError(f"durable write verification failed: {path}")
         _fsync_parent_directory(path)
     except BaseException:
-        # 清理未发布的临时文件;已 replace 时 tmp_path 不存在,missing_ok 兜底
+        # 清理未发布的临时文件;已发布时 tmp_path 不存在,missing_ok 兜底
         try:
             tmp_path.unlink(missing_ok=True)
         except OSError:
@@ -124,21 +149,27 @@ def durable_write_bytes(path: Path, payload: bytes) -> None:
         raise
 
 
-def durable_write_yaml(path: Path, data: Mapping[str, Any]) -> None:
+def durable_write_yaml(
+    path: Path, data: Mapping[str, Any], *, no_overwrite: bool = False
+) -> None:
     """以 UTF-8、保持键顺序、允许 Unicode 的方式耐久写入 YAML 映射。"""
     text = yaml.dump(data, allow_unicode=True, sort_keys=False)
-    durable_write_bytes(path, text.encode("utf-8"))
+    durable_write_bytes(path, text.encode("utf-8"), no_overwrite=no_overwrite)
 
 
-def durable_stream_to_file(path: Path, stream: Any) -> str:
+def durable_stream_to_file(
+    path: Path, stream: Any, *, no_overwrite: bool = False
+) -> str:
     """耐久写入合同的流式变体: 分块复制 stream → 同目录临时文件 → flush →
-    fsync → os.replace → sha256 回读验证 → POSIX fsync(父目录)。
+    fsync → 原子发布 → sha256 回读验证 → POSIX fsync(父目录)。
 
     写入过程中增量计算 SHA-256,全程不把整个流读入内存;返回内容的
     SHA-256 十六进制摘要。任何失败清理未发布的临时文件。
+    R7-P2-2: 缺失的父目录链经 durable_makedirs 耐久创建。
+    no_overwrite=True 时目标已存在即 FileExistsError,绝不覆盖(R7-P2-3)。
     """
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    durable_makedirs(path.parent)
     fd, tmp_name = tempfile.mkstemp(
         prefix=path.name + ".", suffix=".tmp", dir=str(path.parent)
     )
@@ -154,7 +185,7 @@ def durable_stream_to_file(path: Path, stream: Any) -> str:
                 handle.write(chunk)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp_path, path)
+        _publish_temp_file(tmp_path, path, no_overwrite)
         if sha256_file(path) != digest.hexdigest():
             raise OSError(f"durable stream verification failed: {path}")
         _fsync_parent_directory(path)

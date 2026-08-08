@@ -14,6 +14,7 @@ import yaml
 from api.durable_fs import (
     durable_makedirs,
     durable_publish_directory,
+    durable_stream_to_file,
     durable_unlink,
     durable_write_bytes,
     durable_write_yaml,
@@ -304,7 +305,9 @@ def test_probe_durable_directory_creates_chain_durably(tmp_path, monkeypatch):
 
     probe_durable_directory(target)
 
-    assert calls == [target]
+    # 链创建与探针文件写入的父目录创建均经耐久原语(目标即探针文件父目录)
+    assert calls
+    assert all(call == target for call in calls)
     assert target.is_dir()
     assert list(target.iterdir()) == []
 
@@ -323,3 +326,113 @@ def test_durable_unlink_propagates_parent_fsync_failure(tmp_path, monkeypatch):
 
     with pytest.raises(OSError, match="simulated fsync failure"):
         durable_unlink(target)
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 7 (R7-P2-2): 写入原语的父目录创建必须走 durable_makedirs——
+# 新建业务目录条目在其父目录中同样耐久。spy 内层边界,不翻转 os.name。
+# ---------------------------------------------------------------------------
+
+
+def test_durable_write_bytes_creates_missing_parents_durably(tmp_path, monkeypatch):
+    """R7-P2-2: 写入缺失嵌套父目录时,每层新建目录的父目录先自底向上
+    fsync,再做文件级发布 fsync。"""
+    import api.durable_fs as durable_fs
+
+    events = []
+    monkeypatch.setattr(
+        durable_fs,
+        "_fsync_parent_directory",
+        lambda path: events.append(Path(path)),
+    )
+    target = tmp_path / "newdir" / "sub" / "f.bin"
+
+    durable_write_bytes(target, b"payload")
+
+    assert target.read_bytes() == b"payload"
+    # durable_makedirs 自底向上: 新建层 newdir/sub 与 newdir;
+    # 随后是文件发布的父目录 fsync(以文件路径入参)
+    assert events == [
+        tmp_path / "newdir" / "sub",
+        tmp_path / "newdir",
+        target,
+    ]
+
+
+def test_durable_write_bytes_existing_parent_skips_chain_fsync(
+    tmp_path, monkeypatch
+):
+    """R7-P2-2: 父目录已存在 → 零链 fsync,仅文件发布的父目录 fsync。"""
+    import api.durable_fs as durable_fs
+
+    events = []
+    monkeypatch.setattr(
+        durable_fs,
+        "_fsync_parent_directory",
+        lambda path: events.append(Path(path)),
+    )
+    target = tmp_path / "f.bin"
+
+    durable_write_bytes(target, b"payload")
+
+    assert events == [target]
+
+
+def test_durable_write_bytes_propagates_parent_creation_fsync_failure(
+    tmp_path, monkeypatch
+):
+    """R7-P2-2: 目录链 fsync 失败原样传播(调用方失败关闭)。"""
+    import api.durable_fs as durable_fs
+
+    def boom(path):
+        raise OSError("simulated parent fsync failure")
+
+    monkeypatch.setattr(durable_fs, "_fsync_parent_directory", boom)
+    with pytest.raises(OSError, match="simulated parent fsync failure"):
+        durable_write_bytes(tmp_path / "a" / "b" / "f.bin", b"x")
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 7 (R7-P2-3): no_overwrite 排他发布——同目录临时文件写完整 +
+# fsync 后,经 os.link 原子创建最终目标(已存在即 FileExistsError,绝不
+# 覆盖),再清理临时文件并 fsync 父目录。
+# ---------------------------------------------------------------------------
+
+
+def test_durable_write_bytes_no_overwrite_refuses_existing(tmp_path):
+    """R7-P2-3: 目标已存在 → FileExistsError,既有字节不变,无临时残留。"""
+    target = tmp_path / "f.bin"
+    target.write_bytes(b"other writer")
+    with pytest.raises(FileExistsError):
+        durable_write_bytes(target, b"ours", no_overwrite=True)
+    assert target.read_bytes() == b"other writer"
+    assert [p.name for p in tmp_path.iterdir()] == ["f.bin"]
+
+
+def test_durable_write_bytes_no_overwrite_creates_new_target(tmp_path):
+    """R7-P2-3: 目标不存在 → 排他创建成功,内容一致。"""
+    target = tmp_path / "f.bin"
+    durable_write_bytes(target, b"ours", no_overwrite=True)
+    assert target.read_bytes() == b"ours"
+    assert [p.name for p in tmp_path.iterdir()] == ["f.bin"]
+
+
+def test_durable_stream_to_file_no_overwrite_refuses_existing(tmp_path):
+    """R7-P2-3: 流式变体同一排他合同。"""
+    import io
+
+    target = tmp_path / "s.bin"
+    target.write_bytes(b"other writer")
+    with pytest.raises(FileExistsError):
+        durable_stream_to_file(target, io.BytesIO(b"ours"), no_overwrite=True)
+    assert target.read_bytes() == b"other writer"
+    assert [p.name for p in tmp_path.iterdir()] == ["s.bin"]
+
+
+def test_durable_write_yaml_no_overwrite_refuses_existing(tmp_path):
+    """R7-P2-3: YAML 变体同一排他合同。"""
+    target = tmp_path / "f.yaml"
+    target.write_text("keep: true\n", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        durable_write_yaml(target, {"ours": 1}, no_overwrite=True)
+    assert target.read_text(encoding="utf-8") == "keep: true\n"

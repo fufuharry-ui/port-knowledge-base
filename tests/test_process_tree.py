@@ -820,3 +820,27 @@ def test_cooperative_terminate_signals_group_exactly_once(monkeypatch):
     assert result.status == "terminated"
     assert signals == [(identity.process_group_id, signal.SIGTERM)]
     assert ("terminate", identity.pid) not in log
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 7 (R7-P1-1): spawn 时 create_time 不可读 = 身份捕获失败——
+# 绝不持久化 0.0 兜底(load_manifest 拒绝非正 create_time,持久化会留下
+# 永久完整性阻断的 RUNNING manifest);spawn 必须抛出,由既有
+# except BaseException 路径 best-effort 终止并回收不可跟踪子进程。
+# ---------------------------------------------------------------------------
+
+
+def test_spawn_fails_when_create_time_unreadable(tmp_path, monkeypatch):
+    """R7-P1-1: psutil 读取 create_time 时进程已退出(NoSuchProcess)→
+    spawn_compile_process 抛出,不可跟踪子进程被 kill + wait 回收。"""
+    fake = _RecordingPopen(pid=4321)
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: fake)
+    monkeypatch.setattr(
+        psutil, "Process", Mock(side_effect=psutil.NoSuchProcess(pid=4321))
+    )
+
+    with pytest.raises(psutil.NoSuchProcess):
+        spawn_compile_process(tmp_path, "doc_x", {})
+
+    assert fake.killed or fake.terminated
+    assert fake.waited

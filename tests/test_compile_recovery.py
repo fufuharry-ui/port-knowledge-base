@@ -85,6 +85,28 @@ def rewrite_manifest_yaml(job_dir, data):
     )
 
 
+def write_completed_journal(job_dir, paths):
+    """写入 intake.yaml: 每个路径一条 completed=True 的本请求条目
+    (R7-P2-1: 恢复引擎按 journal 交叉验证 Manifest 声明的 intake 目标)。"""
+    (job_dir / "intake.yaml").write_text(
+        yaml.dump(
+            {
+                "schema_version": 1,
+                "entries": [
+                    {
+                        "path": path,
+                        "created_by_this_request": True,
+                        "completed": True,
+                    }
+                    for path in paths
+                ],
+            },
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+
+
 def hash_tree(root, subdirs=BUSINESS_SUBDIRS):
     """对指定业务子树做 path → sha256 清单,用于证明阻断路径未触碰业务文件。"""
     result = {}
@@ -461,9 +483,13 @@ def test_upload_rollback_removes_only_this_round_published_files(tmp_path):
         previous_meta={"id": DOC_ID, "status": "raw"},
         published_intake=intake,
     )
-    # 本轮发布的业务文件
+    # 本轮发布的业务文件 + 与之精确一致的 completed journal(R7-P2-1)
     (tmp_path / "originals" / "example.pdf").write_bytes(b"example")
     (tmp_path / "raw" / f"{DOC_ID}.txt").write_text("text", encoding="utf-8")
+    write_completed_journal(
+        manifest.job_dir,
+        [intake.original_path, intake.raw_text_path, intake.raw_meta_path],
+    )
     write_doc_meta(tmp_path, DOC_ID, {
         "id": DOC_ID, "status": "compiling", "compile_job_id": manifest.job_id,
     })
@@ -510,7 +536,8 @@ def test_upload_manifest_with_unsafe_intake_path_blocks(tmp_path):
 
 
 def _scheduled_upload_with_intake(tmp_path, intake):
-    """上传事务进入 SCHEDULED 并发布 intake 声明的全部文件。"""
+    """上传事务进入 SCHEDULED 并发布 intake 声明的全部文件
+    (R7-P2-1: 同步写入与声明一致的 completed journal)。"""
     manifest = make_prepared(
         tmp_path, seed=False, kind=TransactionKind.UPLOAD,
         previous_meta={"id": DOC_ID, "status": "raw"},
@@ -520,6 +547,10 @@ def _scheduled_upload_with_intake(tmp_path, intake):
         target = tmp_path / stored
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(b"published::" + stored.encode("utf-8"))
+    write_completed_journal(
+        manifest.job_dir,
+        [intake.original_path, intake.raw_text_path, intake.raw_meta_path],
+    )
     transition_manifest(manifest.job_dir, expected=PREPARED, target=SCHEDULED,
                         scheduled_at="2026-08-06T14:30:01+00:00")
     return load_manifest(manifest.job_dir)
@@ -1359,6 +1390,11 @@ def _scheduled_upload_with_new_artifacts(tmp_path):
         target = tmp_path / stored
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(b"published::" + stored.encode("utf-8"))
+    # R7-P2-1: 恢复引擎按 journal 交叉验证 intake 目标
+    write_completed_journal(
+        manifest.job_dir,
+        [intake.original_path, intake.raw_text_path, intake.raw_meta_path],
+    )
     summary = tmp_path / "wiki" / f"{DOC_ID}.summary.yaml"
     summary.parent.mkdir(parents=True, exist_ok=True)
     summary.write_bytes(b"partial-summary")
@@ -1963,3 +1999,139 @@ def test_rollback_blocks_when_source_meta_snapshot_not_a_mapping(tmp_path):
     )
     assert result.blocked is True
     assert load_manifest(manifest.job_dir).state is ROLLBACKING
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 7 (R7-P2-1): 回滚删除的 intake 目标必须与事务目录内独立的
+# journal 证据(intake.yaml,发布时逐目标落条)精确一致——Manifest 声明的
+# originals/ 直接子文件不再单独构成删除授权;journal 缺失/不可解析/不匹配
+# 一律失败关闭(绝不误删他文档的 original)。
+# ---------------------------------------------------------------------------
+
+
+def _scheduled_upload_with_journal(tmp_path, intake):
+    """上传事务 SCHEDULED + 发布文件 + 与声明一致的 completed journal。"""
+    manifest = make_prepared(
+        tmp_path, seed=False, kind=TransactionKind.UPLOAD,
+        previous_meta={"id": DOC_ID, "status": "raw"},
+        published_intake=intake,
+    )
+    for stored in (intake.original_path, intake.raw_text_path, intake.raw_meta_path):
+        target = tmp_path / stored
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"published::" + stored.encode("utf-8"))
+    write_completed_journal(
+        manifest.job_dir,
+        [intake.original_path, intake.raw_text_path, intake.raw_meta_path],
+    )
+    write_doc_meta(tmp_path, DOC_ID, {
+        "id": DOC_ID, "status": "compiling", "compile_job_id": manifest.job_id,
+    })
+    transition_manifest(manifest.job_dir, expected=PREPARED, target=SCHEDULED,
+                        scheduled_at="2026-08-06T14:30:01+00:00")
+    return load_manifest(manifest.job_dir)
+
+
+def _legit_upload_intake():
+    return PublishedIntake(
+        original_path="originals/example.pdf",
+        raw_text_path=f"raw/{DOC_ID}.txt",
+        raw_meta_path=f"raw/{DOC_ID}.meta.yaml",
+        published=True,
+    )
+
+
+def test_rollback_blocks_when_manifest_original_path_tampered(tmp_path):
+    """R7-P2-1: Manifest 的 original_path 被篡改为他文档的 originals/
+    直接子文件(与 journal 不符)→ 阻断,该文件字节不变,证据保留。"""
+    manifest = _scheduled_upload_with_journal(tmp_path, _legit_upload_intake())
+    foreign = tmp_path / "originals" / "keep.pdf"
+    foreign.write_bytes(b"other document")
+    data = yaml.safe_load(
+        (manifest.job_dir / "manifest.yaml").read_text(encoding="utf-8")
+    )
+    data["published_intake"]["original_path"] = "originals/keep.pdf"
+    rewrite_manifest_yaml(manifest.job_dir, data)
+
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+
+    assert result.blocked is True
+    assert foreign.read_bytes() == b"other document"
+    assert load_manifest(manifest.job_dir).state is ROLLBACKING
+    assert manifest.job_dir.exists()
+
+
+def test_rollback_blocks_upload_when_journal_missing(tmp_path):
+    """R7-P2-1: published=true 但 journal 缺失 → 无法证明归属,失败关闭。"""
+    intake = _legit_upload_intake()
+    manifest = make_prepared(
+        tmp_path, seed=False, kind=TransactionKind.UPLOAD,
+        previous_meta={"id": DOC_ID, "status": "raw"},
+        published_intake=intake,
+    )
+    for stored in (intake.original_path, intake.raw_text_path, intake.raw_meta_path):
+        target = tmp_path / stored
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"published::" + stored.encode("utf-8"))
+    write_doc_meta(tmp_path, DOC_ID, {
+        "id": DOC_ID, "status": "compiling", "compile_job_id": manifest.job_id,
+    })
+    transition_manifest(manifest.job_dir, expected=PREPARED, target=SCHEDULED,
+                        scheduled_at="2026-08-06T14:30:01+00:00")
+    manifest = load_manifest(manifest.job_dir)
+    before = hash_tree(tmp_path)
+
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+
+    assert result.blocked is True
+    assert load_manifest(manifest.job_dir).state is ROLLBACKING
+    assert hash_tree(tmp_path) == before
+
+
+def test_rollback_blocks_upload_when_journal_unparsable(tmp_path):
+    """R7-P2-1: journal 不可解析 → 失败关闭,不删除任何已发布文件。"""
+    manifest = _scheduled_upload_with_journal(tmp_path, _legit_upload_intake())
+    (manifest.job_dir / "intake.yaml").write_text("{{{{", encoding="utf-8")
+
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+
+    assert result.blocked is True
+    assert load_manifest(manifest.job_dir).state is ROLLBACKING
+    for stored in (
+        "originals/example.pdf", f"raw/{DOC_ID}.txt", f"raw/{DOC_ID}.meta.yaml",
+    ):
+        assert (tmp_path / stored).exists()
+
+
+def test_rollback_upload_reentry_after_mid_rollback_crash(tmp_path):
+    """R7-P2-1: 回滚中途崩溃(部分目标已删)→ journal 仍在事务目录,
+    幂等重入仍完成验证与回滚。"""
+    manifest = _scheduled_upload_with_journal(tmp_path, _legit_upload_intake())
+    manifest = transition_manifest(
+        manifest.job_dir, expected=SCHEDULED, target=ROLLBACKING,
+        failure={"original_code": "interrupted", "original_message": "restart"},
+    )
+    # 模拟回滚中途崩溃: 两个目标已删除,一个仍在
+    (tmp_path / "originals" / "example.pdf").unlink()
+    (tmp_path / "raw" / f"{DOC_ID}.meta.yaml").unlink()
+
+    result = recover_transaction(
+        tmp_path, runtime_config(tmp_path), manifest.job_dir,
+        reason_code="interrupted", reason_message="service restart",
+    )
+
+    assert result.completed is True
+    assert not (tmp_path / "raw" / f"{DOC_ID}.txt").exists()
+    verification = verify_terminal_transaction(
+        tmp_path, load_manifest(manifest.job_dir)
+    )
+    assert verification.ok is True, verification.failures

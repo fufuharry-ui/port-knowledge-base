@@ -407,13 +407,13 @@ def test_publish_original_streams_staged_file(tmp_path, monkeypatch):
     real_stream = intake_mod.durable_stream_to_file
     real_write_bytes = intake_mod.durable_write_bytes
 
-    def spy_stream(path, stream):
+    def spy_stream(path, stream, **kwargs):
         events.append(("stream", Path(path).name))
-        return real_stream(path, stream)
+        return real_stream(path, stream, **kwargs)
 
-    def spy_write_bytes(path, payload):
+    def spy_write_bytes(path, payload, **kwargs):
         events.append(("write_bytes", Path(path).name))
-        return real_write_bytes(path, payload)
+        return real_write_bytes(path, payload, **kwargs)
 
     monkeypatch.setattr(intake_mod, "durable_stream_to_file", spy_stream)
     monkeypatch.setattr(intake_mod, "durable_write_bytes", spy_write_bytes)
@@ -594,22 +594,22 @@ def _crash_after_target_publish(monkeypatch, target_suffix):
     real_write_yaml = intake_mod.durable_write_yaml
     state = {"published": False}
 
-    def spy_write_bytes(path, payload):
-        result = real_write_bytes(path, payload)
+    def spy_write_bytes(path, payload, **kwargs):
+        result = real_write_bytes(path, payload, **kwargs)
         path = Path(path)
         if path.parent.name == "raw" and path.name.endswith(target_suffix):
             state["published"] = True
         return result
 
-    def spy_write_yaml(path, data):
+    def spy_write_yaml(path, data, **kwargs):
         path = Path(path)
         if path.parent.name == "raw" and path.name.endswith(target_suffix):
-            real_write_yaml(path, data)
+            real_write_yaml(path, data, **kwargs)
             state["published"] = True
             return
         if state["published"] and path.name == JOURNAL_FILENAME:
             raise _InjectedCrash("crash after publish before journal")
-        real_write_yaml(path, data)
+        real_write_yaml(path, data, **kwargs)
 
     monkeypatch.setattr(intake_mod, "durable_write_bytes", spy_write_bytes)
     monkeypatch.setattr(intake_mod, "durable_write_yaml", spy_write_yaml)
@@ -646,21 +646,21 @@ def test_crash_between_pending_journal_and_publish_is_idempotent(
     real_write_bytes = intake_mod.durable_write_bytes
     state = {"pending_seen": False}
 
-    def crash_on_raw_text_publish(path, payload):
+    def crash_on_raw_text_publish(path, payload, **kwargs):
         path = Path(path)
         if path.parent.name == "raw" and path.suffix == ".txt":
             raise _InjectedCrash("crash before raw text publish")
-        return real_write_bytes(path, payload)
+        return real_write_bytes(path, payload, **kwargs)
 
     real_write_yaml = intake_mod.durable_write_yaml
 
-    def spy_write_yaml(path, data):
+    def spy_write_yaml(path, data, **kwargs):
         if Path(path).name == JOURNAL_FILENAME and any(
             isinstance(e, dict) and e.get("completed") is False
             for e in (data.get("entries") or [])
         ):
             state["pending_seen"] = True
-        return real_write_yaml(path, data)
+        return real_write_yaml(path, data, **kwargs)
 
     monkeypatch.setattr(intake_mod, "durable_write_bytes", crash_on_raw_text_publish)
     monkeypatch.setattr(intake_mod, "durable_write_yaml", spy_write_yaml)
@@ -762,3 +762,42 @@ def test_stage_upload_mid_stream_failure_cleans_staging(tmp_path):
         stage_upload(upload, config)
     root = config.upload_intake_dir
     assert not root.exists() or list(root.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# Codex Round 7 (R7-P2-3): 排他发布——exists() 预检与发布之间目标被并发
+# 本地写入者创建时,绝不覆盖、绝不把他人文件记入 journal、回滚绝不误删。
+# ---------------------------------------------------------------------------
+
+
+def test_publish_never_overwrites_concurrent_writer_target(tmp_path, monkeypatch):
+    """R7-P2-3: 预检通过后、排他创建前目标被他人创建 → FileExistsError,
+    他人内容字节不变,journal 无该目标归属条目,回滚不删除任何文件。"""
+    manifest, staged, prepared = prepared_upload_transaction(tmp_path, "report.txt")
+
+    import api.upload_intake as intake_mod
+
+    real_stream = intake_mod.durable_stream_to_file
+
+    def concurrent_writer(path, stream, **kwargs):
+        # 模拟并发写入者在 exists() 预检之后创建同名目标
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_bytes(b"other writer")
+        return real_stream(path, stream, **kwargs)
+
+    monkeypatch.setattr(intake_mod, "durable_stream_to_file", concurrent_writer)
+
+    with pytest.raises(FileExistsError):
+        publish_upload_intake(manifest, staged, prepared, tmp_path)
+
+    target = tmp_path / "originals" / "report.txt"
+    assert target.read_bytes() == b"other writer"
+    # journal 不得宣称该目标由本请求创建(pending 条目已撤销)
+    for entry in read_journal(manifest.job_dir):
+        assert not (
+            entry.get("path") == "originals/report.txt"
+            and entry.get("created_by_this_request") is True
+        )
+    # 回滚绝不误删他人文件
+    assert rollback_published_intake(manifest, tmp_path) == []
+    assert target.read_bytes() == b"other writer"

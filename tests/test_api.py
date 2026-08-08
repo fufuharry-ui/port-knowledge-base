@@ -1585,12 +1585,12 @@ def test_upload_publish_failure_revokes_published_files(
     before = _business_manifest(tmp_repo)
     observed = {"raw_text_write": False}
 
-    def failing_write_bytes(path, payload):
+    def failing_write_bytes(path, payload, **kwargs):
         path = Path(path)
         if path.parent.name == "raw" and path.suffix == ".txt":
             observed["raw_text_write"] = True
             raise OSError("simulated durable write failure")
-        return real_write_bytes(path, payload)
+        return real_write_bytes(path, payload, **kwargs)
 
     monkeypatch.setattr(intake_mod, "durable_write_bytes", failing_write_bytes)
     response = managed_client.post(

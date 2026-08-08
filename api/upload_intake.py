@@ -210,6 +210,36 @@ def _read_journal_entries(job_dir: Path) -> list[dict[str, Any]]:
     return list(entries) if isinstance(entries, list) else []
 
 
+def read_completed_intake_paths(job_dir: Path) -> list[str] | None:
+    """读取 journal 中 completed=True 且 created_by_this_request=True 的
+    目标路径(按记录顺序);journal 缺失、不可解析或结构非法返回 None。
+
+    R7-P2-1: 供恢复引擎把 Manifest 声明的 intake 目标与独立 journal
+    证据交叉验证;journal 在事务目录中存留至清理,回滚中途崩溃后的
+    幂等重入仍可验证(不像 raw meta 本身是删除目标)。
+    """
+    path = _journal_path(job_dir)
+    if not path.is_file():
+        return None
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return None
+    entries = data.get("entries") if isinstance(data, Mapping) else None
+    if not isinstance(entries, list):
+        return None
+    paths: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            return None
+        if (
+            entry.get("created_by_this_request") is True
+            and entry.get("completed") is True
+        ):
+            paths.append(entry.get("path"))
+    return paths
+
+
 def _write_journal_entries(job_dir: Path, entries: list[dict[str, Any]]) -> None:
     durable_write_yaml(
         _journal_path(job_dir),
@@ -246,6 +276,29 @@ def _flip_journal_completed(job_dir: Path, relative_path: str) -> None:
             return
     raise ValueError(
         f"journal pending entry missing for publish target: {relative_path!r}"
+    )
+
+
+def _drop_journal_pending(job_dir: Path, relative_path: str) -> None:
+    """排他发布证明目标非本请求创建(FileExistsError)时,撤销该目标的
+    pending 条目(耐久)——绝不把他人文件记为本请求创建,回滚绝不误删。
+
+    找不到匹配的 pending 条目说明 journal 内部状态不一致,失败关闭。
+    """
+    entries = _read_journal_entries(job_dir)
+    for index in range(len(entries) - 1, -1, -1):
+        entry = entries[index]
+        if (
+            isinstance(entry, dict)
+            and entry.get("path") == relative_path
+            and entry.get("created_by_this_request") is True
+            and entry.get("completed") is False
+        ):
+            del entries[index]
+            _write_journal_entries(job_dir, entries)
+            return
+    raise ValueError(
+        f"journal pending entry missing for dropped target: {relative_path!r}"
     )
 
 
@@ -301,9 +354,12 @@ def publish_upload_intake(
     - manifest.published_intake 与 staged/prepared 不一致时失败关闭;
     - 任一目标已存在: 停止并抛 FileExistsError,既有字节不动,该目标
       不进入 journal(非本请求创建);
-    - 每个目标按 intent-first 顺序: 先落 pending journal(耐久)→ 耐久
-      发布目标 → 翻转 completed(耐久);任一时刻崩溃,journal 都覆盖
-      已发布目标,绝不留下无归属文件;
+    - 每个目标按 intent-first 顺序: 先落 pending journal(耐久)→ 排他
+      耐久发布目标(os.link 原子创建,目标已存在即 FileExistsError,
+      绝不覆盖;预检仅作快速路径,R7-P2-3)→ 翻转 completed(耐久);
+      排他创建证明目标非本请求所写时,撤销 pending 条目后再抛
+      FileExistsError(绝不把他人文件记入 journal,回滚绝不误删);
+      任一时刻崩溃,journal 都覆盖已发布目标,绝不留下无归属文件;
     - original 目标经 durable_stream_to_file 流式发布(1MB 分块 + 增量
       sha256,R4-P1-2),绝不整文件读入内存;raw text/meta 为
       PreparedIngest 内存对象,保持 bytes/yaml 原语;
@@ -344,19 +400,26 @@ def publish_upload_intake(
         if target is None:
             raise ValueError(f"unsafe intake publish target: {relative_path!r}")
         if target.exists() or target.is_symlink():
+            # 快速路径预检;真正的安全机制是下方的排他创建(os.link)。
             raise FileExistsError(
                 f"intake publish target already exists: {relative_path}"
             )
         _append_journal_pending(manifest.job_dir, relative_path)
-        if mode == "stream":
-            # R4-P1-2: 原始文件流式发布(分块 + 增量 sha256),绝不整文件
-            # 读入内存;staging 文件以二进制流打开。
-            with open(staged.staged_file, "rb") as stream:
-                durable_stream_to_file(target, stream)
-        elif mode == "bytes":
-            durable_write_bytes(target, payload)
-        else:
-            durable_write_yaml(target, payload)
+        try:
+            if mode == "stream":
+                # R4-P1-2: 原始文件流式发布(分块 + 增量 sha256),绝不整文件
+                # 读入内存;staging 文件以二进制流打开。
+                with open(staged.staged_file, "rb") as stream:
+                    durable_stream_to_file(target, stream, no_overwrite=True)
+            elif mode == "bytes":
+                durable_write_bytes(target, payload, no_overwrite=True)
+            else:
+                durable_write_yaml(target, payload, no_overwrite=True)
+        except FileExistsError:
+            # R7-P2-3: 排他创建证明目标是预检之后由他人创建——撤销 pending
+            # 条目(绝不把他人文件记为本请求创建),再按既有合同抛出。
+            _drop_journal_pending(manifest.job_dir, relative_path)
+            raise
         _flip_journal_completed(manifest.job_dir, relative_path)
 
     return update_published_intake(

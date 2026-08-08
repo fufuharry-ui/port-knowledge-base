@@ -182,11 +182,16 @@ def _terminate_untracked_child(popen: subprocess.Popen) -> None:
 
 
 def _read_create_time(pid: int) -> float:
-    try:
-        return psutil.Process(pid).create_time()
-    except psutil.NoSuchProcess:
-        # 进程已快速退出;create_time 未知,后续身份验证会得到 process_gone。
-        return 0.0
+    """读取进程 create_time;进程已退出时抛出 NoSuchProcess(身份捕获失败)。
+
+    R7-P1-1: 绝不返回 0.0 兜底——0.0 会被 SCHEDULED→RUNNING 迁移持久化,
+    而 load_manifest(R6-P1-2)拒绝非正 create_time,留下启动恢复永久
+    阻断的 RUNNING manifest。spawn 处抛出由 spawn_compile_process 的
+    except BaseException 路径 best-effort 终止并回收不可跟踪子进程,
+    再由调用方按 spawn 失败从 SCHEDULED 干净回滚(写者/读者一致性:
+    不可读的身份绝不持久化)。
+    """
+    return psutil.Process(pid).create_time()
 
 
 def _read_attr(pid: int, attr: str, fallback: str) -> str:

@@ -839,21 +839,21 @@ class UploadCrashScenario:
         elif self.crash_point == "after_original_publish":
             real_write_bytes = intake_mod.durable_write_bytes
 
-            def fail_on_raw_text(path, payload):
+            def fail_on_raw_text(path, payload, **kwargs):
                 path = Path(path)
                 if path.parent.name == "raw" and path.suffix == ".txt":
                     raise _InjectedCrash(self.crash_point)
-                return real_write_bytes(path, payload)
+                return real_write_bytes(path, payload, **kwargs)
 
             mp.setattr(intake_mod, "durable_write_bytes", fail_on_raw_text)
         elif self.crash_point == "after_raw_text_publish":
             real_write_yaml = intake_mod.durable_write_yaml
 
-            def fail_on_raw_meta(path, data):
+            def fail_on_raw_meta(path, data, **kwargs):
                 path = Path(path)
                 if path.parent.name == "raw" and path.name.endswith(".meta.yaml"):
                     raise _InjectedCrash(self.crash_point)
-                return real_write_yaml(path, data)
+                return real_write_yaml(path, data, **kwargs)
 
             mp.setattr(intake_mod, "durable_write_yaml", fail_on_raw_meta)
         elif self.crash_point == "after_scheduled":

@@ -488,3 +488,190 @@ describe('Wiki 仪表盘过期快照防护 (E004-FIX-01)', () => {
         expect(mockedFetch).toHaveBeenCalledTimes(3);
     });
 });
+
+/**
+ * E005 Task 12:服务重启把编译中文档恢复为 status='error' + error_code='interrupted'。
+ * 复用既有纪元/序号守卫与通用 compiling→error Toast 逻辑,不新增可见状态:
+ *  - 历史 interrupted 展示固定恢复文案但不弹 Toast;
+ *  - compiling → interrupted 恰好弹一次固定恢复文案 Toast;
+ *  - 重编译开启新一轮失败轮,可再次 Toast;
+ *  - 重启前发出的过期响应不得覆盖已落地的 interrupted 终态;
+ *  - 瞬时轮询失败保留上一份可用目录。
+ */
+describe('Wiki 仪表盘 interrupted 恢复轮询 (E005 Task 12)', () => {
+    const INTERRUPTED_COPY = '编译任务因服务重启中断，旧版本已恢复，请重新编译';
+
+    beforeEach(() => {
+        mockedFetch.mockReset();
+        mockedRecompile.mockReset();
+        mockedDelete.mockReset();
+        mockToastPush.mockReset();
+    });
+
+    afterEach(() => {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+    });
+
+    test('compiling to interrupted emits one recovery toast', async () => {
+        jest.useFakeTimers();
+        mockedFetch
+            .mockResolvedValueOnce({
+                total_docs: 1,
+                documents: [{ id: 'doc_1', status: 'compiling' }],
+            })
+            .mockResolvedValue({
+                total_docs: 1,
+                documents: [{ id: 'doc_1', status: 'error', error_code: 'interrupted' }],
+            });
+        render(<WikiPage />);
+        await screen.findByTestId('compiling-hint');
+
+        await act(async () => {
+            jest.advanceTimersByTime(3000);
+            await Promise.resolve();
+        });
+        await waitFor(() => expect(mockToastPush).toHaveBeenCalledTimes(1));
+        expect(mockToastPush).toHaveBeenCalledWith(INTERRUPTED_COPY, 'error');
+
+        // 同一轮失败终态:继续轮询窗口内不得重复 Toast
+        await act(async () => {
+            jest.advanceTimersByTime(6000);
+            await Promise.resolve();
+        });
+        expect(mockToastPush).toHaveBeenCalledTimes(1);
+        // 内联错误展示同一固定恢复文案
+        expect(screen.getByTestId('compile-error-message')).toHaveTextContent(INTERRUPTED_COPY);
+    });
+
+    test('initial historical interrupted displays the fixed copy without a toast', async () => {
+        mockedFetch.mockResolvedValue({
+            total_docs: 1,
+            documents: [{ id: 'doc_1', title: 'T', status: 'error', error_code: 'interrupted' }],
+        });
+        render(<WikiPage />);
+        await screen.findByTestId('compile-error-message');
+        expect(screen.getByTestId('compile-error-message')).toHaveTextContent(INTERRUPTED_COPY);
+        expect(screen.getByTestId('status-badge')).toHaveTextContent('编译失败');
+        expect(screen.queryByTestId('compiling-hint')).toBeNull();
+        expect(mockToastPush).not.toHaveBeenCalled();
+    });
+
+    test('recompile after interrupted starts a new failure round that toasts again', async () => {
+        jest.useFakeTimers();
+        mockedFetch
+            .mockResolvedValueOnce({
+                total_docs: 1,
+                documents: [{
+                    id: 'doc_1',
+                    title: 'T',
+                    status: 'error',
+                    error_code: 'interrupted',
+                }],
+            })
+            .mockResolvedValue({
+                total_docs: 1,
+                documents: [{
+                    id: 'doc_1',
+                    title: 'T',
+                    status: 'error',
+                    error_code: 'interrupted',
+                }],
+            });
+        mockedRecompile.mockResolvedValue({ status: 'recompiling' });
+
+        render(<WikiPage />);
+        // 历史 interrupted:首轮不弹 Toast
+        fireEvent.click(await screen.findByTestId('recompile-btn'));
+        await screen.findByTestId('compiling-hint');
+        expect(mockToastPush).not.toHaveBeenCalled();
+
+        // 新一轮失败:恰好一次固定恢复文案 Toast
+        await act(async () => {
+            jest.advanceTimersByTime(3000);
+            await Promise.resolve();
+        });
+        await waitFor(() => expect(mockToastPush).toHaveBeenCalledTimes(1));
+        expect(mockToastPush).toHaveBeenCalledWith(INTERRUPTED_COPY, 'error');
+    });
+
+    test('stale pre-restart response cannot overwrite the applied interrupted state', async () => {
+        // StrictMode 双挂载 → 同纪元并发发出初始加载 A(重启前,先发)与 B(重启后,后发)
+        const requestA = createDeferred<WikiIndexData>();
+        const requestB = createDeferred<WikiIndexData>();
+        mockedFetch
+            .mockImplementationOnce(() => requestA.promise)
+            .mockImplementationOnce(() => requestB.promise);
+
+        render(
+            <React.StrictMode>
+                <WikiPage />
+            </React.StrictMode>,
+        );
+        await waitFor(() => expect(mockedFetch).toHaveBeenCalledTimes(2));
+
+        // B(更新)先落地:interrupted 终态被应用;首轮不弹 Toast
+        await act(async () => {
+            requestB.resolve({
+                total_docs: 1,
+                documents: [{
+                    id: 'doc_1',
+                    title: 'A',
+                    status: 'error',
+                    error_code: 'interrupted',
+                }],
+            });
+            await flushMicrotasks();
+        });
+        expect(screen.getByTestId('compile-error-message')).toHaveTextContent(INTERRUPTED_COPY);
+        expect(mockToastPush).not.toHaveBeenCalled();
+
+        // A(重启前的更旧快照)后落地:不得把 interrupted 终态回退成 compiling
+        await act(async () => {
+            requestA.resolve({
+                total_docs: 1,
+                documents: [{ id: 'doc_1', title: 'A', status: 'compiling' }],
+            });
+            await flushMicrotasks();
+        });
+        expect(screen.getByTestId('compile-error-message')).toHaveTextContent(INTERRUPTED_COPY);
+        expect(screen.getByTestId('status-badge')).toHaveTextContent('编译失败');
+        expect(screen.queryByTestId('compiling-hint')).toBeNull();
+        expect(mockToastPush).not.toHaveBeenCalled();
+    });
+
+    test('a transient poll failure keeps the last good catalog', async () => {
+        jest.useFakeTimers();
+        mockedFetch
+            .mockResolvedValueOnce({
+                total_docs: 1,
+                documents: [{ id: 'doc_1', status: 'compiling' }],
+            })
+            .mockRejectedValueOnce(new Error('network down'))
+            .mockResolvedValue({
+                total_docs: 1,
+                documents: [{ id: 'doc_1', status: 'error', error_code: 'interrupted' }],
+            });
+
+        render(<WikiPage />);
+        await screen.findByTestId('compiling-hint');
+
+        // 瞬时轮询失败:上一份目录保留,提示条仍在,不弹 Toast
+        await act(async () => {
+            jest.advanceTimersByTime(3000);
+            await flushMicrotasks();
+        });
+        expect(screen.getByTestId('compiling-hint')).toBeInTheDocument();
+        expect(screen.getByTestId('doc-count')).toHaveTextContent('1');
+        expect(mockToastPush).not.toHaveBeenCalled();
+
+        // 下一轮轮询成功:interrupted 终态落地,恰好一次恢复文案 Toast
+        await act(async () => {
+            jest.advanceTimersByTime(3000);
+            await flushMicrotasks();
+        });
+        await waitFor(() => expect(mockToastPush).toHaveBeenCalledTimes(1));
+        expect(mockToastPush).toHaveBeenCalledWith(INTERRUPTED_COPY, 'error');
+        expect(screen.getByTestId('compile-error-message')).toHaveTextContent(INTERRUPTED_COPY);
+    });
+});

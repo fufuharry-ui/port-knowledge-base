@@ -191,17 +191,33 @@ def test_durable_unlink_posix_branch_opens_fsyncs_closes_parent(
 
 
 def test_durable_unlink_skips_parent_fsync_on_windows(tmp_path, monkeypatch):
-    """P1-1: Windows 分支只删除,绝不尝试父目录 fsync。"""
+    """P1-1: Windows 分支只删除,绝不尝试父目录 fsync。
+
+    直接调用 _fsync_parent_directory 而非 durable_unlink: os.name 翻转后,
+    对立平台 Path 类的实例化/派生会抛 NotImplementedError(3.11 在 Path(...)
+    选择时经 _flavour.is_supported 抛;3.12 在 parent/joinpath 派生时经
+    导入期绑定的 __new__ stub 抛)——durable_unlink 内部有 Path(path),
+    在非 Windows CI 上会让本测试报错,并连带 pytest 失败格式化器
+    INTERNALERROR。durable_unlink → _fsync_parent_directory 的接线由
+    test_durable_unlink_deletes_file_and_fsyncs_parent 覆盖;真实分支的
+    端到端删除由 test_durable_unlink_deletes_file_on_native_platform 覆盖。
+    """
     import api.durable_fs as durable_fs
 
     target = tmp_path / "gone.bin"
-    target.write_bytes(b"x")
     monkeypatch.setattr(durable_fs.os, "name", "nt")
 
     def forbidden_open(*args, **kwargs):
         raise AssertionError("Windows 不得尝试父目录 fsync")
 
     monkeypatch.setattr(durable_fs.os, "open", forbidden_open)
+    durable_fs._fsync_parent_directory(target)
+
+
+def test_durable_unlink_deletes_file_on_native_platform(tmp_path):
+    """P1-1: 无任何补丁的原生分支端到端删除(Windows 上即 nt 分支)。"""
+    target = tmp_path / "gone.bin"
+    target.write_bytes(b"x")
     durable_unlink(target)
     assert not target.exists()
 

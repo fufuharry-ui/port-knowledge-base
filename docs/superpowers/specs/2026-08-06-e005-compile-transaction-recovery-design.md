@@ -368,6 +368,8 @@ COMPILE_SCHEDULE_LOCK → COMPILE_EXECUTION_LOCK
 - `add_task`失败：请求线程立即进入回滚；
 - 请求未正式接受时不制造文档错误终态。
 
+> 实施澄清（2026-08-08）：未正式接受请求的回滚由 `ERROR_CODE_UNACCEPTED`（`"unaccepted"`）哨兵驱动：恢复引擎识别该哨兵后，对重编译把 meta **字节级恢复**为绑定前快照 `source-meta-before.yaml`，而不是写入或规范化一个 error 终态；快照缺失或不可读时 fail-closed。该策略同样适用于 §16 回滚路径。
+
 ## 12. 两阶段上传摄入发布
 
 ### 12.1 根因约束
@@ -435,6 +437,8 @@ class PreparedIngest:
 ```
 
 业务目录发布必须记录每个目标是否由本请求创建。发布时若任一目标已存在，停止并回滚，不能覆盖既有文件。
+
+> 实施澄清（2026-08-08）：实现中 `intake.yaml` journal 在**每个业务目标耐久发布完成后**追加一条精确相对路径记录，并作为回滚的唯一权威依据（journal 缺失视为本轮未发布，no-op；journal 不可解析则 fail-closed 不删除任何文件）。“先发布、后追加 journal”的既定顺序存在一个已记录的上报不足窗口：目标已耐久发布但 journal 追加前崩溃时，该目标未被 journal 记录，恢复按未发布处理。
 
 ### 12.4 上传失败与崩溃恢复
 
@@ -673,6 +677,8 @@ service_mode = ready | recovery_required
 
 公共目录只投影`status`和稳定`error_code`，不投影活动job字段、PID、事务目录、快照或技术错误。
 
+> 实施澄清（2026-08-08）：`_schedule_compile` 携带显式 `runtime` 参数（三参数签名：`background_tasks, doc_id, runtime`），runtime 按请求解析；runtime 缺失时 fail-closed。本节对外响应与调度语义不变。
+
 ## 22. 前端合同
 
 保持现有行为：
@@ -801,6 +807,8 @@ CLI先获取同一个实例锁，复用生产恢复库。禁止提供`force-dele
 - 不删除任何既有业务文件；
 - 未正式接受的上传不保留错误文档；
 - 已进入SCHEDULED的上传按中断事务完整撤销。
+
+> 实施澄清（2026-08-08）：R8 六个崩溃窗口在测试中经可 monkeypatch 的命名边界注入：`api.main` 的 `_r8_boundary_after_intake_stage` / `_r8_boundary_after_prepare_ingest` / `_r8_boundary_after_prepared_manifest` / `_r8_boundary_after_scheduled` 钩子，以及 `api.upload_intake` 的 `durable_write_bytes` / `durable_write_yaml` 边界；生产路径不存在任何恢复绕过开关。
 
 ## 25. 数据与离线安全门禁
 
